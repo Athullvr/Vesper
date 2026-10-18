@@ -1,0 +1,8 @@
+[features]
+hooks = true
+
+[projects."/tmp/fastlane-poc"]
+trust_level = "trusted"
+
+[tui]
+screen_reader_detection_done = true
