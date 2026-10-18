@@ -1,0 +1,17 @@
+{
+  "description": "Minimal Fast Lane UserPromptSubmit feasibility probe",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/experiments/fast-lane-hook-feasibility/hook_probe.py\"",
+            "timeout": 3,
+            "statusMessage": "Checking for a local Fast Lane answer"
+          }
+        ]
+      }
+    ]
+  }
+}
