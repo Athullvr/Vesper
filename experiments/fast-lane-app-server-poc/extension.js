@@ -242,7 +242,7 @@ class AppServerClient {
       this.log(`request=${requestId} rpc=thread/start`);
       const result = await this.request("thread/start", {
         cwd,
-        sandbox: "readOnly",
+        sandbox: "read-only",
       }, APP_SERVER_TIMEOUT_MS);
       this.threadId = result?.thread?.id;
       if (!this.threadId) throw new Error("App-server did not return a thread id.");
