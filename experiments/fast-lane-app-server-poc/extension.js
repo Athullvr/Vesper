@@ -112,7 +112,7 @@ async function handlePrompt(prompt) {
     return;
   }
 
-  writeLog(`request=${requestId} route=codex_fallback intent=unsupported cwd=${cwd || "<no-workspace>"}`);
+  writeLog(`request=${requestId} event=request_submitted route=codex_fallback intent=unsupported prompt_chars=${prompt.length} cwd=${cwd || "<no-workspace>"}`);
   if (!cwd) {
     finishLocalError(requestId, startedAt, "Open a workspace folder before sending a prompt to Codex.");
     return;
@@ -254,17 +254,23 @@ class AppServerClient {
       completeResolve = resolve;
       completeReject = reject;
     });
+    let activeTurn;
     const timer = setTimeout(() => {
-      if (this.activeTurn) {
+      if (this.activeTurn === activeTurn) {
+        this.log(`request=${requestId} event=turn_timeout elapsed_ms=${Math.round(performance.now() - activeTurn.startedAt)}`);
         this.activeTurn = undefined;
         completeReject(new Error("Codex turn timed out."));
       }
     }, TURN_TIMEOUT_MS);
 
-    this.activeTurn = {
+    activeTurn = {
       requestId,
       threadId: this.threadId,
       onDelta,
+      startedAt: performance.now(),
+      firstServerEventLogged: false,
+      deltaCount: 0,
+      deltaChars: 0,
       resolve: (value) => {
         clearTimeout(timer);
         this.activeTurn = undefined;
@@ -277,6 +283,7 @@ class AppServerClient {
       },
       usageSeen: false,
     };
+    this.activeTurn = activeTurn;
 
     this.log(`request=${requestId} rpc=turn/start`);
     try {
@@ -299,10 +306,12 @@ class AppServerClient {
     }
 
     const id = this.nextRpcId++;
+    const requestedAt = performance.now();
     const timeout = setTimeout(() => {
       const entry = this.pending.get(id);
       if (entry) {
         this.pending.delete(id);
+        this.log(`rpc timeout id=${id} method=${method} elapsed_ms=${Math.round(performance.now() - requestedAt)}`);
         entry.reject(new Error(`Timed out waiting for app-server response to ${method}.`));
       }
     }, timeoutMs);
@@ -321,7 +330,14 @@ class AppServerClient {
       });
     });
 
-    this.write({ method, id, params }, `request id=${id} method=${method}`);
+    try {
+      this.write({ method, id, params }, `request id=${id} method=${method}`);
+    } catch (error) {
+      const entry = this.pending.get(id);
+      this.pending.delete(id);
+      entry?.reject(error);
+      this.log(`rpc request write failed id=${id} method=${method} reason=${safeMessage(error)}`);
+    }
     return promise;
   }
 
@@ -347,12 +363,22 @@ class AppServerClient {
         continue;
       }
 
+      if (Object.prototype.hasOwnProperty.call(message, "id") && typeof message.method === "string") {
+        this.handleServerRequest(message);
+        continue;
+      }
+
       if (Object.prototype.hasOwnProperty.call(message, "id")) {
         const pending = this.pending.get(message.id);
-        if (!pending) continue;
+        if (!pending) {
+          this.log(`rpc <-- unmatched response id=${message.id}`);
+          continue;
+        }
         this.pending.delete(message.id);
         if (message.error) {
-          pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
+          const error = new Error(message.error.message || JSON.stringify(message.error));
+          this.log(`rpc <-- id=${message.id} method=${pending.method} error=${safeMessage(error)}`);
+          pending.reject(error);
         } else {
           this.log(`rpc <-- id=${message.id} method=${pending.method} ok`);
           pending.resolve(message.result || {});
@@ -364,7 +390,57 @@ class AppServerClient {
     }
   }
 
+  handleServerRequest(message) {
+    const { id, method } = message;
+    this.noteTurnServerEvent(method);
+    this.log(`rpc <-- server request id=${id} method=${method}`);
+
+    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+      this.respondToServerRequest(
+        { id, result: { decision: "decline" } },
+        `server response id=${id} method=${method} decision=decline`
+      );
+      return;
+    }
+
+    if (method === "applyPatchApproval" || method === "execCommandApproval") {
+      this.respondToServerRequest(
+        { id, result: { decision: { denied: { rejection: "Fast Lane PoC does not grant approvals." } } } },
+        `server response id=${id} method=${method} decision=deny`
+      );
+      return;
+    }
+
+    const error = new Error(`Fast Lane PoC does not support app-server request ${method}.`);
+    if (this.respondToServerRequest(
+      { id, error: { code: -32601, message: error.message } },
+      `server response id=${id} method=${method} error=unsupported`
+    )) {
+      this.activeTurn?.reject(error);
+    }
+  }
+
+  respondToServerRequest(message, label) {
+    try {
+      this.write(message, label);
+      return true;
+    } catch (error) {
+      this.log(`rpc server response failed reason=${safeMessage(error)}`);
+      this.activeTurn?.reject(error);
+      return false;
+    }
+  }
+
+  noteTurnServerEvent(method) {
+    const activeTurn = this.activeTurn;
+    if (!activeTurn || activeTurn.firstServerEventLogged) return;
+    activeTurn.firstServerEventLogged = true;
+    this.log(`request=${activeTurn.requestId} event=first_server_event method=${method} elapsed_ms=${Math.round(performance.now() - activeTurn.startedAt)}`);
+  }
+
   handleNotification(method, params) {
+    this.noteTurnServerEvent(method);
+
     if (method === "turn/started") {
       this.log(`rpc <-- turn/started turn=${params.turn?.id || "unknown"}`);
       return;
@@ -372,7 +448,14 @@ class AppServerClient {
 
     if (method === "item/agentMessage/delta") {
       const delta = typeof params.delta === "string" ? params.delta : "";
-      if (this.activeTurn && delta) this.activeTurn.onDelta(delta);
+      if (this.activeTurn && delta) {
+        this.activeTurn.deltaCount += 1;
+        this.activeTurn.deltaChars += delta.length;
+        if (this.activeTurn.deltaCount === 1 || this.activeTurn.deltaCount % 25 === 0) {
+          this.log(`request=${this.activeTurn.requestId} event=assistant_delta count=${this.activeTurn.deltaCount} chars=${this.activeTurn.deltaChars} elapsed_ms=${Math.round(performance.now() - this.activeTurn.startedAt)}`);
+        }
+        this.activeTurn.onDelta(delta);
+      }
       return;
     }
 
@@ -384,12 +467,15 @@ class AppServerClient {
 
     if (method === "turn/completed") {
       const turn = params.turn || {};
-      this.log(`rpc <-- turn/completed status=${turn.status || "unknown"}`);
+      const elapsedMs = this.activeTurn ? Math.round(performance.now() - this.activeTurn.startedAt) : 0;
+      this.log(`request=${this.activeTurn?.requestId || "unknown"} event=turn_completed status=${turn.status || "unknown"} elapsed_ms=${elapsedMs} deltas=${this.activeTurn?.deltaCount || 0} chars=${this.activeTurn?.deltaChars || 0}`);
       if (!this.activeTurn) return;
       if (turn.status === "completed") {
         this.activeTurn.resolve({ status: turn.status, usageSeen: this.activeTurn.usageSeen });
       } else {
-        this.activeTurn.reject(new Error(turn.error?.message || `Codex turn ended with status ${turn.status || "unknown"}.`));
+        const error = new Error(turn.error?.message || `Codex turn ended with status ${turn.status || "unknown"}.`);
+        this.log(`request=${this.activeTurn.requestId} event=turn_error reason=${safeMessage(error)}`);
+        this.activeTurn.reject(error);
       }
       return;
     }
@@ -522,8 +608,8 @@ function getHtml(webview) {
       if (message.type === 'assistant-done' && activeAssistant) {
         activeAssistant.title.textContent = 'Codex · ' + message.elapsedMs + ' ms · ' + message.usage;
         activeAssistant = undefined;
-        setBusy(false);
       }
+      if (message.type === 'assistant-done') setBusy(false);
       if (message.type === 'assistant-error') {
         if (activeAssistant) {
           activeAssistant.title.textContent = 'Codex fallback error · ' + message.elapsedMs + ' ms';
