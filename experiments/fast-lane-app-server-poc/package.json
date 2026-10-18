@@ -1,0 +1,25 @@
+{
+  "name": "fast-lane-app-server-poc",
+  "displayName": "Fast Lane App-Server PoC",
+  "description": "Disposable local-first prompt routing experiment for VS Code and Codex app-server.",
+  "version": "0.1.0",
+  "publisher": "local-experiment",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:fastLane.openPanel"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "fastLane.openPanel",
+        "title": "Fast Lane: Open Panel"
+      }
+    ]
+  }
+}
