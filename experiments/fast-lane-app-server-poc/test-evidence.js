@@ -8,9 +8,14 @@ const TEST_RESULT_FILE = ".fast-lane-test-result.json";
 const TEST_RESULT_RECORDER = "vesper-fast-lane-routing-tests";
 const SOURCE_FILES = Object.freeze([
   "package.json",
+  "app-server-client.js",
+  "cli.js",
   "extension.js",
   "routing-core.js",
   "local-handlers.js",
+  "session-store.js",
+  "terminal-frontend.js",
+  "bin/vesper.js",
   "test-evidence.js",
   "test/run-tests.js",
   "test/extension-routing.test.js",
@@ -18,6 +23,10 @@ const SOURCE_FILES = Object.freeze([
   "test/routing-core.test.js",
   "test/local-handlers.test.js",
   "test/test-evidence.test.js",
+  "test/app-server-client.test.js",
+  "test/cli.test.js",
+  "test/session-store.test.js",
+  "test/terminal-frontend.test.js",
 ]);
 
 function currentSourceDigest(root) {

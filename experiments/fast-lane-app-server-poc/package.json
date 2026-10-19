@@ -4,6 +4,9 @@
   "description": "Disposable local-first prompt routing experiment for VS Code and Codex app-server.",
   "version": "0.1.0",
   "publisher": "local-experiment",
+  "bin": {
+    "vesper": "./bin/vesper.js"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -15,7 +18,8 @@
   ],
   "main": "./extension.js",
   "scripts": {
-    "test": "node ./test/run-tests.js"
+    "test": "node ./test/run-tests.js",
+    "cli": "node ./bin/vesper.js"
   },
   "contributes": {
     "commands": [

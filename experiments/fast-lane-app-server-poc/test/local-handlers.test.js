@@ -200,7 +200,7 @@ test("test-result handler confirms only a matching source snapshot and never tur
   const passed = await current[LOCAL_INTENTS.MOST_RECENT_TEST_RESULT]();
   assert.equal(passed.status, "confirmed");
   assert.equal(passed.value.passed, true);
-  assert.equal(passed.source.scope, "Fast Lane routing-core tests");
+  assert.equal(passed.source.scope, "Fast Lane prototype tests");
 
   const failedRecord = { ...record, exitCode: 1, summary: { ...record.summary, failed: 1, passed: 11 } };
   const failedHandler = createLocalHandlers({ runGit: async () => "", testResultReader: () => ({ state: "valid", record: failedRecord, sourceMatches: true }), now: () => fixedNow });

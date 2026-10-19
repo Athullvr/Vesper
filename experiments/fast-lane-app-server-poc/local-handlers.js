@@ -171,7 +171,7 @@ function createLocalHandlers({ runGit, testResultReader, now = () => new Date() 
           status: "unknown",
           summary: "No trustworthy Fast Lane routing-core test record is available.",
           evidence: ["The local Node test runner has not recorded a result for this prototype."],
-          source: { kind: "test_runner", command: "npm test", scope: "Fast Lane routing-core tests" },
+          source: { kind: "test_runner", command: "npm test", scope: "Fast Lane prototype tests" },
           freshness: { state: "unknown", observedAt },
         });
       }
@@ -181,7 +181,7 @@ function createLocalHandlers({ runGit, testResultReader, now = () => new Date() 
           status: "unavailable",
           summary: "The recorded test result could not be verified.",
           evidence: ["The test record was unreadable, malformed, or incomplete."],
-          source: { kind: "test_runner", command: "npm test", scope: "Fast Lane routing-core tests" },
+          source: { kind: "test_runner", command: "npm test", scope: "Fast Lane prototype tests" },
           freshness: { state: "unknown", observedAt },
         });
       }
@@ -191,8 +191,8 @@ function createLocalHandlers({ runGit, testResultReader, now = () => new Date() 
       const outcome = passed ? "passed" : "failed";
       const status = sourceMatches ? "confirmed" : "stale";
       const sourceNote = sourceMatches
-        ? "The recorded source fingerprint matches the current routing-core test files."
-        : "The recorded test run used a different source fingerprint and does not verify the current routing-core files.";
+        ? "The recorded source fingerprint matches the current Fast Lane prototype and test files."
+        : "The recorded test run used a different source fingerprint and does not verify the current Fast Lane prototype files.";
       return createLocalResult({
         intent: LOCAL_INTENTS.MOST_RECENT_TEST_RESULT,
         status,
@@ -204,9 +204,9 @@ function createLocalHandlers({ runGit, testResultReader, now = () => new Date() 
           exitCode: record.exitCode,
           completedAt: record.completedAt,
         },
-        summary: `Most recent recorded Fast Lane routing-core test run ${outcome}: ${record.summary.passed} passed, ${record.summary.failed} failed, ${record.summary.skipped} skipped (exit code ${record.exitCode}) at ${record.completedAt}. ${sourceNote}`,
+        summary: `Most recent recorded Fast Lane prototype test run ${outcome}: ${record.summary.passed} passed, ${record.summary.failed} failed, ${record.summary.skipped} skipped (exit code ${record.exitCode}) at ${record.completedAt}. ${sourceNote}`,
         evidence: ["The result was recorded by the prototype's Node test runner.", sourceNote],
-        source: { kind: "test_runner", command: "npm test", scope: "Fast Lane routing-core tests" },
+        source: { kind: "test_runner", command: "npm test", scope: "Fast Lane prototype tests" },
         freshness: {
           state: sourceMatches ? "same_source_snapshot" : "stale",
           observedAt,

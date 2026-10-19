@@ -1,0 +1,171 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
+const { LOCAL_INTENTS, createLocalResult } = require("../routing-core");
+const { TerminalFrontend } = require("../terminal-frontend");
+
+class FakeLineIO {
+  constructor(answers = []) {
+    this.answers = [...answers];
+    this.questions = [];
+    this.interruptHandler = undefined;
+    this.closed = false;
+  }
+
+  async question(prompt) {
+    this.questions.push(prompt);
+    return this.answers.length ? this.answers.shift() : null;
+  }
+
+  onInterrupt(handler) {
+    this.interruptHandler = handler;
+  }
+
+  interrupt() {
+    this.interruptHandler?.();
+  }
+
+  close() {
+    this.closed = true;
+  }
+}
+
+class FakeAppServer extends EventEmitter {
+  constructor(runTurn) {
+    super();
+    this.runTurnImpl = runTurn;
+    this.turns = [];
+    this.interrupted = false;
+  }
+
+  async runTurn(request) {
+    this.turns.push(request);
+    return this.runTurnImpl(request, this);
+  }
+
+  async interrupt() {
+    this.interrupted = true;
+    return true;
+  }
+
+  dispose() {}
+}
+
+function makeFrontend({ answers, appServer, handlers, lineIO, onWrite } = {}) {
+  const io = lineIO || new FakeLineIO(answers);
+  let outputText = "";
+  const output = { write: (text) => { outputText += String(text); onWrite?.(String(text)); } };
+  const frontend = new TerminalFrontend({
+    cwd: "/workspace/project",
+    handlers: handlers || {
+      [LOCAL_INTENTS.CURRENT_GIT_BRANCH]: async () => createLocalResult({
+        intent: LOCAL_INTENTS.CURRENT_GIT_BRANCH,
+        status: "confirmed",
+        value: { branch: "feature/phase-two" },
+        summary: "Current Git branch: feature/phase-two",
+        evidence: ["mock branch evidence"],
+        source: { kind: "git" },
+        freshness: { state: "observed" },
+      }),
+    },
+    appServer: appServer || new FakeAppServer(async ({ onDelta }) => {
+      onDelta("A streamed answer.");
+      return { status: "completed" };
+    }),
+    output,
+    lineIO: io,
+  });
+  return { frontend, io, output: () => outputText };
+}
+
+test("local question is labeled local, uses no app-server turn, and Codex fallback streams in the same terminal", async () => {
+  const appServer = new FakeAppServer(async ({ prompt, cwd, onDelta }) => {
+    assert.equal(prompt, "Explain a rebase in one sentence.");
+    assert.equal(cwd, "/workspace/project");
+    onDelta("A rebase replays commits.");
+    return { status: "completed" };
+  });
+  const { frontend, output } = makeFrontend({
+    answers: ["What Git branch am I on?", "Explain a rebase in one sentence.", ":quit"],
+    appServer,
+  });
+
+  await frontend.run();
+  const text = output();
+  assert.match(text, /Vesper local · confirmed · no Codex turn/u);
+  assert.match(text, /Current Git branch: feature\/phase-two/u);
+  assert.match(text, /A rebase replays commits\./u);
+  assert.match(text, /Codex · completed/u);
+  assert.equal(appServer.turns.length, 1);
+});
+
+test("fallback failures produce a visible terminal error and allow another prompt", async () => {
+  let calls = 0;
+  const appServer = new FakeAppServer(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("mock app-server failure");
+    return { status: "completed" };
+  });
+  const { frontend, output } = makeFrontend({ answers: ["Build a website", "Explain Git refs", ":quit"], appServer });
+
+  await frontend.run();
+  assert.match(output(), /Codex error .* mock app-server failure/u);
+  assert.match(output(), /Codex · completed/u);
+  assert.equal(appServer.turns.length, 2);
+});
+
+test("Ctrl+C requests interruption, reports terminal status, and ends the current frontend run", async () => {
+  let io;
+  const appServer = new FakeAppServer(async () => new Promise((resolve) => {
+    queueMicrotask(() => {
+      io.interrupt();
+      resolve({ status: "interrupted" });
+    });
+  }));
+  const setup = makeFrontend({ answers: ["Build a website", ":quit"], appServer });
+  io = setup.io;
+
+  await setup.frontend.run();
+  assert.equal(appServer.interrupted, true);
+  assert.match(setup.output(), /interrupting Codex/u);
+  assert.match(setup.output(), /Codex · interrupted/u);
+  assert.equal(setup.io.closed, true);
+});
+
+test("approval prompts require an explicit yes and only grant one-time protocol decisions", async () => {
+  const { frontend: accepting, output: acceptingOutput } = makeFrontend({ answers: ["yes"] });
+  const commandResult = await accepting.requestApproval("item/commandExecution/requestApproval", {
+    command: "printf '\u001b[31munsafe?\u001b[0m'",
+    cwd: "/workspace/project",
+    availableDecisions: ["accept", "decline"],
+  });
+  assert.deepEqual(commandResult, { decision: "accept" });
+  assert.match(acceptingOutput(), /\\x1b/u);
+  assert.equal(acceptingOutput().includes("\u001b"), false);
+
+  const { frontend: declining } = makeFrontend({ answers: ["no"] });
+  assert.deepEqual(await declining.requestApproval("item/fileChange/requestApproval", { reason: "write requested" }), { decision: "decline" });
+
+  const { frontend: permissionApproval } = makeFrontend({ answers: ["yes"] });
+  assert.deepEqual(await permissionApproval.requestApproval("item/permissions/requestApproval", {
+    permissions: { network: { enabled: true } },
+    reason: "network access required",
+  }), { permissions: { network: { enabled: true } }, scope: "turn" });
+
+  const { frontend: permissionDeny } = makeFrontend({ answers: [""] });
+  assert.deepEqual(await permissionDeny.requestApproval("item/permissions/requestApproval", {
+    permissions: { network: { enabled: true } },
+  }), { permissions: {}, scope: "turn" });
+});
+
+test("a command cannot be approved when the server does not offer the one-time accept decision", async () => {
+  const { frontend, io } = makeFrontend({ answers: ["yes"] });
+  const result = await frontend.requestApproval("item/commandExecution/requestApproval", {
+    command: "dangerous-looking-command",
+    availableDecisions: ["decline", "cancel"],
+  });
+  assert.deepEqual(result, { decision: "decline" });
+  assert.equal(io.questions.length, 0);
+});
