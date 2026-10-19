@@ -258,3 +258,100 @@ test("legacy approval denials match the installed schema without granting persis
   assert.throws(() => validateApprovalResult("execCommandApproval", { decision: "denied" }), /Legacy approval decision/u);
   assert.throws(() => validateApprovalResult("applyPatchApproval", { decision: "approved_for_session" }), /Legacy approval decision/u);
 });
+
+test("late events from a disconnected process cannot complete or stream into a recovered turn", async (t) => {
+  const first = new FakeAppServerProcess({ onTurnStart() {} });
+  let nextRequest;
+  const second = new FakeAppServerProcess({ onTurnStart: (request) => { nextRequest = request; } });
+  let spawns = 0;
+  const client = new AppServerClient({ spawnProcess: () => ++spawns === 1 ? first : second });
+  t.after(() => client.dispose());
+  const failed = assert.rejects(client.runTurn({ prompt: "Inspect this repository", cwd: "/workspace" }), /exited/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  first.emit("close", 1, null);
+  await failed;
+  const streamed = [];
+  const recovered = client.runTurn({ prompt: "Try again", cwd: "/workspace", onDelta: (text) => streamed.push(text) });
+  await new Promise((resolve) => setImmediate(resolve));
+  first.send({ method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", delta: "stale text" } });
+  first.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+  first.emit("close", 1, null);
+  assert.ok(client.activeTurn, "old process must not complete the new turn");
+  assert.deepEqual(streamed, []);
+  assert.equal(second.requests.some((request) => request.method === "thread/start"), false);
+  assert.equal(second.requests.find((request) => request.method === "thread/resume").params.threadId, "thread-1");
+  second.completeTurn(nextRequest, "completed", "Recovered.");
+  assert.deepEqual(await recovered, { status: "completed" });
+  assert.deepEqual(streamed, ["Recovered."]);
+});
+
+test("stale turn notifications cannot change identity and current tool payloads are preserved", async (t) => {
+  const server = new FakeAppServerProcess();
+  const { client } = createClient(server);
+  t.after(() => client.dispose());
+  await client.runTurn({ prompt: "First request", cwd: "/workspace" });
+  let request;
+  server.onTurnStart = (value) => { request = value; };
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
+  const turn = client.runTurn({ prompt: "Second request", cwd: "/workspace" });
+  await new Promise((resolve) => setImmediate(resolve));
+  server.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "turn-1", status: "inProgress" } } });
+  server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+  assert.equal(client.activeTurn?.turnId, "turn-2");
+  const params = { threadId: "thread-1", turnId: "turn-2", item: { id: "command-1", type: "commandExecution", command: "git status", status: "completed", exitCode: 0, aggregatedOutput: "clean" } };
+  server.send({ method: "item/completed", params: { ...params, turnId: "turn-1" } });
+  server.send({ method: "item/completed", params });
+  const activity = progress.filter((event) => event.type === "codex_progress");
+  assert.deepEqual(activity, [{ type: "codex_progress", method: "item/completed", params }]);
+  server.completeTurn(request, "completed");
+  assert.deepEqual(await turn, { status: "completed" });
+});
+
+test("an approval answer from a disconnected process is never written to its replacement", async (t) => {
+  let answer;
+  const first = new FakeAppServerProcess({ onTurnStart: (_request, server) => {
+    server.requestFromServer("approval-1", "item/commandExecution/requestApproval", {
+      threadId: "thread-1", turnId: "turn-1", itemId: "command-1", command: "git status",
+    });
+  } });
+  const second = new FakeAppServerProcess({ onTurnStart() {} });
+  let spawns = 0;
+  const client = new AppServerClient({
+    spawnProcess: () => ++spawns === 1 ? first : second,
+    onApproval: () => new Promise((resolve) => { answer = resolve; }),
+  });
+  t.after(() => client.dispose());
+  const failed = assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /exited/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  first.emit("close", 1, null);
+  await failed;
+  const recovery = client.runTurn({ prompt: "Inspect again", cwd: "/workspace" });
+  const stopped = assert.rejects(recovery, /closed/u);
+  await new Promise((resolve) => setImmediate(resolve));
+  answer({ decision: "accept" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(second.requests.some((message) => message.id === "approval-1"), false);
+  client.dispose();
+  await stopped;
+});
+
+test("resume rejects a mismatched server thread or cwd before any turn", async (t) => {
+  for (const response of [
+    { thread: { id: "wrong-thread" }, cwd: "/workspace" },
+    { thread: { id: "saved-thread" }, cwd: "/different-project" },
+  ]) {
+    const server = new FakeAppServerProcess();
+    const receive = server.receive.bind(server);
+    server.receive = (message) => {
+      if (message.method === "thread/resume") {
+        server.requests.push(message);
+        server.respond(message.id, response);
+      } else receive(message);
+    };
+    const { client } = createClient(server, { initialThreadId: "saved-thread" });
+    t.after(() => client.dispose());
+    await assert.rejects(client.runTurn({ prompt: "Continue", cwd: "/workspace" }), /different/u);
+    assert.equal(server.requests.some((message) => ["thread/start", "turn/start"].includes(message.method)), false);
+  }
+});

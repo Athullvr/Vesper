@@ -124,7 +124,10 @@ test("ahead count is tied to last-fetched local ref and includes the stale-remot
       if (args[0] === "symbolic-ref") return "main\n";
       if (args[0] === "for-each-ref") return "origin/main\n";
       if (args[0] === "rev-list") return "2\n";
-      if (args[0] === "reflog") return `${updatedSeconds}\n`;
+      if (args[0] === "reflog") {
+        assert.deepEqual(args, ["reflog", "show", "-1", "--format=%gD", "--date=raw", "@{upstream}"]);
+        return `refs/remotes/origin/main@{${updatedSeconds} +0530}\n`;
+      }
       throw new Error("unexpected git call");
     },
     now: () => fixedNow,
@@ -134,7 +137,7 @@ test("ahead count is tied to last-fetched local ref and includes the stale-remot
   assert.equal(result.status, "confirmed");
   assert.deepEqual(result.value, { branch: "main", upstream: "origin/main", aheadCount: 2 });
   assert.equal(result.freshness.state, "recent");
-  assert.match(result.summary, /last fetched upstream reference/u);
+  assert.match(result.summary, /local upstream reference/u);
   assert.match(result.summary, /remote was not contacted/u);
   assert.equal(calls.some((args) => args[0] === "fetch"), false);
 });
@@ -146,7 +149,7 @@ test("ahead count is marked stale when its local tracking ref is older than the 
       if (args[0] === "symbolic-ref") return "main\n";
       if (args[0] === "for-each-ref") return "origin/main\n";
       if (args[0] === "rev-list") return "0\n";
-      if (args[0] === "reflog") return `${oldSeconds}\n`;
+      if (args[0] === "reflog") return `refs/remotes/origin/main@{${oldSeconds} -0700}\n`;
       throw new Error("unexpected git call");
     },
     now: () => fixedNow,
@@ -201,6 +204,38 @@ test("ahead count is unavailable without upstream or usable commit evidence", as
   const invalid = await badCount[LOCAL_INTENTS.AHEAD_OF_UPSTREAM]({ cwd: "/workspace" });
   assert.equal(invalid.status, "unavailable");
   assert.equal(invalid.value, null);
+});
+
+test("empty, malformed, unsafe and implausibly future reflog timestamps keep freshness unknown", async () => {
+  const futureSeconds = Math.floor(fixedNow.getTime() / 1_000) + 7_200;
+  for (const output of [
+    "", "\n", "not-a-timestamp", "1792238400",
+    "refs/remotes/origin/main@{yesterday}",
+    "refs/remotes/origin/main@{NaN +0000}",
+    "refs/remotes/origin/main@{1.5 +0000}",
+    "refs/remotes/origin/main@{-1 +0000}",
+    "refs/remotes/origin/main@{99999999999999999999 +0000}",
+    `refs/remotes/origin/main@{${futureSeconds} +0000}`,
+    "refs/remotes/origin/main@{1792238400 +0000}\nextra",
+  ]) {
+    const handlers = createLocalHandlers({
+      now: () => fixedNow,
+      runGit: async (args) => {
+        if (args[0] === "symbolic-ref") return "main\n";
+        if (args[0] === "for-each-ref") return "origin/main\n";
+        if (args[0] === "rev-list") return "3\n";
+        if (args[0] === "reflog") return output;
+        assert.fail(`Unexpected Git command: ${args[0]}`);
+      },
+    });
+    const result = await handlers[LOCAL_INTENTS.AHEAD_OF_UPSTREAM]({ cwd: "/workspace" });
+    assert.equal(result.value.aheadCount, 3);
+    assert.equal(result.status, "confirmed"); // Confirms the local count, never its age.
+    assert.equal(result.freshness.state, "unknown", output);
+    assert.equal(result.freshness.lastUpdatedAt, undefined);
+    assert.match(result.summary, /age .* could not be established/u);
+    assert.match(result.summary, /remote was not contacted/u);
+  }
 });
 
 test("test-result handler reports unknown when no trusted runner record exists", async () => {

@@ -66,7 +66,9 @@ class AppServerClient extends EventEmitter {
     const generation = ++this.connectionGeneration;
     child.stdout?.setEncoding?.("utf8");
     child.stderr?.setEncoding?.("utf8");
-    child.stdout?.on("data", (chunk) => this.handleStdout(chunk));
+    child.stdout?.on("data", (chunk) => {
+      if (this.child === child && this.connectionGeneration === generation) this.handleStdout(chunk);
+    });
     // App-server stderr can contain project or prompt details. Never copy it to Vesper output.
     child.stderr?.on("data", () => {});
     child.on("error", (error) => this.handleExit(error, generation));
@@ -322,29 +324,35 @@ class AppServerClient extends EventEmitter {
   async handleServerRequest(message) {
     const { id, method, params = {} } = message;
     const active = this.activeTurn;
+    const child = this.child;
+    // Approval prompts can outlive a disconnected transport. Never send their
+    // replies (including denials/errors) to a replacement process with new IDs.
+    const respond = (response) => {
+      if (this.child === child && child) this.write(response);
+    };
     try {
       if (!isApprovalMethod(method)) {
-        this.write({ id, error: { code: -32601, message: `Vesper does not support app-server request ${method}.` } });
+        respond({ id, error: { code: -32601, message: `Vesper does not support app-server request ${method}.` } });
         if (active) this.finish(active, undefined, new Error(`Codex requested unsupported approval method ${method}.`));
         return;
       }
 
       if (!isCurrentApproval(active, method, params, this.activeTurn)) {
-        this.write({ id, result: validateApprovalResult(method, defaultApproval(method)) });
+        respond({ id, result: validateApprovalResult(method, defaultApproval(method)) });
         return;
       }
 
       this.emit("progress", { type: "approval_requested", method });
       const result = await this.onApproval(method, params);
       if (!isCurrentApproval(active, method, params, this.activeTurn)) {
-        this.write({ id, result: validateApprovalResult(method, defaultApproval(method)) });
+        respond({ id, result: validateApprovalResult(method, defaultApproval(method)) });
         return;
       }
       const safeResult = validateApprovalResult(method, result);
-      this.write({ id, result: safeResult });
+      respond({ id, result: safeResult });
     } catch (error) {
       try {
-        this.write({ id, error: { code: -32000, message: "Vesper could not complete the approval request." } });
+        respond({ id, error: { code: -32000, message: "Vesper could not complete the approval request." } });
       } catch {
         // A closed transport is already reported through the active turn.
       }
@@ -356,6 +364,8 @@ class AppServerClient extends EventEmitter {
     const active = this.activeTurn;
     if (!active) return;
     if (params.threadId && params.threadId !== active.threadId) return;
+    const eventTurnId = params.turnId || params.turn?.id;
+    if (eventTurnId && active.turnId && eventTurnId !== active.turnId) return;
 
     if (method === "turn/started") {
       const turnId = params.turn?.id;
@@ -381,8 +391,13 @@ class AppServerClient extends EventEmitter {
       return;
     }
 
-    if (method === "item/started" || method === "item/completed" || method === "item/commandExecution/outputDelta") {
-      this.emit("progress", { type: "codex_progress", method });
+    if (method === "item/started" || method === "item/completed" ||
+        method === "item/commandExecution/outputDelta" || method === "item/fileChange/outputDelta" ||
+        method === "item/fileChange/patchUpdated" || method === "turn/diff/updated" ||
+        method === "turn/plan/updated" || method === "item/mcpToolCall/progress" || method === "error") {
+      // Keep protocol payloads for additive frontend activity/diff/error views.
+      // Error notifications may describe retries; only turn/completed settles.
+      this.emit("progress", { type: "codex_progress", method, params });
     }
   }
 

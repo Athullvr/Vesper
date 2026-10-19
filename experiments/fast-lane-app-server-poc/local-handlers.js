@@ -140,14 +140,19 @@ function createLocalHandlers({ runGit, testResultReader, now = () => new Date() 
           : freshness.state === "unknown"
             ? " The age of the local tracking reference could not be established."
             : " The local tracking reference was updated within the last seven days.";
-        const summary = `This branch is ${aheadCount} commit${aheadCount === 1 ? "" : "s"} ahead of its last fetched upstream reference.${ageDescription} ${REMOTE_UNCHECKED_CAVEAT}`;
+        const summary = `This branch is ${aheadCount} commit${aheadCount === 1 ? "" : "s"} ahead of its local upstream reference.${ageDescription} ${REMOTE_UNCHECKED_CAVEAT}`;
 
         return createLocalResult({
           intent: LOCAL_INTENTS.AHEAD_OF_UPSTREAM,
           status,
           value: { branch, upstream, aheadCount },
           summary,
-          evidence: ["The ahead count came from git rev-list --count @{upstream}..HEAD."],
+          evidence: [
+            "The ahead count came from git rev-list --count @{upstream}..HEAD.",
+            freshness.state === "unknown"
+              ? "No usable upstream reflog entry timestamp was available."
+              : "The local ref update time came from git reflog show -1 --format=%gD --date=raw @{upstream}.",
+          ],
           source: { kind: "git", command: "git rev-list --count @{upstream}..HEAD", scope: "local refs only" },
           freshness: { ...freshness, observedAt: observedAt.toISOString(), caveat: REMOTE_UNCHECKED_CAVEAT },
         });
@@ -232,9 +237,13 @@ async function readCurrentUpstream(runGit, cwd) {
 
 async function getUpstreamFreshness(runGit, cwd, observedAt) {
   try {
-    const timestampText = (await runGit(["reflog", "show", "-1", "--format=%ct", "@{upstream}"], cwd)).trim();
-    if (!/^\d+$/u.test(timestampText)) return { state: "unknown" };
-    const timestamp = Number(timestampText) * 1_000;
+    // %ct dates the commit, not the ref update. %gD is the reflog selector;
+    // an explicit --date=raw makes its suffix @{<entry epoch> <timezone>}.
+    // Ask Git rather than reading .git/logs (worktrees and ref backends vary).
+    const selector = (await runGit(["reflog", "show", "-1", "--format=%gD", "--date=raw", "@{upstream}"], cwd)).trim();
+    const match = /^refs\/[^\s{}]+@\{(\d+) [+-]\d{4}\}$/u.exec(selector);
+    if (!match) return { state: "unknown" };
+    const timestamp = Number(match[1]) * 1_000;
     if (!Number.isSafeInteger(timestamp) || timestamp > observedAt.getTime() + 60 * 60 * 1_000) return { state: "unknown" };
     const lastUpdatedAt = new Date(timestamp).toISOString();
     return {
