@@ -201,6 +201,12 @@ test("approval requests use one-time supported decisions and permissions are lim
   assert.deepEqual(approvalResponse.result, { decision: "accept" });
   assert.equal(approvalCalls[0].method, "item/commandExecution/requestApproval");
 
+  server.requestFromServer("approval-stale", "item/commandExecution/requestApproval", {
+    itemId: "item-stale", startedAtMs: 2, threadId: "thread-1", turnId: "turn-1", command: "npm test",
+  });
+  assert.deepEqual(server.requests.find((request) => request.id === "approval-stale").result, { decision: "decline" });
+  assert.equal(approvalCalls.length, 1);
+
   assert.deepEqual(validateApprovalResult("item/permissions/requestApproval", { permissions: {}, scope: "turn" }), { permissions: {}, scope: "turn" });
   assert.throws(() => validateApprovalResult("item/permissions/requestApproval", { permissions: { network: { enabled: true } }, scope: "session" }), /turn-scoped/u);
   assert.throws(() => validateApprovalResult("item/commandExecution/requestApproval", { decision: "acceptForSession" }), /not supported/u);

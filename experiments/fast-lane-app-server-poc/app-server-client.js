@@ -316,16 +316,24 @@ class AppServerClient extends EventEmitter {
   async handleServerRequest(message) {
     const { id, method, params = {} } = message;
     const active = this.activeTurn;
-    if (active && (params.threadId && params.threadId !== active.threadId || params.turnId && active.turnId && params.turnId !== active.turnId)) return;
-    this.emit("progress", { type: "approval_requested", method });
-
     try {
       if (!isApprovalMethod(method)) {
         this.write({ id, error: { code: -32601, message: `Vesper does not support app-server request ${method}.` } });
         if (active) this.finish(active, undefined, new Error(`Codex requested unsupported approval method ${method}.`));
         return;
       }
+
+      if (!isCurrentApproval(active, method, params, this.activeTurn)) {
+        this.write({ id, result: validateApprovalResult(method, defaultApproval(method)) });
+        return;
+      }
+
+      this.emit("progress", { type: "approval_requested", method });
       const result = await this.onApproval(method, params);
+      if (!isCurrentApproval(active, method, params, this.activeTurn)) {
+        this.write({ id, result: validateApprovalResult(method, defaultApproval(method)) });
+        return;
+      }
       const safeResult = validateApprovalResult(method, result);
       this.write({ id, result: safeResult });
     } catch (error) {
@@ -446,6 +454,17 @@ function defaultApproval(method) {
   if (method === "item/permissions/requestApproval") return { permissions: {}, scope: "turn" };
   if (method === "applyPatchApproval" || method === "execCommandApproval") return { decision: "denied" };
   return { decision: "decline" };
+}
+
+function isCurrentApproval(capturedTurn, method, params, currentTurn) {
+  if (!capturedTurn || capturedTurn.settled || capturedTurn !== currentTurn) return false;
+  const requestThreadId = params.threadId || params.conversationId;
+  if (requestThreadId && requestThreadId !== capturedTurn.threadId) return false;
+  if (params.turnId && capturedTurn.turnId && params.turnId !== capturedTurn.turnId) return false;
+  if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval" || method === "item/permissions/requestApproval") {
+    return Boolean(params.threadId && params.turnId);
+  }
+  return true;
 }
 
 function validateApprovalResult(method, value) {

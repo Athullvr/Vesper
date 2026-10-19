@@ -19,6 +19,8 @@ class TerminalFrontend {
     this.activeRequest = false;
     this.exitAfterTurn = false;
     this.closed = false;
+    this.pendingApprovals = new Set();
+    this.approvalQueue = Promise.resolve();
     this.handleProgress = this.handleProgress.bind(this);
 
     this.appServer.on?.("progress", this.handleProgress);
@@ -80,7 +82,7 @@ class TerminalFrontend {
         fallback: () => this.appServer.runTurn({
           prompt,
           cwd: this.cwd,
-          onDelta: (delta) => this.write(String(delta)),
+          onDelta: (delta) => this.write(safeStreamText(delta)),
         }),
       });
       const result = routed.fallbackResult;
@@ -96,18 +98,38 @@ class TerminalFrontend {
       this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
       this.activeRequest = false;
+      if (this.pendingApprovals.size) {
+        this.write("[Vesper] Waiting for the pending approval decision before the next prompt.\n");
+        await Promise.allSettled([...this.pendingApprovals]);
+      }
       if (this.exitAfterTurn) this.lineIO.close?.();
     }
   }
 
-  async requestApproval(method, params = {}) {
+  requestApproval(method, params = {}) {
+    const pending = this.approvalQueue.then(() => this.promptForApproval(method, params));
+    this.approvalQueue = pending.catch(() => undefined);
+    this.pendingApprovals.add(pending);
+    pending.then(
+      () => this.pendingApprovals.delete(pending),
+      () => this.pendingApprovals.delete(pending)
+    );
+    return pending;
+  }
+
+  async promptForApproval(method, params = {}) {
     const details = approvalDetails(method, params);
     this.write(`\n\n[Codex approval required · ${details.title}]\n`);
     if (details.body) this.write(`${details.body}\n`);
 
+    if (details.truncated) {
+      this.write("The complete approval details do not fit the terminal review limit; Vesper declined this request.\n");
+      return refusedApproval(method);
+    }
+
     if (method === "item/commandExecution/requestApproval" && Array.isArray(params.availableDecisions) && !params.availableDecisions.includes("accept")) {
       this.write("This command cannot be approved through the available protocol decisions.\n");
-      return { decision: "decline" };
+      return refusedApproval(method);
     }
 
     const answer = await this.lineIO.question("Type yes to approve once, cancel to cancel, or anything else to decline: ");
@@ -200,52 +222,86 @@ function createLineIO(input, output) {
 }
 
 function approvalDetails(method, params) {
+  const lines = [];
+  let truncated = false;
+  const add = (label, value, json = false) => {
+    if (value === undefined || value === null || value === "") return;
+    let text = json ? JSON.stringify(value, null, 2) : String(value);
+    text = escapeTerminalControls(text);
+    if (text.length > 8_000) {
+      text = `${text.slice(0, 8_000)}\n[truncated]`;
+      truncated = true;
+    }
+    lines.push(`${label}: ${text}`);
+  };
+
+  let title = "unknown approval";
   if (method === "item/commandExecution/requestApproval") {
-    const lines = [];
-    if (params.command) lines.push(`Command: ${safeTerminalText(params.command)}`);
-    if (params.cwd) lines.push(`Directory: ${safeTerminalText(params.cwd)}`);
-    if (params.reason) lines.push(`Reason: ${safeTerminalText(params.reason)}`);
-    return { title: "command execution", body: lines.join("\n") };
+    title = "command execution";
+    add("Command", params.command);
+    add("Working directory", params.cwd);
+    add("Reason", params.reason);
+    add("Parsed actions", params.commandActions, true);
+    add("Additional permissions requested", params.additionalPermissions, true);
+    add("Network approval context", params.networkApprovalContext, true);
+    add("Proposed future command rules", params.proposedExecpolicyAmendment, true);
+    add("Proposed future network rules", params.proposedNetworkPolicyAmendments, true);
+  } else if (method === "item/fileChange/requestApproval") {
+    title = "file changes";
+    add("Requested write root", params.grantRoot);
+    add("Reason", params.reason);
+  } else if (method === "item/permissions/requestApproval") {
+    title = "additional permissions for this turn";
+    add("Reason", params.reason);
+    add("Requested profile", params.permissions || {}, true);
+  } else if (method === "applyPatchApproval") {
+    title = "patch application";
+    add("Reason", params.reason);
+    add("File changes", params.fileChanges || {}, true);
+  } else if (method === "execCommandApproval") {
+    title = "command execution";
+    add("Command argv", params.command, true);
+    add("Working directory", params.cwd);
+    add("Parsed command", params.parsedCmd, true);
+    add("Reason", params.reason);
+  } else {
+    lines.push("No approval details are available.");
   }
-  if (method === "item/fileChange/requestApproval") {
-    const lines = [];
-    if (params.grantRoot) lines.push(`Requested write root: ${safeTerminalText(params.grantRoot)}`);
-    if (params.reason) lines.push(`Reason: ${safeTerminalText(params.reason)}`);
-    return { title: "file changes", body: lines.join("\n") };
+
+  let body = lines.join("\n");
+  if (body.length > 20_000) {
+    body = `${body.slice(0, 20_000)}\n[truncated]`;
+    truncated = true;
   }
-  if (method === "item/permissions/requestApproval") {
-    return {
-      title: "additional permissions for this turn",
-      body: [params.reason && `Reason: ${safeTerminalText(params.reason)}`, `Requested profile: ${JSON.stringify(params.permissions || {})}`].filter(Boolean).join("\n"),
-    };
-  }
-  if (method === "applyPatchApproval") {
-    const files = Object.keys(params.fileChanges || {});
-    return {
-      title: "patch application",
-      body: [params.reason && `Reason: ${safeTerminalText(params.reason)}`, files.length ? `Files: ${files.map(safeTerminalText).join(", ")}` : "The patch did not include a file list."].filter(Boolean).join("\n"),
-    };
-  }
-  if (method === "execCommandApproval") {
-    const command = Array.isArray(params.command) ? params.command.join(" ") : params.command;
-    return {
-      title: "command execution",
-      body: [command && `Command: ${safeTerminalText(command)}`, params.cwd && `Directory: ${safeTerminalText(params.cwd)}`, params.reason && `Reason: ${safeTerminalText(params.reason)}`].filter(Boolean).join("\n"),
-    };
-  }
-  return { title: "unknown approval", body: "No approval details are available." };
+  return { title, body, truncated };
 }
 
 function safeTerminalText(value) {
+  return escapeTerminalControls(value).slice(0, 4_000);
+}
+
+function escapeTerminalControls(value) {
   return String(value ?? "")
     .replace(/\u001b/gu, "\\x1b")
     .replace(/\r/gu, "\\r")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ")
-    .slice(0, 4_000);
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ");
+}
+
+function safeStreamText(value) {
+  return String(value ?? "")
+    .replace(/\u001b/gu, "\\x1b")
+    .replace(/\r/gu, "\\r")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ");
 }
 
 function cloneJsonValue(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function refusedApproval(method) {
+  if (method === "item/permissions/requestApproval") return { permissions: {}, scope: "turn" };
+  if (method === "applyPatchApproval" || method === "execCommandApproval") return { decision: "denied" };
+  return { decision: "decline" };
 }
 
 module.exports = {
@@ -253,4 +309,5 @@ module.exports = {
   approvalDetails,
   createLineIO,
   safeTerminalText,
+  safeStreamText,
 };

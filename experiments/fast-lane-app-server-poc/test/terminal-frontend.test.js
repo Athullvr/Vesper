@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { LOCAL_INTENTS, createLocalResult } = require("../routing-core");
-const { TerminalFrontend } = require("../terminal-frontend");
+const { TerminalFrontend, safeStreamText } = require("../terminal-frontend");
 
 class FakeLineIO {
   constructor(answers = []) {
@@ -139,10 +139,14 @@ test("approval prompts require an explicit yes and only grant one-time protocol 
   const commandResult = await accepting.requestApproval("item/commandExecution/requestApproval", {
     command: "printf '\u001b[31munsafe?\u001b[0m'",
     cwd: "/workspace/project",
+    additionalPermissions: { network: { enabled: true } },
+    networkApprovalContext: { host: "example.test", protocol: "https" },
     availableDecisions: ["accept", "decline"],
   });
   assert.deepEqual(commandResult, { decision: "accept" });
   assert.match(acceptingOutput(), /\\x1b/u);
+  assert.match(acceptingOutput(), /example\.test/u);
+  assert.match(acceptingOutput(), /Additional permissions requested/u);
   assert.equal(acceptingOutput().includes("\u001b"), false);
 
   const { frontend: declining } = makeFrontend({ answers: ["no"] });
@@ -168,4 +172,18 @@ test("a command cannot be approved when the server does not offer the one-time a
   });
   assert.deepEqual(result, { decision: "decline" });
   assert.equal(io.questions.length, 0);
+});
+
+test("approval details that exceed the review limit are declined without asking", async () => {
+  const { frontend, io } = makeFrontend({ answers: ["yes"] });
+  const result = await frontend.requestApproval("item/commandExecution/requestApproval", {
+    command: "x".repeat(9_000),
+    availableDecisions: ["accept", "decline"],
+  });
+  assert.deepEqual(result, { decision: "decline" });
+  assert.equal(io.questions.length, 0);
+});
+
+test("streamed model text cannot inject terminal control sequences", () => {
+  assert.equal(safeStreamText("answer\u001b[2J\rnext"), "answer\\x1b[2J\\rnext");
 });
