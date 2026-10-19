@@ -5,6 +5,7 @@ const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core"
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
+const { LiveTurnDiffView } = require("./live-turn-diff-view");
 
 const QUIT_COMMANDS = new Set([":quit", ":exit", "/quit", "/exit"]);
 const MAX_FILE_ACTIVITY_ITEMS = 50;
@@ -34,6 +35,13 @@ class TerminalFrontend {
     this.fileActivityLimitReported = false;
     this.turnDiffIdentity = null;
     this.turnDiffRendered = false;
+    this.pendingTurnDiffFinal = null;
+    this.approvalPromptDepth = 0;
+    this.turnDiffView = new LiveTurnDiffView({
+      output,
+      enabled: Boolean(input?.isTTY && output?.isTTY && process.env.TERM !== "dumb"),
+      renderActivity: (activity) => renderTurnDiffActivity({ ...activity, closeReason: activity?.closeReason || "inProgress" }),
+    });
     this.pendingApprovals = new Set();
     this.approvalQueue = Promise.resolve();
     this.handleProgress = this.handleProgress.bind(this);
@@ -94,6 +102,8 @@ class TerminalFrontend {
     this.commandActivity = new CommandActivityStore();
     this.turnDiffIdentity = null;
     this.turnDiffRendered = false;
+    this.pendingTurnDiffFinal = null;
+    this.turnDiffView.begin();
     this.fileActivityIdentities.clear();
     this.fileActivityOutputLength = 0;
     this.fileActivityLimitReported = false;
@@ -121,6 +131,7 @@ class TerminalFrontend {
       this.metrics.record(decision, elapsedMs);
       this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
+      this.turnDiffView.end();
       this.activeRequest = false;
       this.commandActivity = null;
       if (this.pendingApprovals.size) {
@@ -132,7 +143,26 @@ class TerminalFrontend {
   }
 
   requestApproval(method, params = {}, context) {
-    const pending = this.approvalQueue.then(() => this.promptForApproval(method, params, context));
+    const pending = this.approvalQueue.then(async () => {
+      this.approvalPromptDepth += 1;
+      this.turnDiffView.suspend();
+      try {
+        return await this.promptForApproval(method, params, context);
+      } finally {
+        this.approvalPromptDepth = Math.max(0, this.approvalPromptDepth - 1);
+        if (this.approvalPromptDepth === 0) {
+          if (this.pendingTurnDiffFinal) {
+            const activity = this.pendingTurnDiffFinal;
+            this.pendingTurnDiffFinal = null;
+            this.write(renderTurnDiffActivity(activity));
+          } else {
+            this.turnDiffView.resume();
+          }
+        } else {
+          this.turnDiffView.resume();
+        }
+      }
+    });
     this.approvalQueue = pending.catch(() => undefined);
     this.pendingApprovals.add(pending);
     pending.then(
@@ -203,6 +233,7 @@ class TerminalFrontend {
         this.turnDiffIdentity = isTurnDiffIdentity(event.threadId, event.turnId)
           ? { threadId: event.threadId, turnId: event.turnId }
           : null;
+        if (this.turnDiffIdentity) this.turnDiffView.begin();
         this.renderCommandActivity(this.commandActivity?.bindTurn(event.threadId, event.turnId));
         this.renderFileChangeActivities(event.fileChanges);
         break;
@@ -229,6 +260,9 @@ class TerminalFrontend {
         break;
       case "turn_diff_activity":
         this.renderTurnDiffActivity(event.activity);
+        break;
+      case "turn_diff_updated":
+        this.updateTurnDiffActivity(event.activity);
         break;
       case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
       case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
@@ -267,10 +301,19 @@ class TerminalFrontend {
   renderTurnDiffActivity(activity) {
     if (this.turnDiffRendered || !isTurnDiffIdentity(activity?.threadId, activity?.turnId)) return;
     if (!this.turnDiffIdentity || activity.threadId !== this.turnDiffIdentity.threadId || activity.turnId !== this.turnDiffIdentity.turnId) return;
-    const rendered = renderTurnDiffActivity(activity);
-    if (!rendered) return;
+    const retainedInPlace = this.turnDiffView.close(activity);
     this.turnDiffRendered = true;
-    this.write(rendered);
+    if (this.approvalPromptDepth > 0) {
+      this.pendingTurnDiffFinal = activity;
+      return;
+    }
+    if (!retainedInPlace) this.write(renderTurnDiffActivity(activity));
+  }
+
+  updateTurnDiffActivity(activity) {
+    if (this.turnDiffRendered || !isTurnDiffIdentity(activity?.threadId, activity?.turnId)) return;
+    if (!this.turnDiffIdentity || activity.threadId !== this.turnDiffIdentity.threadId || activity.turnId !== this.turnDiffIdentity.turnId) return;
+    this.turnDiffView.update(activity);
   }
 
   writeFileActivityLimitMarker() {
@@ -295,7 +338,12 @@ class TerminalFrontend {
   }
 
   write(text) {
-    this.output.write(String(text));
+    this.turnDiffView.beforeExternalWrite();
+    try {
+      this.output.write(String(text));
+    } finally {
+      this.turnDiffView.afterExternalWrite();
+    }
   }
 }
 
@@ -503,8 +551,11 @@ function renderTurnDiffActivity(activity) {
   const evidenceStates = new Set(["available", "empty", "unavailable"]);
   const closeReasons = new Set(["completed", "interrupted", "failed", "disconnected", "timeout", "client_closed", "unknown"]);
   const evidenceState = evidenceStates.has(activity.evidenceState) ? activity.evidenceState : "unavailable";
-  const closeReason = closeReasons.has(activity.closeReason) ? activity.closeReason : "unknown";
+  const closeReason = activity.closeReason === "inProgress"
+    ? "inProgress"
+    : closeReasons.has(activity.closeReason) ? activity.closeReason : "unknown";
   const lifecycle = {
+    inProgress: "turn in progress; snapshot may be partial",
     completed: "turn completed",
     interrupted: "turn interrupted; snapshot may be partial",
     failed: "turn failed; snapshot may be partial",

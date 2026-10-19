@@ -132,7 +132,7 @@ class AppServerClient extends EventEmitter {
       }
       active.turnId = turn.id;
       active.startAcknowledged = true;
-      active.turnDiff.bindTurn(active.threadId, active.turnId);
+      const boundTurnDiff = active.turnDiff.bindTurn(active.threadId, active.turnId);
       active.resolveStart();
       this.emit("progress", {
         type: "turn_identity",
@@ -140,6 +140,7 @@ class AppServerClient extends EventEmitter {
         turnId: active.turnId,
         fileChanges: active.fileChanges.activities(active.threadId, active.turnId),
       });
+      if (boundTurnDiff) this.emitTurnDiffUpdate(active, boundTurnDiff);
       if (active.pendingTurnStarts.has(active.turnId) || turn.status === "inProgress") this.emitTurnStarted(active);
       for (const delta of active.pendingDeltas) {
         if (delta.turnId === active.turnId && delta.delta) active.onDelta(delta.delta);
@@ -449,18 +450,26 @@ class AppServerClient extends EventEmitter {
   handleNotification(method, params) {
     const active = this.activeTurn;
     if (!active) return;
-    if (method === "turn/diff/updated") active.turnDiff.record(params);
+    const turnDiffUpdate = method === "turn/diff/updated" ? active.turnDiff.record(params) : null;
     // Retain early item snapshots, but approval waits for the authoritative
     // turn/start response. Every cache key includes all three protocol IDs.
     const fileChangeUpdates = active.fileChanges.record(method, params, active.startAcknowledged ? active.turnId : null);
     if (!params || typeof params !== "object" || Array.isArray(params)) {
       if (active.startAcknowledged) this.emitFileChangeActivities(active, fileChangeUpdates);
+      if (active.startAcknowledged) this.emitTurnDiffUpdate(active, turnDiffUpdate);
       return;
     }
-    if (params.threadId && params.threadId !== active.threadId) return;
+    if (params.threadId && params.threadId !== active.threadId) {
+      if (active.startAcknowledged) this.emitTurnDiffUpdate(active, turnDiffUpdate);
+      return;
+    }
     const eventTurnId = params.turnId || params.turn?.id;
-    if (eventTurnId && active.turnId && eventTurnId !== active.turnId) return;
+    if (eventTurnId && active.turnId && eventTurnId !== active.turnId) {
+      if (active.startAcknowledged) this.emitTurnDiffUpdate(active, turnDiffUpdate);
+      return;
+    }
     if (active.startAcknowledged) this.emitFileChangeActivities(active, fileChangeUpdates);
+    if (active.startAcknowledged) this.emitTurnDiffUpdate(active, turnDiffUpdate);
 
     if (method === "turn/started") {
       const turnId = params.turn?.id;
@@ -579,6 +588,11 @@ class AppServerClient extends EventEmitter {
     const activity = active.turnDiff.close(reason);
     if (!activity || activity.threadId !== active.threadId || activity.turnId !== active.turnId) return;
     this.emit("progress", { type: "turn_diff_activity", activity });
+  }
+
+  emitTurnDiffUpdate(active, activity) {
+    if (!activity || activity.threadId !== active.threadId || activity.turnId !== active.turnId || active.settled) return;
+    this.emit("progress", { type: "turn_diff_updated", activity });
   }
 
   handleExit(error, generation) {

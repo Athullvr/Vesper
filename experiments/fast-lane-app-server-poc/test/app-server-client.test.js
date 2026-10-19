@@ -286,9 +286,11 @@ test("late events from a disconnected process cannot complete or stream into a r
   await new Promise((resolve) => setImmediate(resolve));
   const currentDiff = client.activeTurn.turnDiff.snapshot();
   const beforeLateDiff = progress.filter((event) => event.type === "turn_diff_activity").length;
+  const beforeLateLiveDiff = progress.filter((event) => event.type === "turn_diff_updated").length;
   first.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "stale old process snapshot" } });
   assert.deepEqual(client.activeTurn.turnDiff.snapshot(), currentDiff, "a replaced process cannot update the active aggregate view");
   assert.equal(progress.filter((event) => event.type === "turn_diff_activity").length, beforeLateDiff);
+  assert.equal(progress.filter((event) => event.type === "turn_diff_updated").length, beforeLateLiveDiff, "a replaced process cannot publish a live view update");
   first.send({ method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", delta: "stale text" } });
   first.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
   first.emit("close", 1, null);
@@ -962,13 +964,37 @@ test("turn diff updates replace the aggregate snapshot and never become per-item
 
   assert.deepEqual(await client.runTurn({ prompt: "Inspect proposed changes", cwd: "/workspace" }), { status: "completed" });
   const views = progress.filter((event) => event.type === "turn_diff_activity");
+  const liveViews = progress.filter((event) => event.type === "turn_diff_updated");
   assert.equal(views.length, 1, "complete snapshots are projected once when the turn closes");
+  assert.equal(liveViews.length, 1, "pre-ack complete snapshots bind to the authoritative turn before live forwarding");
+  assert.equal(liveViews[0].activity.diff, "latest complete snapshot");
   assert.equal(views[0].activity.diff, "latest complete snapshot");
   assert.equal(views[0].activity.evidenceState, "available");
   assert.equal(views[0].activity.closeReason, "completed");
   assert.equal(Object.hasOwn(views[0].activity, "itemId"), false);
   assert.equal(approvalEvidence, null, "aggregate diffs cannot create file-item approval evidence");
   assert.equal(progress.some((event) => event.type === "codex_progress" && event.method === "turn/diff/updated"), false);
+});
+
+test("accepted turn diff snapshots are forwarded live only for the active thread and turn", async (t) => {
+  const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
+    setImmediate(() => {
+      current.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "live first" } });
+      current.send({ method: "turn/diff/updated", params: { threadId: "foreign", turnId: "turn-1", diff: "foreign thread" } });
+      current.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "foreign-turn", diff: "foreign turn" } });
+      current.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "live replacement" } });
+      current.completeTurn(request, "completed");
+    });
+  } });
+  const { client } = createClient(server);
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
+  t.after(() => client.dispose());
+
+  assert.deepEqual(await client.runTurn({ prompt: "Observe aggregate updates", cwd: "/workspace" }), { status: "completed" });
+  const live = progress.filter((event) => event.type === "turn_diff_updated");
+  assert.deepEqual(live.map((event) => event.activity.diff), ["live first", "live replacement"]);
+  assert.equal(live.every((event) => event.activity.threadId === "thread-1" && event.activity.turnId === "turn-1"), true);
 });
 
 test("turn diff view closes with the protocol turn outcome for completion, interruption and failure", async (t) => {
