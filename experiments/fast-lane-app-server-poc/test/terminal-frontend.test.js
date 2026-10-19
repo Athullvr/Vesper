@@ -7,6 +7,7 @@ const { PassThrough } = require("node:stream");
 const { LOCAL_INTENTS, createLocalResult } = require("../routing-core");
 const { TerminalFrontend, createLineIO, safeStreamText } = require("../terminal-frontend");
 const { FileChangeApprovalStore } = require("../file-change-approval");
+const { AppServerClient } = require("../app-server-client");
 
 class FakeLineIO {
   constructor(answers = []) {
@@ -53,6 +54,51 @@ class FakeAppServer extends EventEmitter {
   }
 
   dispose() {}
+}
+
+class FakeCodexProcess extends EventEmitter {
+  constructor({ onTurnStart = () => {} } = {}) {
+    super();
+    this.stdout = new EventEmitter();
+    this.stderr = new EventEmitter();
+    this.stdout.setEncoding = () => {};
+    this.stderr.setEncoding = () => {};
+    this.requests = [];
+    this.turnCount = 0;
+    this.onTurnStart = onTurnStart;
+    this.onClientResponse = () => {};
+    this.killed = false;
+    this.stdin = { writable: true, write: (line) => this.receive(JSON.parse(line)) };
+  }
+
+  receive(message) {
+    this.requests.push(message);
+    if (!Object.hasOwn(message, "id")) return;
+    if (message.method === "initialize") this.respond(message.id, { codexHome: "/mock", platformFamily: "unix", platformOs: "linux", userAgent: "mock" });
+    else if (message.method === "thread/start") this.respond(message.id, { thread: { id: "thread-1" }, cwd: message.params.cwd });
+    else if (message.method === "thread/resume") this.respond(message.id, { thread: { id: message.params.threadId }, cwd: "/workspace/project" });
+    else if (message.method === "turn/start") {
+      this.turnCount += 1;
+      this.cwd = message.params.cwd;
+      this.respond(message.id, { turn: { id: `turn-${this.turnCount}`, items: [], status: "inProgress" } });
+      this.onTurnStart(message, this);
+    } else if (message.method === "turn/interrupt") this.respond(message.id, {});
+    else this.onClientResponse(message, this);
+  }
+
+  respond(id, result) { this.send({ id, result }); }
+  send(message) { this.stdout.emit("data", `${JSON.stringify(message)}\n`); }
+  requestFromServer(id, method, params) { this.send({ id, method, params }); }
+  kill() { this.killed = true; }
+
+  completeTurn(startRequest, status, text = "") {
+    const turnId = `turn-${this.turnCount}`;
+    queueMicrotask(() => {
+      this.send({ method: "turn/started", params: { threadId: startRequest.params.threadId, turn: { id: turnId, status: "inProgress", items: [] } } });
+      if (text) this.send({ method: "item/agentMessage/delta", params: { threadId: startRequest.params.threadId, turnId, itemId: "answer-1", delta: text } });
+      this.send({ method: "turn/completed", params: { threadId: startRequest.params.threadId, turn: { id: turnId, status, items: [] } } });
+    });
+  }
 }
 
 function makeFrontend({ answers, appServer, handlers, lineIO, onWrite } = {}) {
@@ -179,7 +225,7 @@ test("Ctrl+C requests interruption, reports terminal status, and ends the curren
 test("approval prompts require an explicit yes and only grant one-time protocol decisions", async () => {
   const { frontend: accepting, output: acceptingOutput } = makeFrontend({ answers: ["yes"] });
   const commandResult = await accepting.requestApproval("item/commandExecution/requestApproval", {
-    command: "printf '\u001b[31munsafe?\u001b[0m'",
+    command: "printf '\u001b[31munsafe?\u001b[0m' API_KEY=supersecret",
     cwd: "/workspace/project",
     additionalPermissions: { network: { enabled: true } },
     networkApprovalContext: { host: "example.test", protocol: "https" },
@@ -187,6 +233,8 @@ test("approval prompts require an explicit yes and only grant one-time protocol 
   });
   assert.deepEqual(commandResult, { decision: "accept" });
   assert.match(acceptingOutput(), /\\x1b/u);
+  assert.match(acceptingOutput(), /API_KEY=\[redacted\]/u);
+  assert.doesNotMatch(acceptingOutput(), /supersecret/u);
   assert.match(acceptingOutput(), /example\.test/u);
   assert.match(acceptingOutput(), /Additional permissions requested/u);
   assert.equal(acceptingOutput().includes("\u001b"), false);
@@ -241,6 +289,63 @@ test("approval details that exceed the review limit are declined without asking"
 
 test("streamed model text cannot inject terminal control sequences", () => {
   assert.equal(safeStreamText("answer\u001b[2J\rnext"), "answer\\x1b[2J\\rnext");
+});
+
+test("app-server command item and output notifications render bounded activity through the terminal", async () => {
+  const server = new FakeCodexProcess({ onTurnStart: (request, current) => {
+    const params = {
+      threadId: "thread-1", turnId: "turn-1", startedAtMs: 1,
+      item: {
+        type: "commandExecution", id: "command-1", command: "npm test", cwd: "/workspace/project",
+        status: "inProgress", exitCode: null, aggregatedOutput: null,
+      },
+    };
+    current.send({ method: "item/started", params });
+    current.send({ method: "item/commandExecution/outputDelta", params: {
+      threadId: params.threadId, turnId: params.turnId, itemId: params.item.id, delta: "all checks passed\n",
+    } });
+    current.send({ method: "item/completed", params: {
+      ...params, completedAtMs: 2,
+      item: { ...params.item, status: "completed", exitCode: 0, aggregatedOutput: "all checks passed\n" },
+    } });
+    current.completeTurn(request, "completed", "Finished.");
+  } });
+  const appServer = new AppServerClient({
+    spawnProcess: () => server,
+  });
+  const { frontend, output } = makeFrontend({ appServer, answers: ["Inspect the test command", ":quit"] });
+  await frontend.run();
+
+  assert.match(output(), /Codex command #1 · execution started/u);
+  assert.match(output(), /Command: npm test/u);
+  assert.match(output(), /Working directory: \/workspace\/project/u);
+  assert.match(output(), /Codex command #1 · execution completed · exit code 0/u);
+  assert.match(output(), /\| all checks passed/u);
+  appServer.dispose();
+});
+
+test("approval acceptance is shown separately and does not imply command execution", async () => {
+  let startRequest;
+  const server = new FakeCodexProcess({ onTurnStart: (request, current) => {
+    startRequest = request;
+    current.requestFromServer("approval-1", "item/commandExecution/requestApproval", {
+      threadId: "thread-1", turnId: "turn-1", itemId: "command-1", startedAtMs: 1,
+      command: "npm test", cwd: "/workspace/project", availableDecisions: ["accept", "decline"],
+    });
+  } });
+  server.onClientResponse = (message, current) => {
+    if (message.id === "approval-1") current.completeTurn(startRequest, "completed", "The server did not report a command item.");
+  };
+  const appServer = new AppServerClient({ spawnProcess: () => server });
+  const { frontend, output } = makeFrontend({ appServer, answers: ["Inspect command", "yes", ":quit"] });
+  appServer.onApproval = (method, params, context) => frontend.requestApproval(method, params, context);
+  await frontend.run();
+  assert.match(output(), /approval requested/u);
+  assert.match(output(), /approval approved/u);
+  assert.match(output(), /execution status unavailable|turn ended before command status was reported/u);
+  assert.doesNotMatch(output(), /execution completed/u);
+  assert.deepEqual(server.requests.find((request) => request.id === "approval-1").result, { decision: "accept" });
+  appServer.dispose();
 });
 
 function reviewFixture(changes = [{ path: "/workspace/hello.txt", kind: { type: "update" }, diff: "@@ -1 +1 @@\n-old\n+hello\n" }], itemId = "file-1") {

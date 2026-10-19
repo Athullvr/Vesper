@@ -126,12 +126,21 @@ class AppServerClient extends EventEmitter {
         input: [{ type: "text", text: prompt }],
       });
       const turn = response?.turn;
-      if (!turn || typeof turn.id !== "string" || !turn.id) {
+      if (!turn || !isSafeProtocolIdentity(turn.id)) {
         throw new Error("Codex app-server did not return a turn id.");
       }
       active.turnId = turn.id;
       active.startAcknowledged = true;
       active.resolveStart();
+      this.emit("progress", { type: "turn_identity", threadId: active.threadId, turnId: active.turnId });
+      if (active.pendingTurnStarts.has(active.turnId) || turn.status === "inProgress") this.emitTurnStarted(active);
+      for (const delta of active.pendingDeltas) {
+        if (delta.turnId === active.turnId && delta.delta) active.onDelta(delta.delta);
+      }
+      active.pendingDeltas = [];
+      active.pendingDeltaLength = 0;
+      const pendingCompletion = active.pendingCompletions.get(active.turnId);
+      if (pendingCompletion && !active.settled) this.finishFromStatus(active, pendingCompletion);
       if (active.interruptRequested) await this.sendInterrupt(active);
 
       if (isTerminalStatus(turn.status) && !active.settled) {
@@ -178,7 +187,7 @@ class AppServerClient extends EventEmitter {
       }
       await this.onThreadId(this.threadId);
       this.threadReady = true;
-      this.emit("progress", { type: "thread_resumed" });
+      this.emit("progress", { type: "thread_resumed", threadId: this.threadId });
       return;
     }
 
@@ -192,7 +201,7 @@ class AppServerClient extends EventEmitter {
     this.threadId = threadId;
     await this.onThreadId(threadId);
     this.threadReady = true;
-    this.emit("progress", { type: "thread_started" });
+    this.emit("progress", { type: "thread_started", threadId: this.threadId });
   }
 
   createActiveTurn(onDelta) {
@@ -212,6 +221,11 @@ class AppServerClient extends EventEmitter {
       threadId: this.threadId,
       turnId: null,
       startAcknowledged: false,
+      pendingTurnStarts: new Set(),
+      pendingCompletions: new Map(),
+      pendingDeltas: [],
+      pendingDeltaLength: 0,
+      turnStartedEmitted: false,
       startReady,
       resolveStart,
       fileChanges: new FileChangeApprovalStore(this.threadId),
@@ -348,7 +362,11 @@ class AppServerClient extends EventEmitter {
     // Approval prompts can outlive a disconnected transport. Never send their
     // replies (including denials/errors) to a replacement process with new IDs.
     const respond = (response) => {
-      if (this.child === child && child) this.write(response);
+      if (this.child === child && child) {
+        this.write(response);
+        return true;
+      }
+      return false;
     };
     const declineFileChange = (reason) => {
       if (this.child !== child || !child) return;
@@ -374,6 +392,7 @@ class AppServerClient extends EventEmitter {
         ? active.fileChanges.capture(params)
         : undefined;
       if (fileApproval && active) await active.startReady;
+      if (method === "item/commandExecution/requestApproval" && active) await active.startReady;
       if (!isCurrentApproval(active, method, params, this.activeTurn)) {
         if (fileApproval) {
           declineFileChange("The file-change request does not belong to the active turn.");
@@ -393,7 +412,7 @@ class AppServerClient extends EventEmitter {
           return;
         }
       }
-      this.emit("progress", { type: "approval_requested", method });
+      this.emit("progress", { type: "approval_requested", method, params });
       const result = await this.onApproval(method, params, context);
       if (!isCurrentApproval(active, method, params, this.activeTurn) || (context && !context.isCurrent())) {
         if (fileApproval) {
@@ -404,7 +423,11 @@ class AppServerClient extends EventEmitter {
         return;
       }
       const safeResult = validateApprovalResult(method, result);
-      respond({ id, result: safeResult });
+      const sent = respond({ id, result: safeResult });
+      if (sent && method === "item/commandExecution/requestApproval") {
+        const status = safeResult.decision === "accept" ? "approved" : safeResult.decision === "cancel" ? "cancelled" : "declined";
+        this.emit("progress", { type: "approval_decided", method, params, status });
+      }
     } catch (error) {
       try {
         respond({ id, error: { code: -32000, message: "Vesper could not complete the approval request." } });
@@ -421,14 +444,20 @@ class AppServerClient extends EventEmitter {
     // Retain early item snapshots, but approval waits for the authoritative
     // turn/start response. Every cache key includes all three protocol IDs.
     active.fileChanges.record(method, params, active.startAcknowledged ? active.turnId : null);
+    if (!params || typeof params !== "object" || Array.isArray(params)) return;
     if (params.threadId && params.threadId !== active.threadId) return;
     const eventTurnId = params.turnId || params.turn?.id;
     if (eventTurnId && active.turnId && eventTurnId !== active.turnId) return;
 
     if (method === "turn/started") {
       const turnId = params.turn?.id;
-      if (typeof turnId === "string") active.turnId = turnId;
-      this.emit("progress", { type: "turn_started" });
+      if (params.threadId !== active.threadId || !isSafeProtocolIdentity(turnId)) return;
+      if (!active.startAcknowledged) {
+        if (active.pendingTurnStarts.size < 4) active.pendingTurnStarts.add(turnId);
+        return;
+      }
+      if (turnId !== active.turnId) return;
+      this.emitTurnStarted(active);
       if (active.interruptRequested && active.turnId) {
         void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error));
       }
@@ -436,15 +465,35 @@ class AppServerClient extends EventEmitter {
     }
 
     if (method === "item/agentMessage/delta") {
-      if (typeof params.turnId === "string" && active.turnId && params.turnId !== active.turnId) return;
-      if (typeof params.delta === "string" && params.delta) active.onDelta(params.delta);
+      if (params.threadId !== active.threadId || !isSafeProtocolIdentity(params.turnId) || typeof params.delta !== "string") return;
+      if (!active.startAcknowledged) {
+        const remaining = Math.max(0, 64 * 1024 - active.pendingDeltaLength);
+        if (remaining > 0 && params.delta && active.pendingDeltas.length < 256) {
+          const delta = params.delta.slice(0, remaining);
+          active.pendingDeltas.push({ turnId: params.turnId, delta });
+          active.pendingDeltaLength += delta.length;
+        }
+        return;
+      }
+      if (params.turnId !== active.turnId) return;
+      if (params.delta) active.onDelta(params.delta);
       return;
     }
 
     if (method === "turn/completed") {
-      const turn = params.turn || {};
-      if (turn.id && active.turnId && turn.id !== active.turnId) return;
-      if (turn.id && !active.turnId) active.turnId = turn.id;
+      const turn = params.turn;
+      if (params.threadId !== active.threadId || !isSafeProtocolIdentity(turn?.id)) return;
+      if (!active.startAcknowledged) {
+        if (isTerminalStatus(turn.status) && active.pendingCompletions.size < 4) {
+          active.pendingCompletions.set(turn.id, {
+            id: turn.id,
+            status: turn.status,
+            error: typeof turn.error?.message === "string" ? { message: turn.error.message.slice(0, 800) } : undefined,
+          });
+        }
+        return;
+      }
+      if (turn.id !== active.turnId) return;
       this.finishFromStatus(active, turn);
       return;
     }
@@ -460,6 +509,13 @@ class AppServerClient extends EventEmitter {
   }
 
   finishFromStatus(active, turn) {
+    if (active.settled) return;
+    this.emit("progress", {
+      type: "turn_status",
+      threadId: active.threadId,
+      turnId: active.turnId,
+      status: turn.status,
+    });
     switch (turn.status) {
       case "completed":
         this.finish(active, { status: "completed" });
@@ -473,6 +529,12 @@ class AppServerClient extends EventEmitter {
       default:
         this.finish(active, undefined, new Error(`Codex turn ended in unsupported status ${String(turn.status || "unknown")}.`));
     }
+  }
+
+  emitTurnStarted(active) {
+    if (active.turnStartedEmitted) return;
+    active.turnStartedEmitted = true;
+    this.emit("progress", { type: "turn_started", threadId: active.threadId, turnId: active.turnId });
   }
 
   finish(active, value, error) {
@@ -544,7 +606,10 @@ function isCurrentApproval(capturedTurn, method, params, currentTurn) {
   const requestThreadId = params.threadId || params.conversationId;
   if (requestThreadId && requestThreadId !== capturedTurn.threadId) return false;
   if (params.turnId && capturedTurn.turnId && params.turnId !== capturedTurn.turnId) return false;
-  if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval" || method === "item/permissions/requestApproval") {
+  if (method === "item/commandExecution/requestApproval") {
+    return Boolean(params.threadId && params.turnId && params.itemId && capturedTurn.turnId === params.turnId);
+  }
+  if (method === "item/fileChange/requestApproval" || method === "item/permissions/requestApproval") {
     return Boolean(params.threadId && params.turnId);
   }
   return true;
@@ -595,6 +660,11 @@ function samePath(first, second) {
 
 function isTerminalStatus(status) {
   return ["completed", "interrupted", "failed"].includes(status);
+}
+
+function isSafeProtocolIdentity(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 &&
+    !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value);
 }
 
 function safeErrorMessage(error) {

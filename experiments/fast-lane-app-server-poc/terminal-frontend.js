@@ -3,6 +3,7 @@
 const readline = require("node:readline");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
+const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 
 const QUIT_COMMANDS = new Set([":quit", ":exit", "/quit", "/exit"]);
 
@@ -20,6 +21,7 @@ class TerminalFrontend {
     this.activeRequest = false;
     this.exitAfterTurn = false;
     this.closed = false;
+    this.commandActivity = null;
     this.pendingApprovals = new Set();
     this.approvalQueue = Promise.resolve();
     this.handleProgress = this.handleProgress.bind(this);
@@ -77,6 +79,7 @@ class TerminalFrontend {
     }
 
     this.activeRequest = true;
+    this.commandActivity = new CommandActivityStore();
     this.write(`\n[Codex · ${decision.reason} · connecting]\n`);
     try {
       const routed = await routeRequest(prompt, {
@@ -102,6 +105,7 @@ class TerminalFrontend {
       this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
       this.activeRequest = false;
+      this.commandActivity = null;
       if (this.pendingApprovals.size) {
         this.write("[Vesper] Waiting for the pending approval decision before the next prompt.\n");
         await Promise.allSettled([...this.pendingApprovals]);
@@ -178,11 +182,36 @@ class TerminalFrontend {
       case "thread_starting": this.write("[Codex] Starting a thread…\n"); break;
       case "thread_resuming": this.write("[Codex] Resuming the saved thread…\n"); break;
       case "turn_started": this.write("[Codex] Working…\n"); break;
+      case "turn_identity":
+        this.renderCommandActivity(this.commandActivity?.bindTurn(event.threadId, event.turnId));
+        break;
+      case "turn_status":
+        this.renderCommandActivity(this.commandActivity?.setTurnStatus(event.threadId, event.turnId, event.status));
+        break;
+      case "approval_requested":
+        if (event.method === "item/commandExecution/requestApproval") {
+          this.renderCommandActivity(this.commandActivity?.applyApproval(event.params, "requested"));
+        }
+        break;
+      case "approval_decided":
+        if (event.method === "item/commandExecution/requestApproval") {
+          this.renderCommandActivity(this.commandActivity?.applyApproval(event.params, event.status));
+        }
+        break;
+      case "codex_progress":
+        if (["item/started", "item/completed", "item/commandExecution/outputDelta"].includes(event.method)) {
+          this.renderCommandActivity(this.commandActivity?.applyProtocolNotification(event.method, event.params));
+        }
+        break;
       case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
       case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
       case "file_approval_declined": this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.reason)}\n`); break;
       default: break;
     }
+  }
+
+  renderCommandActivity(updates) {
+    renderActivityUpdates(updates, (text) => this.write(text));
   }
 
   handleInterrupt() {
@@ -255,10 +284,11 @@ function createLineIO(input, output) {
 function approvalDetails(method, params, fileChange) {
   const lines = [];
   let truncated = false;
-  const add = (label, value, json = false) => {
+  const add = (label, value, json = false, redact = false, singleLine = false) => {
     if (value === undefined || value === null || value === "") return;
     let text = json ? JSON.stringify(value, null, 2) : String(value);
-    text = escapeTerminalControls(text);
+    if (redact) text = redactSensitiveText(text);
+    text = singleLine ? escapeTerminalField(text) : redact ? escapeTerminalOutput(text) : escapeTerminalControls(text);
     if (text.length > 8_000) {
       text = `${text.slice(0, 8_000)}\n[truncated]`;
       truncated = true;
@@ -269,13 +299,13 @@ function approvalDetails(method, params, fileChange) {
   let title = "unknown approval";
   if (method === "item/commandExecution/requestApproval") {
     title = "command execution";
-    add("Command", params.command);
+    add("Command", params.command, false, true, true);
     add("Working directory", params.cwd);
     add("Reason", params.reason);
-    add("Parsed actions", params.commandActions, true);
+    add("Parsed actions", params.commandActions, true, true);
     add("Additional permissions requested", params.additionalPermissions, true);
     add("Network approval context", params.networkApprovalContext, true);
-    add("Proposed future command rules", params.proposedExecpolicyAmendment, true);
+    add("Proposed future command rules", params.proposedExecpolicyAmendment, true, true);
     add("Proposed future network rules", params.proposedNetworkPolicyAmendments, true);
   } else if (method === "item/fileChange/requestApproval") {
     title = "file changes";
@@ -304,9 +334,9 @@ function approvalDetails(method, params, fileChange) {
     add("File changes", params.fileChanges || {}, true);
   } else if (method === "execCommandApproval") {
     title = "command execution";
-    add("Command argv", params.command, true);
+    add("Command argv", params.command, true, true, true);
     add("Working directory", params.cwd);
-    add("Parsed command", params.parsedCmd, true);
+    add("Parsed command", params.parsedCmd, true, true);
     add("Reason", params.reason);
   } else {
     lines.push("No approval details are available.");

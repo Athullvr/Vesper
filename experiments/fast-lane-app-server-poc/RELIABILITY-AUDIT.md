@@ -126,3 +126,30 @@ No agent text deltas or successful model answer were observed. This proves local
 - `README.md`, this report and `INTERFACE-ROADMAP.md`: behavior, verified protocol coverage, remaining risks and incremental roadmap.
 
 `session-store.js`, public result schemas, production configuration/authentication behavior, routing policy, package scripts and security defaults remain compatible. The test runner refreshed its existing ignored source-fingerprinted test record, as it normally does.
+
+## Milestone update: safe command activity visibility — 2026-10-19
+
+**Starting baseline and result.** Before edits, `npm test` passed **102 tests, 0 failed, 0 cancelled, 0 skipped**. The first sandboxed invocation could not spawn the test runner (`EPERM`); the authorized run outside the sandbox established the baseline. After this milestone, `npm test` passed **114 tests, 0 failed, 0 cancelled, 0 skipped**. The final `git diff --check` passed after the documentation update.
+
+**Installed protocol evidence.** The installed `codex-cli 0.162.1` JSON schema bundle generated locally on 2026-10-19 was inspected before implementation:
+
+- `item/started` requires `threadId`, `turnId`, `item`, and `startedAtMs`. `item/completed` has the same identity/item fields and `completedAtMs`.
+- A `commandExecution` item requires `id`, `type`, `command`, `cwd`, and `status`. Its status enum is `inProgress`, `completed`, `failed`, or `declined`. `exitCode` and `aggregatedOutput` are nullable and may be absent.
+- `item/commandExecution/outputDelta` requires `threadId`, `turnId`, `itemId`, and `delta`.
+- `turn/started` and `turn/completed` carry `threadId` and a `turn` with `id` and `status`. Turn statuses include `completed`, `interrupted`, `failed`, and `inProgress`.
+- The command approval server request requires `threadId`, `turnId`, `itemId`, and `startedAtMs`; its command and cwd may be null. The response carries a decision. There is no later approval-accepted acknowledgement in these schemas: Vesper can report the user's decision sent to the server, while execution status still comes from the command item.
+- `error` carries turn identity, an error and `willRetry`; it may describe a retry and is not evidence that a particular command failed.
+
+The command status enum has no `interrupted` value. Vesper shows an interrupted turn separately and leaves an in-progress command's execution result unresolved. A missing exit code is shown as unavailable; it does not become success. A disconnected process does not complete or fail a command item.
+
+**Implementation.** `command-activity.js` is a bounded in-memory reducer keyed by thread, turn, and item. It accepts only command execution item and output events, limits command text to 4,096 characters, cwd to 2,048, output payload to 16,384, approval callbacks to 8 per item, and retained command items to 50 per turn. Terminal control sequences and Unicode format controls are escaped; common credential forms are redacted in command arguments and output. Output deltas are buffered until item/turn completion so redaction can span delta boundaries. If an item is still in progress when its turn ends, the terminal labels any output partial and leaves the execution result unresolved.
+
+`AppServerClient` now binds activity to the `turn/start` response ID. Pre-ack notifications are retained only in bounded buffers and filtered against that authoritative identity; late notifications from a replaced process remain rejected by the existing process-generation guard. Command approval requests wait for the confirmed turn and require an item ID before prompting. The one-time approval choices and backend execution settings are unchanged. The terminal does not execute commands. No route, local command allowlist, session metadata, file-approval store, Codex configuration, or permission setting changed.
+
+**Tests.** Added eight reducer tests in `test/command-activity.test.js` for normal start/output/completion, failure, interruption, missing exit code, out-of-order/duplicate lifecycle events, identity isolation, malformed payloads, truncation, control escaping/redaction, approval/execution separation, and the retained-item cap. Added client tests for stale pre-ack turn events, command approval identity, and late events after process replacement. Added terminal/client mock integration tests for rendered command output and the distinction between an accepted approval decision and an observed execution result.
+
+**Limitations and validation scope.** The full test suite uses mock app-server notifications for command lifecycle and approval behavior. The installed schema is live local protocol evidence; this milestone did not run a real Codex command, a network-backed model turn, or authenticated model behavior. Credential masking is heuristic and cannot identify every secret. The protocol gives output deltas no sequence/event ID, so exact duplicate delta chunks cannot always be distinguished from legitimate repeated output when a final `aggregatedOutput` is absent; lifecycle notifications are idempotent, and a final aggregate replaces buffered deltas when supplied. Command output is shown at item/turn end rather than streamed live.
+
+**Changed files.** `command-activity.js` adds the reducer and safe renderer. `app-server-client.js` adds authoritative turn binding and command approval progress. `terminal-frontend.js` renders command states and redacts common secrets in command approval details. `test/command-activity.test.js`, `test/app-server-client.test.js`, and `test/terminal-frontend.test.js` add coverage. `README.md` and `INTERFACE-ROADMAP.md` describe the behavior, limits and next work.
+
+**Next smallest milestone.** Render bounded file-change summaries outside approval prompts using the existing per-turn evidence cache, while preserving its fail-closed behavior for missing or stale diffs.

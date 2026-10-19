@@ -266,9 +266,15 @@ test("late events from a disconnected process cannot complete or stream into a r
   const second = new FakeAppServerProcess({ onTurnStart: (request) => { nextRequest = request; } });
   let spawns = 0;
   const client = new AppServerClient({ spawnProcess: () => ++spawns === 1 ? first : second });
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
   t.after(() => client.dispose());
   const failed = assert.rejects(client.runTurn({ prompt: "Inspect this repository", cwd: "/workspace" }), /exited/u);
   await new Promise((resolve) => setImmediate(resolve));
+  first.send({ method: "item/started", params: {
+    threadId: "thread-1", turnId: "turn-1", startedAtMs: 1,
+    item: { type: "commandExecution", id: "command-1", command: "old command", cwd: "/workspace", status: "inProgress" },
+  } });
   first.emit("close", 1, null);
   await failed;
   const streamed = [];
@@ -279,11 +285,79 @@ test("late events from a disconnected process cannot complete or stream into a r
   first.emit("close", 1, null);
   assert.ok(client.activeTurn, "old process must not complete the new turn");
   assert.deepEqual(streamed, []);
+  const beforeLateCommand = progress.filter((event) => event.type === "codex_progress").length;
+  first.send({ method: "item/completed", params: {
+    threadId: "thread-1", turnId: "turn-1", completedAtMs: 2,
+    item: { type: "commandExecution", id: "command-1", command: "stale replacement command", cwd: "/workspace", status: "completed", exitCode: 0 },
+  } });
+  assert.equal(progress.filter((event) => event.type === "codex_progress").length, beforeLateCommand);
   assert.equal(second.requests.some((request) => request.method === "thread/start"), false);
   assert.equal(second.requests.find((request) => request.method === "thread/resume").params.threadId, "thread-1");
   second.completeTurn(nextRequest, "completed", "Recovered.");
   assert.deepEqual(await recovered, { status: "completed" });
   assert.deepEqual(streamed, ["Recovered."]);
+});
+
+test("notifications arriving before turn/start acknowledgement wait for authoritative turn identity", async (t) => {
+  const server = new FakeAppServerProcess();
+  const receive = server.receive.bind(server);
+  let startRequest;
+  server.receive = (message) => {
+    if (message.method === "turn/start") {
+      startRequest = message;
+      server.requests.push(message);
+      server.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "stale-turn", status: "inProgress" } } });
+      server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "stale-turn", status: "completed" } } });
+      server.send({ method: "item/started", params: {
+        threadId: "thread-1", turnId: "stale-turn", startedAtMs: 1,
+        item: { type: "commandExecution", id: "stale-command", command: "stale", cwd: "/workspace", status: "inProgress" },
+      } });
+    } else receive(message);
+  };
+  const { client } = createClient(server);
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
+  t.after(() => client.dispose());
+
+  const turn = client.runTurn({ prompt: "Inspect", cwd: "/workspace" });
+  let settled = false;
+  turn.then(() => { settled = true; }, () => { settled = true; });
+  await nextEvent();
+  assert.equal(client.activeTurn?.turnId, null);
+  assert.equal(settled, false);
+  server.respond(startRequest.id, { turn: { id: "current-turn", status: "inProgress", items: [] } });
+  await nextEvent();
+  assert.equal(client.activeTurn?.turnId, "current-turn");
+  assert.equal(progress.some((event) => event.type === "turn_identity" && event.turnId === "current-turn"), true);
+  assert.equal(progress.some((event) => event.type === "turn_identity" && event.turnId === "stale-turn"), false);
+  assert.equal(progress.some((event) => event.type === "turn_status" && event.turnId === "stale-turn"), false);
+  assert.equal(progress.filter((event) => event.type === "codex_progress").some((event) => event.params.turnId === "stale-turn"), true,
+    "raw activity is retained for the terminal reducer to discard after authoritative binding");
+  server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "current-turn", status: "completed" } } });
+  assert.deepEqual(await turn, { status: "completed" });
+});
+
+test("command approvals require the authoritative turn and item identity", async (t) => {
+  let approvals = 0;
+  const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
+    current.requestFromServer("stale-command-approval", "item/commandExecution/requestApproval", {
+      threadId: "thread-1", turnId: "older-turn", itemId: "command-1", command: "npm test",
+    });
+    current.requestFromServer("missing-item-approval", "item/commandExecution/requestApproval", {
+      threadId: "thread-1", turnId: "turn-1", command: "npm test",
+    });
+    current.completeTurn(request, "completed");
+  } });
+  const { client } = createClient(server, { onApproval: async () => {
+    approvals += 1;
+    return { decision: "accept" };
+  } });
+  t.after(() => client.dispose());
+
+  assert.deepEqual(await client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), { status: "completed" });
+  assert.equal(approvals, 0);
+  assert.deepEqual(server.requests.find((message) => message.id === "stale-command-approval").result, { decision: "decline" });
+  assert.deepEqual(server.requests.find((message) => message.id === "missing-item-approval").result, { decision: "decline" });
 });
 
 test("stale turn notifications cannot change identity and current tool payloads are preserved", async (t) => {
