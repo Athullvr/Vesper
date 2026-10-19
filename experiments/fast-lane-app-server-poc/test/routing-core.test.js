@@ -125,6 +125,29 @@ test("ambiguous and unsupported requests call only the fallback", async () => {
   assert.deepEqual(calls, ["local_ambiguous", "codex_fallback"]);
 });
 
+test("shell text, live pushed state, repository inspection and bug analysis stay on Codex", async () => {
+  for (const [prompt, reason] of [
+    ["grep -nE 'freshness|stale|reflog|upstream|aheadCount' test tests 2>/dev/null", "local_ambiguous"],
+    ["Has this branch been pushed?", "local_ambiguous"],
+    ["Inspect the repository and explain its architecture.", "codex_fallback"],
+    ["Review the code and analyze potential bugs.", "codex_fallback"],
+    ["What is the current Git branch? Then push it.", "local_ambiguous"],
+    ["git status && echo unsafe", "local_ambiguous"],
+  ]) {
+    let fallbacks = 0;
+    const handlers = Object.fromEntries(Object.values(LOCAL_INTENTS).map((intent) =>
+      [intent, async () => assert.fail("No local handler may execute shell text or answer a complex request")]
+    ));
+    const routed = await routeRequest(prompt, {
+      handlers, fallback: async () => { fallbacks += 1; return { status: "completed" }; },
+    });
+    assert.deepEqual(routed.decision, { route: "codex", intent: null, reason }, prompt);
+    assert.equal(fallbacks, 1);
+    assert.equal(routed.result, undefined);
+    assert.deepEqual(routed.fallbackResult, { status: "completed" });
+  }
+});
+
 test("a failed local handler returns unavailable without fabricating a value or falling back", async () => {
   let fallbackCalls = 0;
   const routed = await routeRequest("What Git branch am I on?", {

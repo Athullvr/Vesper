@@ -139,6 +139,9 @@ test("resuming a Vesper session passes its saved Codex thread id to the frontend
   assert.equal(errors.text(), "");
   assert.equal(clients[0].initialThreadId, "codex-saved-thread");
   assert.equal(clients[0].turns.length, 1);
+  assert.equal(clients[0].turns[0].cwd, root);
+  assert.match(output.text(), new RegExp(saved.sessionId));
+  assert.equal(store.load(saved.sessionId).cwd, root);
   assert.match(output.text(), /Vesper session: /u);
   assert.equal(fs.readdirSync(store.directory).filter((name) => name.endsWith(".json")).length, 1);
 });

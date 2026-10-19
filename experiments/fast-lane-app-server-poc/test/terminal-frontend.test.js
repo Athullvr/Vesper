@@ -119,6 +119,43 @@ test("initialization failures and timeouts are visible and the input loop recove
   assert.equal(appServer.turns.length, 3);
 });
 
+test("insufficient evidence and handler failure remain local uncertainty without any Codex turn", async () => {
+  const appServer = new FakeAppServer(async () => assert.fail("Local uncertainty must not silently invoke Codex"));
+  const { frontend, output } = makeFrontend({
+    appServer,
+    answers: ["What is the current Git branch?", "Show working-tree status.", ":quit"],
+    handlers: {
+      [LOCAL_INTENTS.CURRENT_GIT_BRANCH]: async () => createLocalResult({
+        intent: LOCAL_INTENTS.CURRENT_GIT_BRANCH, status: "unknown", summary: "Detached checkout.",
+        evidence: ["No branch name."], source: { kind: "git" }, freshness: { state: "observed" },
+      }),
+      [LOCAL_INTENTS.WORKING_TREE_STATUS]: async () => { throw new Error("private failure"); },
+    },
+  });
+  await frontend.run();
+  assert.equal(appServer.turns.length, 0);
+  assert.match(output(), /Vesper local · unknown/u);
+  assert.match(output(), /Vesper local · unavailable/u);
+  assert.doesNotMatch(output(), /confirmed|private failure|Codex · completed/u);
+});
+
+test("failed and interrupted fallback turns never print a completed or confirmed local answer", async () => {
+  let calls = 0;
+  const appServer = new FakeAppServer(async ({ onDelta }) => {
+    onDelta("Partial output.");
+    if (++calls === 1) throw new Error("Turn failed");
+    return { status: "interrupted" };
+  });
+  const { frontend, output, io } = makeFrontend({
+    appServer, answers: ["Inspect the repository", "Analyze the bug", ":quit"],
+  });
+  await frontend.run();
+  assert.match(output(), /Codex error .* Turn failed/u);
+  assert.match(output(), /Codex · interrupted/u);
+  assert.doesNotMatch(output(), /Codex · completed|Vesper local/u);
+  assert.equal(io.questions.length, 3);
+});
+
 test("Ctrl+C requests interruption, reports terminal status, and ends the current frontend run", async () => {
   let io;
   const appServer = new FakeAppServer(async () => new Promise((resolve) => {

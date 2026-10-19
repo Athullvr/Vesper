@@ -139,6 +139,7 @@ class TerminalFrontend {
     const choice = String(answer || "").trim().toLowerCase();
     const approved = choice === "yes";
     const cancelled = choice === "cancel";
+    this.write(`[Vesper] Approval choice: ${approved ? "approve once" : cancelled ? "cancel" : "decline"}.\n`);
 
     if (method === "item/permissions/requestApproval") {
       if (!approved) return { permissions: {}, scope: "turn" };

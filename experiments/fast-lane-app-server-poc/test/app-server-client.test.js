@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { AppServerClient, validateApprovalResult } = require("../app-server-client");
+const { TerminalFrontend } = require("../terminal-frontend");
 
 class FakeAppServerProcess extends EventEmitter {
   constructor({ onTurnStart, onInterrupt } = {}) {
@@ -354,4 +355,69 @@ test("resume rejects a mismatched server thread or cwd before any turn", async (
     await assert.rejects(client.runTurn({ prompt: "Continue", cwd: "/workspace" }), /different/u);
     assert.equal(server.requests.some((message) => ["thread/start", "turn/start"].includes(message.method)), false);
   }
+});
+
+test("terminal approval choices reach the app-server and its outcome controls completion", async (t) => {
+  for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"]) {
+    for (const answer of ["yes", "no", "cancel"]) {
+      await t.test(`${method}: ${answer}`, async (t) => {
+        let startRequest;
+        let operations = 0;
+        let response;
+        const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
+          startRequest = request;
+          current.requestFromServer("approval-1", method, {
+            threadId: "thread-1", turnId: "turn-1", itemId: "item-1", startedAtMs: 1,
+            command: "git status", cwd: "/workspace", reason: "Fixture operation",
+            permissions: { network: { enabled: true } },
+          });
+        } });
+        const receive = server.receive.bind(server);
+        server.receive = (message) => {
+          receive(message);
+          if (message.id !== "approval-1") return;
+          response = message.result;
+          const accepted = response?.decision === "accept" || response?.permissions?.network?.enabled === true;
+          if (accepted) operations += 1;
+          server.completeTurn(startRequest, answer === "cancel" && response.decision === "cancel" ? "interrupted" : "completed",
+            accepted ? "Operation completed." : "Operation declined; no operation performed.");
+        };
+        let frontend;
+        const { client } = createClient(server, { onApproval: (name, params) => frontend.requestApproval(name, params) });
+        t.after(() => client.dispose());
+        const answers = ["Inspect this repository", answer, ":quit"];
+        let text = "";
+        frontend = new TerminalFrontend({
+          cwd: "/workspace", handlers: {}, appServer: client,
+          output: { write: (chunk) => { text += chunk; } },
+          lineIO: { question: async () => answers.shift(), close() {}, onInterrupt() {} },
+        });
+        await frontend.run();
+        assert.equal(operations, answer === "yes" ? 1 : 0);
+        if (method === "item/permissions/requestApproval") {
+          assert.deepEqual(response, { permissions: answer === "yes" ? { network: { enabled: true } } : {}, scope: "turn" });
+        } else {
+          assert.deepEqual(response, { decision: answer === "yes" ? "accept" : answer === "cancel" ? "cancel" : "decline" });
+        }
+        assert.match(text, /Codex approval required/u);
+        assert.match(text, /Approval choice:/u);
+        assert.doesNotMatch(text, /Vesper local/u);
+        if (answer === "yes") assert.match(text, /Operation completed/u);
+        else assert.match(text, /Operation declined; no operation performed/u);
+        if (answer === "cancel" && method !== "item/permissions/requestApproval") {
+          assert.match(text, /Codex · interrupted/u);
+          assert.doesNotMatch(text, /Codex · completed/u);
+        }
+      });
+    }
+  }
+});
+
+test("unconfirmed timeout closes the connection and cannot be reported as completed", async (t) => {
+  const server = new FakeAppServerProcess({ onTurnStart() {} });
+  const { client } = createClient(server, { turnTimeoutMs: 10, interruptGraceMs: 10 });
+  t.after(() => client.dispose());
+  await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /did not confirm interruption/u);
+  assert.equal(server.killed, true);
+  assert.equal(client.activeTurn, undefined);
 });
