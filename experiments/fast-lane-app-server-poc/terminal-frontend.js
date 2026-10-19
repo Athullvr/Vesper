@@ -4,6 +4,7 @@ const readline = require("node:readline");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
+const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
 
 const QUIT_COMMANDS = new Set([":quit", ":exit", "/quit", "/exit"]);
 const MAX_FILE_ACTIVITY_ITEMS = 50;
@@ -11,6 +12,7 @@ const MAX_FILE_ACTIVITY_OUTPUT_LENGTH = 12_000;
 const MAX_FILE_ACTIVITY_CHANGES_PER_ITEM = 8;
 const MAX_FILE_ACTIVITY_PATH_LENGTH = 1_024;
 const FILE_ACTIVITY_LIMIT_MARKER = "\n[Vesper] File-change summary output is limited; later summaries or updates are omitted.\n";
+const MAX_TURN_DIFF_RENDERED_LENGTH = 16_000;
 
 class TerminalFrontend {
   constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics() } = {}) {
@@ -30,6 +32,8 @@ class TerminalFrontend {
     this.fileActivityIdentities = new Set();
     this.fileActivityOutputLength = 0;
     this.fileActivityLimitReported = false;
+    this.turnDiffIdentity = null;
+    this.turnDiffRendered = false;
     this.pendingApprovals = new Set();
     this.approvalQueue = Promise.resolve();
     this.handleProgress = this.handleProgress.bind(this);
@@ -88,6 +92,8 @@ class TerminalFrontend {
 
     this.activeRequest = true;
     this.commandActivity = new CommandActivityStore();
+    this.turnDiffIdentity = null;
+    this.turnDiffRendered = false;
     this.fileActivityIdentities.clear();
     this.fileActivityOutputLength = 0;
     this.fileActivityLimitReported = false;
@@ -194,6 +200,9 @@ class TerminalFrontend {
       case "thread_resuming": this.write("[Codex] Resuming the saved thread…\n"); break;
       case "turn_started": this.write("[Codex] Working…\n"); break;
       case "turn_identity":
+        this.turnDiffIdentity = isTurnDiffIdentity(event.threadId, event.turnId)
+          ? { threadId: event.threadId, turnId: event.turnId }
+          : null;
         this.renderCommandActivity(this.commandActivity?.bindTurn(event.threadId, event.turnId));
         this.renderFileChangeActivities(event.fileChanges);
         break;
@@ -217,6 +226,9 @@ class TerminalFrontend {
         break;
       case "file_change_activity":
         this.renderFileChangeActivities([event.activity]);
+        break;
+      case "turn_diff_activity":
+        this.renderTurnDiffActivity(event.activity);
         break;
       case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
       case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
@@ -250,6 +262,15 @@ class TerminalFrontend {
       this.write(rendered);
       this.fileActivityOutputLength += rendered.length;
     }
+  }
+
+  renderTurnDiffActivity(activity) {
+    if (this.turnDiffRendered || !isTurnDiffIdentity(activity?.threadId, activity?.turnId)) return;
+    if (!this.turnDiffIdentity || activity.threadId !== this.turnDiffIdentity.threadId || activity.turnId !== this.turnDiffIdentity.turnId) return;
+    const rendered = renderTurnDiffActivity(activity);
+    if (!rendered) return;
+    this.turnDiffRendered = true;
+    this.write(rendered);
   }
 
   writeFileActivityLimitMarker() {
@@ -472,6 +493,58 @@ function renderFileChangeActivity(activity) {
   return lines.join("");
 }
 
+function isTurnDiffIdentity(threadId, turnId) {
+  return [threadId, turnId].every((value) => typeof value === "string" && value.length > 0 && value.length <= 512 &&
+    !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value));
+}
+
+function renderTurnDiffActivity(activity) {
+  if (!isTurnDiffIdentity(activity?.threadId, activity?.turnId)) return "";
+  const evidenceStates = new Set(["available", "empty", "unavailable"]);
+  const closeReasons = new Set(["completed", "interrupted", "failed", "disconnected", "timeout", "client_closed", "unknown"]);
+  const evidenceState = evidenceStates.has(activity.evidenceState) ? activity.evidenceState : "unavailable";
+  const closeReason = closeReasons.has(activity.closeReason) ? activity.closeReason : "unknown";
+  const lifecycle = {
+    completed: "turn completed",
+    interrupted: "turn interrupted; snapshot may be partial",
+    failed: "turn failed; snapshot may be partial",
+    disconnected: "transport disconnected; snapshot may be partial",
+    timeout: "turn timed out; snapshot may be partial",
+    client_closed: "client closed; snapshot may be partial",
+    unknown: "turn lifecycle unavailable; snapshot may be partial",
+  }[closeReason];
+  const heading = `\n[Codex · turn-level aggregate diff · ${lifecycle} · server-reported; disk write not verified]\n`;
+  const distinction = "This is a turn-level snapshot; it is not mapped to file-change items.\n";
+  let body;
+
+  if (evidenceState === "unavailable") {
+    const reason = {
+      no_snapshot: "the app-server did not report a snapshot",
+      malformed: "the latest matching event was malformed and the previous snapshot was cleared",
+      oversized: `the latest snapshot exceeded the ${MAX_TURN_DIFF_LENGTH}-character cache limit and the previous snapshot was cleared`,
+      redaction_expanded: "secret redaction would exceed the snapshot cache limit",
+      pre_ack_overflow: "too many pre-acknowledgement snapshots arrived to retain this turn safely",
+    }[activity.evidenceReason] || "a safe current snapshot is unavailable";
+    body = `Aggregate diff unavailable: ${reason}.\n`;
+  } else if (evidenceState === "empty") {
+    body = "The latest aggregate snapshot is empty; no diff lines were supplied.\n";
+  } else if (typeof activity.diff === "string") {
+    const safeDiff = escapeTerminalOutput(redactSensitiveText(activity.diff));
+    const prefixedDiff = safeDiff.split("\n").map((line) => `| ${line}`).join("\n");
+    body = `Latest aggregate snapshot:\n${prefixedDiff}\n`;
+  } else {
+    body = "Aggregate diff unavailable: the snapshot content was malformed.\n";
+  }
+
+  const full = `${heading}${distinction}${body}`;
+  if (full.length <= MAX_TURN_DIFF_RENDERED_LENGTH) return full;
+  const marker = "\n| [turn-level diff display truncated at the terminal output limit; the cached snapshot was bounded separately]\n";
+  const fixed = `${heading}${distinction}Latest aggregate snapshot:\n`;
+  const contentBudget = Math.max(0, MAX_TURN_DIFF_RENDERED_LENGTH - fixed.length - marker.length);
+  return `${fixed}${body.slice("Latest aggregate snapshot:\n".length, "Latest aggregate snapshot:\n".length + contentBudget)}${marker}`
+    .slice(0, MAX_TURN_DIFF_RENDERED_LENGTH);
+}
+
 function safeFileSummaryField(value) {
   const source = redactSensitiveText(String(value ?? "").slice(0, 8_000));
   let text = "";
@@ -506,6 +579,8 @@ module.exports = {
   safeTerminalText,
   safeStreamText,
   renderFileChangeActivity,
+  renderTurnDiffActivity,
   MAX_FILE_ACTIVITY_ITEMS,
   MAX_FILE_ACTIVITY_OUTPUT_LENGTH,
+  MAX_TURN_DIFF_RENDERED_LENGTH,
 };

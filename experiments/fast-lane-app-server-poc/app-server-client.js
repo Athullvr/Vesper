@@ -4,6 +4,7 @@ const { spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const path = require("node:path");
 const { FileChangeApprovalStore } = require("./file-change-approval");
+const { TurnDiffActivityStore } = require("./turn-diff-activity");
 
 const RPC_TIMEOUT_MS = 20_000;
 const TURN_TIMEOUT_MS = 5 * 60_000;
@@ -131,6 +132,7 @@ class AppServerClient extends EventEmitter {
       }
       active.turnId = turn.id;
       active.startAcknowledged = true;
+      active.turnDiff.bindTurn(active.threadId, active.turnId);
       active.resolveStart();
       this.emit("progress", {
         type: "turn_identity",
@@ -155,7 +157,7 @@ class AppServerClient extends EventEmitter {
       // A lost start reply leaves acceptance unknown. Close this transport
       // before allowing another request, rather than leaving an orphan turn.
       this.handleExit(error, generation);
-      this.finish(active, undefined, error);
+      this.finish(active, undefined, error, "disconnected");
     }
 
     return active.completion;
@@ -234,6 +236,7 @@ class AppServerClient extends EventEmitter {
       startReady,
       resolveStart,
       fileChanges: new FileChangeApprovalStore(this.threadId),
+      turnDiff: new TurnDiffActivityStore(this.threadId),
       onDelta,
       completion,
       resolveCompletion,
@@ -255,11 +258,11 @@ class AppServerClient extends EventEmitter {
     active.interruptRequested = true;
     this.closeFileChanges(active);
     this.emit("progress", { type: "turn_timed_out" });
-    if (active.turnId) void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error));
+    if (active.turnId) void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error, "unknown"));
     active.interruptTimer = setTimeout(() => {
       if (this.activeTurn !== active || active.settled) return;
       this.threadReady = false;
-      this.finish(active, undefined, new Error("Codex turn timed out; the app-server did not confirm interruption. The connection was closed; another request will try to resume the saved thread."));
+      this.finish(active, undefined, new Error("Codex turn timed out; the app-server did not confirm interruption. The connection was closed; another request will try to resume the saved thread."), "timeout");
       this.terminateChild();
     }, this.interruptGraceMs);
   }
@@ -446,6 +449,7 @@ class AppServerClient extends EventEmitter {
   handleNotification(method, params) {
     const active = this.activeTurn;
     if (!active) return;
+    if (method === "turn/diff/updated") active.turnDiff.record(params);
     // Retain early item snapshots, but approval waits for the authoritative
     // turn/start response. Every cache key includes all three protocol IDs.
     const fileChangeUpdates = active.fileChanges.record(method, params, active.startAcknowledged ? active.turnId : null);
@@ -468,7 +472,7 @@ class AppServerClient extends EventEmitter {
       if (turnId !== active.turnId) return;
       this.emitTurnStarted(active);
       if (active.interruptRequested && active.turnId) {
-        void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error));
+        void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error, "unknown"));
       }
       return;
     }
@@ -509,9 +513,9 @@ class AppServerClient extends EventEmitter {
 
     if (method === "item/started" || method === "item/completed" ||
         method === "item/commandExecution/outputDelta" || method === "item/fileChange/outputDelta" ||
-        method === "item/fileChange/patchUpdated" || method === "turn/diff/updated" ||
+        method === "item/fileChange/patchUpdated" ||
         method === "turn/plan/updated" || method === "item/mcpToolCall/progress" || method === "error") {
-      // Keep protocol payloads for additive frontend activity/diff/error views.
+      // Keep other protocol payloads for additive frontend activity/diff/error views.
       // Error notifications may describe retries; only turn/completed settles.
       this.emit("progress", { type: "codex_progress", method, params });
     }
@@ -527,16 +531,16 @@ class AppServerClient extends EventEmitter {
     });
     switch (turn.status) {
       case "completed":
-        this.finish(active, { status: "completed" });
+        this.finish(active, { status: "completed" }, undefined, "completed");
         break;
       case "interrupted":
-        this.finish(active, { status: active.timedOut ? "timeout" : "interrupted" });
+        this.finish(active, { status: active.timedOut ? "timeout" : "interrupted" }, undefined, active.timedOut ? "timeout" : "interrupted");
         break;
       case "failed":
-        this.finish(active, undefined, new Error(turn.error?.message || "Codex turn failed."));
+        this.finish(active, undefined, new Error(turn.error?.message || "Codex turn failed."), "failed");
         break;
       default:
-        this.finish(active, undefined, new Error(`Codex turn ended in unsupported status ${String(turn.status || "unknown")}.`));
+        this.finish(active, undefined, new Error(`Codex turn ended in unsupported status ${String(turn.status || "unknown")}.`), "unknown");
     }
   }
 
@@ -546,10 +550,11 @@ class AppServerClient extends EventEmitter {
     this.emit("progress", { type: "turn_started", threadId: active.threadId, turnId: active.turnId });
   }
 
-  finish(active, value, error) {
+  finish(active, value, error, closeReason) {
     if (active.settled) return;
     active.settled = true;
     this.closeFileChanges(active);
+    this.closeTurnDiff(active, closeReason || (error ? "unknown" : value?.status === "completed" ? "completed" : value?.status === "interrupted" ? "interrupted" : value?.status === "timeout" ? "timeout" : "unknown"));
     active.resolveStart();
     clearTimeout(active.turnTimer);
     clearTimeout(active.interruptTimer);
@@ -570,6 +575,12 @@ class AppServerClient extends EventEmitter {
     if (active.startAcknowledged) this.emitFileChangeActivities(active, invalidated);
   }
 
+  closeTurnDiff(active, reason) {
+    const activity = active.turnDiff.close(reason);
+    if (!activity || activity.threadId !== active.threadId || activity.turnId !== active.turnId) return;
+    this.emit("progress", { type: "turn_diff_activity", activity });
+  }
+
   handleExit(error, generation) {
     if (generation !== this.connectionGeneration) return;
     const child = this.child;
@@ -580,7 +591,7 @@ class AppServerClient extends EventEmitter {
       this.pending.delete(id);
       pending.reject(error);
     }
-    if (this.activeTurn) this.finish(this.activeTurn, undefined, error);
+    if (this.activeTurn) this.finish(this.activeTurn, undefined, error, "disconnected");
     if (child && !child.killed) child.kill();
   }
 
@@ -595,7 +606,7 @@ class AppServerClient extends EventEmitter {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
-    if (this.activeTurn) this.finish(this.activeTurn, undefined, new Error("Vesper closed during the Codex turn."));
+    if (this.activeTurn) this.finish(this.activeTurn, undefined, new Error("Vesper closed during the Codex turn."), "client_closed");
     for (const [id, pending] of this.pending) {
       this.pending.delete(id);
       pending.reject(new Error("Vesper app-server client closed."));

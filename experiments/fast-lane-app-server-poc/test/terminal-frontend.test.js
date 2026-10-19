@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
 const { LOCAL_INTENTS, createLocalResult } = require("../routing-core");
-const { TerminalFrontend, createLineIO, safeStreamText } = require("../terminal-frontend");
+const { TerminalFrontend, createLineIO, safeStreamText, renderTurnDiffActivity, MAX_TURN_DIFF_RENDERED_LENGTH } = require("../terminal-frontend");
 const { FileChangeApprovalStore } = require("../file-change-approval");
 const { AppServerClient } = require("../app-server-client");
 
@@ -494,4 +494,55 @@ test("invalidating an open file review cancels readline and permits the next pro
   input.write("What is the current Git branch?\n");
   assert.equal(await nextPrompt, "What is the current Git branch?");
   assert.equal(frontend.pendingApprovals.size, 0);
+});
+
+test("terminal renders one distinct, bounded turn-level aggregate view for the latest snapshot", () => {
+  const { frontend, output } = makeFrontend();
+  frontend.handleProgress({ type: "turn_identity", threadId: "thread-1", turnId: "turn-1", fileChanges: [] });
+  frontend.handleProgress({ type: "turn_diff_activity", activity: {
+    threadId: "other-thread",
+    turnId: "turn-1",
+    evidenceState: "available",
+    closeReason: "completed",
+    diff: "foreign thread snapshot",
+  } });
+  frontend.handleProgress({ type: "turn_diff_activity", activity: {
+    threadId: "thread-1",
+    turnId: "other-turn",
+    evidenceState: "available",
+    closeReason: "completed",
+    diff: "foreign turn snapshot",
+  } });
+  frontend.handleProgress({ type: "turn_diff_activity", activity: {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    evidenceState: "available",
+    evidenceReason: null,
+    closeReason: "completed",
+    diff: "--- a/latest.txt\n+++ b/latest.txt\n+latest\n",
+    sourceLength: 42,
+    redacted: false,
+    revision: 2,
+  } });
+  frontend.handleProgress({ type: "turn_diff_activity", activity: {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    evidenceState: "available",
+    evidenceReason: null,
+    closeReason: "completed",
+    diff: "stale duplicate view",
+    sourceLength: 20,
+    redacted: false,
+    revision: 1,
+  } });
+  assert.match(output(), /turn-level aggregate diff/u);
+  assert.match(output(), /latest\.txt/u);
+  assert.doesNotMatch(output(), /foreign thread snapshot|foreign turn snapshot/u);
+  assert.doesNotMatch(output(), /stale duplicate view/u);
+  assert.match(output(), /not mapped to file-change items/u);
+  assert.match(output(), /disk write not verified/u);
+  assert.ok(output().length <= MAX_TURN_DIFF_RENDERED_LENGTH);
+
+  const malformed = renderTurnDiffActivity({ threadId: "", turnId: "turn-1", diff: "bad" });
+  assert.equal(malformed, "");
 });

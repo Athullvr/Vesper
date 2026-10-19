@@ -271,15 +271,24 @@ test("late events from a disconnected process cannot complete or stream into a r
   t.after(() => client.dispose());
   const failed = assert.rejects(client.runTurn({ prompt: "Inspect this repository", cwd: "/workspace" }), /exited/u);
   await new Promise((resolve) => setImmediate(resolve));
+  first.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "old process snapshot" } });
   first.send({ method: "item/started", params: {
     threadId: "thread-1", turnId: "turn-1", startedAtMs: 1,
     item: { type: "commandExecution", id: "command-1", command: "old command", cwd: "/workspace", status: "inProgress" },
   } });
   first.emit("close", 1, null);
   await failed;
+  const disconnectedView = progress.find((event) => event.type === "turn_diff_activity");
+  assert.equal(disconnectedView.activity.closeReason, "disconnected");
+  assert.equal(disconnectedView.activity.diff, "old process snapshot");
   const streamed = [];
   const recovered = client.runTurn({ prompt: "Try again", cwd: "/workspace", onDelta: (text) => streamed.push(text) });
   await new Promise((resolve) => setImmediate(resolve));
+  const currentDiff = client.activeTurn.turnDiff.snapshot();
+  const beforeLateDiff = progress.filter((event) => event.type === "turn_diff_activity").length;
+  first.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "stale old process snapshot" } });
+  assert.deepEqual(client.activeTurn.turnDiff.snapshot(), currentDiff, "a replaced process cannot update the active aggregate view");
+  assert.equal(progress.filter((event) => event.type === "turn_diff_activity").length, beforeLateDiff);
   first.send({ method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", delta: "stale text" } });
   first.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
   first.emit("close", 1, null);
@@ -935,4 +944,50 @@ test("turn interruption invalidates file summaries and late events from the repl
   second.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "interrupted" } } });
   assert.deepEqual(await recovered, { status: "interrupted" });
   assert.equal(progress.some((event) => event.type === "file_change_activity" && event.activity.itemId === "resume-file" && event.activity.state === "invalidated"), true);
+});
+
+test("turn diff updates replace the aggregate snapshot and never become per-item approval evidence", async (t) => {
+  let client;
+  let approvalEvidence;
+  const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
+    current.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "first complete snapshot" } });
+    current.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: "latest complete snapshot" } });
+    approvalEvidence = client.activeTurn.fileChanges.capture({ threadId: "thread-1", turnId: "turn-1", itemId: "file-1" });
+    current.completeTurn(request, "completed");
+  } });
+  ({ client } = createClient(server));
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
+  t.after(() => client.dispose());
+
+  assert.deepEqual(await client.runTurn({ prompt: "Inspect proposed changes", cwd: "/workspace" }), { status: "completed" });
+  const views = progress.filter((event) => event.type === "turn_diff_activity");
+  assert.equal(views.length, 1, "complete snapshots are projected once when the turn closes");
+  assert.equal(views[0].activity.diff, "latest complete snapshot");
+  assert.equal(views[0].activity.evidenceState, "available");
+  assert.equal(views[0].activity.closeReason, "completed");
+  assert.equal(Object.hasOwn(views[0].activity, "itemId"), false);
+  assert.equal(approvalEvidence, null, "aggregate diffs cannot create file-item approval evidence");
+  assert.equal(progress.some((event) => event.type === "codex_progress" && event.method === "turn/diff/updated"), false);
+});
+
+test("turn diff view closes with the protocol turn outcome for completion, interruption and failure", async (t) => {
+  for (const status of ["completed", "interrupted", "failed"]) {
+    const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
+      current.send({ method: "turn/diff/updated", params: { threadId: "thread-1", turnId: "turn-1", diff: `snapshot before ${status}` } });
+      current.completeTurn(request, status, "", status === "failed" ? "mock failure" : undefined);
+    } });
+    const { client } = createClient(server);
+    const progress = [];
+    client.on("progress", (event) => progress.push(event));
+    t.after(() => client.dispose());
+
+    const turn = client.runTurn({ prompt: "Observe this turn", cwd: "/workspace" });
+    if (status === "failed") await assert.rejects(turn, /mock failure/u);
+    else assert.deepEqual(await turn, { status });
+    const activity = progress.find((event) => event.type === "turn_diff_activity")?.activity;
+    assert.equal(activity?.closeReason, status);
+    assert.equal(activity?.diff, `snapshot before ${status}`);
+    assert.equal(activity?.evidenceState, "available");
+  }
 });
