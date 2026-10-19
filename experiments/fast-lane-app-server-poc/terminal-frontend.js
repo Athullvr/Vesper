@@ -67,7 +67,10 @@ class TerminalFrontend {
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       const failed = routed.result?.status === "unavailable";
       this.metrics.record(decision, elapsedMs, { handlerFailed: failed });
-      const label = failed ? "Vesper local · unavailable" : `Vesper local · ${routed.result.status} · no Codex turn`;
+      const routeDiagnostic = `${decision.reason}/${decision.intent}`;
+      const label = failed
+        ? `Vesper local · unavailable · ${routeDiagnostic}`
+        : `Vesper local · ${routed.result.status} · no Codex turn · ${routeDiagnostic}`;
       this.write(`\n[${label}] ${safeTerminalText(routed.result.summary)}\n`);
       return;
     }
@@ -142,7 +145,13 @@ class TerminalFrontend {
       return { permissions: cloneJsonValue(params.permissions || {}), scope: "turn" };
     }
     if (method === "applyPatchApproval" || method === "execCommandApproval") {
-      return { decision: approved ? "approved" : cancelled ? "abort" : "denied" };
+      return {
+        decision: approved
+          ? "approved"
+          : cancelled
+            ? "abort"
+            : { denied: { rejection: "User declined the request." } },
+      };
     }
     return { decision: approved ? "accept" : cancelled ? "cancel" : "decline" };
   }
@@ -300,7 +309,9 @@ function cloneJsonValue(value) {
 
 function refusedApproval(method) {
   if (method === "item/permissions/requestApproval") return { permissions: {}, scope: "turn" };
-  if (method === "applyPatchApproval" || method === "execCommandApproval") return { decision: "denied" };
+  if (method === "applyPatchApproval" || method === "execCommandApproval") {
+    return { decision: { denied: { rejection: "Vesper declined because the approval details could not be safely reviewed." } } };
+  }
   return { decision: "decline" };
 }
 

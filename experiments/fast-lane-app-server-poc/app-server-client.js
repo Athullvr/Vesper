@@ -82,7 +82,13 @@ class AppServerClient extends EventEmitter {
       this.emit("progress", { type: "initialized" });
       return true;
     }).catch((error) => {
-      if (this.connectionGeneration === generation) this.readyPromise = undefined;
+      if (this.connectionGeneration === generation) {
+        this.readyPromise = undefined;
+        // An initialization failure leaves the transport unusable. In
+        // particular, an initialize timeout would otherwise leak a child
+        // process that no later request can safely reuse.
+        this.terminateChild();
+      }
       throw error;
     });
 
@@ -452,7 +458,9 @@ function isApprovalMethod(method) {
 
 function defaultApproval(method) {
   if (method === "item/permissions/requestApproval") return { permissions: {}, scope: "turn" };
-  if (method === "applyPatchApproval" || method === "execCommandApproval") return { decision: "denied" };
+  if (method === "applyPatchApproval" || method === "execCommandApproval") {
+    return { decision: { denied: { rejection: "Declined by Vesper." } } };
+  }
   return { decision: "decline" };
 }
 
@@ -478,13 +486,32 @@ function validateApprovalResult(method, value) {
     return { permissions: value.permissions, scope: "turn" };
   }
   const decision = value.decision;
+  if (method === "applyPatchApproval" || method === "execCommandApproval") {
+    if (decision === "approved" || decision === "abort") return { decision };
+    if (isStructuredDenial(decision)) {
+      return { decision: { denied: { rejection: decision.denied.rejection } } };
+    }
+    throw new Error("Legacy approval decision is not supported by Vesper.");
+  }
   const choices = method === "item/commandExecution/requestApproval"
     ? ["accept", "decline", "cancel"]
     : method === "item/fileChange/requestApproval"
       ? ["accept", "decline", "cancel"]
-      : ["approved", "denied", "abort"];
+      : [];
   if (!choices.includes(decision)) throw new Error("Approval decision is not supported by Vesper.");
   return { decision };
+}
+
+function isStructuredDenial(decision) {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision) || Object.keys(decision).length !== 1) return false;
+  const denied = decision.denied;
+  return Boolean(
+    denied &&
+    typeof denied === "object" &&
+    !Array.isArray(denied) &&
+    Object.keys(denied).length === 1 &&
+    typeof denied.rejection === "string"
+  );
 }
 
 function samePath(first, second) {

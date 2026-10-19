@@ -15,7 +15,16 @@ Requirements: Node.js 18 or newer, Git, and Codex CLI on `PATH`. Run the CLI fro
 npm run cli -- --new /path/to/project
 ```
 
-Without a path, `vesper` uses the current directory. Without `--new` or `--resume`, it starts a new Vesper session by default. The package also exposes the executable name `vesper` when installed or linked through npm.
+Without a path, Vesper uses the current directory. To install the `vesper` command in the current npm environment, run `npm link` from this prototype folder, then start a session from the selected project:
+
+```sh
+cd experiments/fast-lane-app-server-poc
+npm link
+cd /path/to/project
+vesper --new
+```
+
+Without `--new` or `--resume`, Vesper starts a new session by default. To run directly from the checkout without linking, use `node /path/to/Vesper/experiments/fast-lane-app-server-poc/bin/vesper.js --new` from the project directory.
 
 Vesper prints the session id at startup. Resume that Vesper session and its saved Codex thread with:
 

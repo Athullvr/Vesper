@@ -62,9 +62,9 @@ test("CLI parsing supports explicit new sessions and resume without silently acc
 test("local request returns without invoking Codex or creating a Codex thread", async (t) => {
   const root = fixture(t);
   const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
-  const clients = [];
   const output = capture();
   const errors = capture();
+  let appServerSpawnCount = 0;
   const status = await runVesper(["--new", root], {
     store,
     output: output.stream,
@@ -75,7 +75,12 @@ test("local request returns without invoking Codex or creating a Codex thread", 
       assert.equal(cwd, root);
       return "feature/local\n";
     },
-    clientFactory: clientFactoryFor(clients),
+    clientOptions: {
+      spawnProcess: () => {
+        appServerSpawnCount += 1;
+        throw new Error("The local route must not launch Codex.");
+      },
+    },
   });
 
   const sessionId = output.text().match(/Vesper session: ([0-9a-f-]+)/u)?.[1];
@@ -83,8 +88,8 @@ test("local request returns without invoking Codex or creating a Codex thread", 
   assert.equal(errors.text(), "");
   assert.match(output.text(), /Current Git branch: feature\/local/u);
   assert.match(output.text(), /no Codex turn/u);
-  assert.equal(clients.length, 1);
-  assert.equal(clients[0].turns.length, 0);
+  assert.match(output.text(), /Session status: new · no Codex thread yet/u);
+  assert.equal(appServerSpawnCount, 0);
   assert.equal(store.load(sessionId).threadId, null);
 });
 

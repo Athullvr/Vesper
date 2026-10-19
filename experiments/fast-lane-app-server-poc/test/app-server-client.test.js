@@ -108,8 +108,38 @@ test("initializes with the installed protocol, starts one thread, streams two tu
   assert.deepEqual(turnRequests.map((request) => request.params.threadId), ["thread-1", "thread-1"]);
   assert.deepEqual(turnRequests.map((request) => request.params.cwd), ["/workspace/project", "/workspace/project"]);
   assert.deepEqual(turnRequests.map((request) => request.params.input[0].text), ["Explain a rebase.", "Explain it with an example."]);
+  assert.equal(turnRequests.every((request) => !Object.hasOwn(request.params, "sandboxPolicy") && !Object.hasOwn(request.params, "approvalPolicy")), true);
   assert.equal(Object.hasOwn(server.requests.find((request) => request.method === "thread/start").params, "sandbox"), false);
   assert.equal(Object.hasOwn(server.requests.find((request) => request.method === "thread/start").params, "approvalPolicy"), false);
+});
+
+test("an initialization RPC failure closes the unusable process and a later fallback can recover", async (t) => {
+  const server = new FakeAppServerProcess();
+  const recoveryServer = new FakeAppServerProcess();
+  server.receive = function (message) {
+    this.requests.push(message);
+    if (message.method === "initialize") {
+      this.send({ id: message.id, error: { code: -32000, message: "mock initialization failure" } });
+    }
+  };
+  let spawnCount = 0;
+  const client = new AppServerClient({
+    spawnProcess: () => {
+      spawnCount += 1;
+      return spawnCount === 1 ? server : recoveryServer;
+    },
+  });
+  t.after(() => client.dispose());
+
+  await assert.rejects(client.runTurn({ prompt: "Explain a rebase.", cwd: "/workspace/project" }), /mock initialization failure/u);
+  assert.equal(server.killed, true);
+  assert.equal(server.requests.some((request) => request.method === "thread/start"), false);
+  assert.equal(server.requests.some((request) => request.method === "turn/start"), false);
+
+  assert.deepEqual(await client.runTurn({ prompt: "Try again.", cwd: "/workspace/project" }), { status: "completed" });
+  assert.equal(spawnCount, 2);
+  assert.equal(recoveryServer.requests.some((request) => request.method === "thread/start"), true);
+  assert.equal(recoveryServer.requests.some((request) => request.method === "turn/start"), true);
 });
 
 test("resumes the saved thread and never silently replaces it with a new one", async (t) => {
@@ -210,4 +240,21 @@ test("approval requests use one-time supported decisions and permissions are lim
   assert.deepEqual(validateApprovalResult("item/permissions/requestApproval", { permissions: {}, scope: "turn" }), { permissions: {}, scope: "turn" });
   assert.throws(() => validateApprovalResult("item/permissions/requestApproval", { permissions: { network: { enabled: true } }, scope: "session" }), /turn-scoped/u);
   assert.throws(() => validateApprovalResult("item/commandExecution/requestApproval", { decision: "acceptForSession" }), /not supported/u);
+});
+
+test("legacy approval denials match the installed schema without granting persistent approval", async (t) => {
+  const server = new FakeAppServerProcess();
+  const { client } = createClient(server);
+  t.after(() => client.dispose());
+  await client.connect("/workspace/project");
+
+  server.requestFromServer("patch-approval", "applyPatchApproval", {});
+  server.requestFromServer("exec-approval", "execCommandApproval", {});
+
+  const denial = { decision: { denied: { rejection: "Declined by Vesper." } } };
+  assert.deepEqual(server.requests.find((request) => request.id === "patch-approval"), { id: "patch-approval", result: denial });
+  assert.deepEqual(server.requests.find((request) => request.id === "exec-approval"), { id: "exec-approval", result: denial });
+  assert.deepEqual(validateApprovalResult("execCommandApproval", denial), denial);
+  assert.throws(() => validateApprovalResult("execCommandApproval", { decision: "denied" }), /Legacy approval decision/u);
+  assert.throws(() => validateApprovalResult("applyPatchApproval", { decision: "approved_for_session" }), /Legacy approval decision/u);
 });

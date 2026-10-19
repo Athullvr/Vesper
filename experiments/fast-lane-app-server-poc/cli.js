@@ -100,6 +100,9 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
     }
 
     output.write(`Vesper session: ${session.sessionId}\n`);
+    const sessionStatus = options.resumeId ? "resumed" : "new";
+    const threadStatus = session.threadId ? "saved Codex thread" : "no Codex thread yet";
+    output.write(`Session status: ${sessionStatus} · ${threadStatus}\n`);
     output.write(`Project: ${cwd}\n`);
 
     let terminal;

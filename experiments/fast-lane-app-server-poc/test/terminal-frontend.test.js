@@ -95,25 +95,28 @@ test("local question is labeled local, uses no app-server turn, and Codex fallba
   await frontend.run();
   const text = output();
   assert.match(text, /Vesper local · confirmed · no Codex turn/u);
+  assert.match(text, /local_exact_match\/current_git_branch/u);
   assert.match(text, /Current Git branch: feature\/phase-two/u);
   assert.match(text, /A rebase replays commits\./u);
   assert.match(text, /Codex · completed/u);
   assert.equal(appServer.turns.length, 1);
 });
 
-test("fallback failures produce a visible terminal error and allow another prompt", async () => {
+test("initialization failures and timeouts are visible and the input loop recovers", async () => {
   let calls = 0;
   const appServer = new FakeAppServer(async () => {
     calls += 1;
-    if (calls === 1) throw new Error("mock app-server failure");
+    if (calls === 1) throw new Error("mock app-server initialization failure");
+    if (calls === 2) return { status: "timeout" };
     return { status: "completed" };
   });
-  const { frontend, output } = makeFrontend({ answers: ["Build a website", "Explain Git refs", ":quit"], appServer });
+  const { frontend, output } = makeFrontend({ answers: ["Build a website", "Explain Git refs", "Try another request", ":quit"], appServer });
 
   await frontend.run();
-  assert.match(output(), /Codex error .* mock app-server failure/u);
+  assert.match(output(), /Codex error .* mock app-server initialization failure/u);
+  assert.match(output(), /Codex · timed out and interrupted/u);
   assert.match(output(), /Codex · completed/u);
-  assert.equal(appServer.turns.length, 2);
+  assert.equal(appServer.turns.length, 3);
 });
 
 test("Ctrl+C requests interruption, reports terminal status, and ends the current frontend run", async () => {
@@ -162,6 +165,15 @@ test("approval prompts require an explicit yes and only grant one-time protocol 
   assert.deepEqual(await permissionDeny.requestApproval("item/permissions/requestApproval", {
     permissions: { network: { enabled: true } },
   }), { permissions: {}, scope: "turn" });
+
+  const { frontend: legacyDeny } = makeFrontend({ answers: ["no"] });
+  assert.deepEqual(await legacyDeny.requestApproval("execCommandApproval", {
+    command: ["npm", "test"],
+    cwd: "/workspace/project",
+  }), { decision: { denied: { rejection: "User declined the request." } } });
+
+  const { frontend: legacyAccept } = makeFrontend({ answers: ["yes"] });
+  assert.deepEqual(await legacyAccept.requestApproval("applyPatchApproval", { reason: "reviewed patch" }), { decision: "approved" });
 });
 
 test("a command cannot be approved when the server does not offer the one-time accept decision", async () => {
