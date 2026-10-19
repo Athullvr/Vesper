@@ -7,6 +7,8 @@ This prototype has two frontends over the same small routing core:
 
 The prototype uses Node.js built-ins, Git, the VS Code Extension API for the panel, and the installed Codex CLI. It has no npm runtime dependencies.
 
+The [reliability audit](RELIABILITY-AUDIT.md) records the verified fixes, test matrix, and offline runtime results. The [interface inventory and roadmap](INTERFACE-ROADMAP.md) maps the terminal's remaining features to the installed protocol and describes an incremental architecture.
+
 ## Terminal frontend
 
 Requirements: Node.js 18 or newer, Git, and Codex CLI on `PATH`. Run the CLI from this folder:
@@ -83,6 +85,7 @@ For terminal fallback, submit `Explain what a Git rebase does in one sentence.` 
 
 - Vesper is its own frontend. It does not attach to, import, or continue the original interactive Codex CLI conversation.
 - Codex app-server is experimental in the inspected CLI version; protocol behavior can change. Recheck the installed generated schema before updating protocol methods.
-- The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and Vesper reports that it must be restarted before continuing.
+- The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and the request is reported as an error. Another fallback tries to resume the same saved thread; it never silently starts a replacement conversation.
 - Local Git checks do not fetch or contact a remote. Their results are bounded by local repository evidence and its freshness.
+- Upstream freshness uses the tracking ref's latest recorded reflog update (`%gD` with `--date=raw`), not the referenced commit's date. Missing or invalid reflog evidence leaves freshness unknown, even when the local ahead count is confirmed. An unchanged fetch need not add a reflog entry; a recent entry never confirms live remote state.
 - Remove `experiments/fast-lane-app-server-poc/` to discard the prototype. Runtime use creates no project configuration, dependencies, or Git changes.

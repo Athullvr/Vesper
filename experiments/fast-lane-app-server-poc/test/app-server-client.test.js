@@ -415,9 +415,60 @@ test("terminal approval choices reach the app-server and its outcome controls co
 
 test("unconfirmed timeout closes the connection and cannot be reported as completed", async (t) => {
   const server = new FakeAppServerProcess({ onTurnStart() {} });
-  const { client } = createClient(server, { turnTimeoutMs: 10, interruptGraceMs: 10 });
+  const recoveryServer = new FakeAppServerProcess();
+  let spawns = 0;
+  const { client } = createClient(server, {
+    turnTimeoutMs: 10, interruptGraceMs: 10,
+    spawnProcess: () => ++spawns === 1 ? server : recoveryServer,
+  });
   t.after(() => client.dispose());
   await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /did not confirm interruption/u);
+  assert.equal(server.killed, true);
+  assert.equal(client.activeTurn, undefined);
+  assert.deepEqual(await client.runTurn({ prompt: "Retry", cwd: "/workspace" }), { status: "completed" });
+  assert.equal(recoveryServer.requests.find((message) => message.method === "thread/resume").params.threadId, "thread-1");
+  assert.equal(recoveryServer.requests.some((message) => message.method === "thread/start"), false);
+});
+
+test("a failure notification before the turn/start reply is reported without an unhandled rejection", async (t) => {
+  const server = new FakeAppServerProcess();
+  const receive = server.receive.bind(server);
+  server.receive = (message) => {
+    if (message.method !== "turn/start") return receive(message);
+    server.requests.push(message);
+    server.turnCount += 1;
+    server.completeTurn(message, "failed", "", "early turn failure");
+    setImmediate(() => server.respond(message.id, { turn: { id: "turn-1", status: "inProgress", items: [] } }));
+  };
+  const { client } = createClient(server);
+  t.after(() => client.dispose());
+  await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /early turn failure/u);
+});
+
+test("an unsupported server request ends the uncertain operation before another fallback", async (t) => {
+  const server = new FakeAppServerProcess({ onTurnStart: (_request, current) => {
+    setImmediate(() => current.requestFromServer("unsupported-1", "item/tool/requestUserInput", {
+      threadId: "thread-1", turnId: "turn-1", itemId: "item-1", questions: [],
+    }));
+  } });
+  const { client } = createClient(server);
+  t.after(() => client.dispose());
+  await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /unsupported/u);
+  assert.equal(server.requests.find((message) => message.id === "unsupported-1").error.code, -32601);
+  assert.equal(server.killed, true);
+  assert.equal(client.child, undefined);
+});
+
+test("turn/start timeout closes the transport because server acceptance is unknown", async (t) => {
+  const server = new FakeAppServerProcess();
+  const receive = server.receive.bind(server);
+  server.receive = (message) => {
+    if (message.method === "turn/start") server.requests.push(message);
+    else receive(message);
+  };
+  const { client } = createClient(server, { rpcTimeoutMs: 10 });
+  t.after(() => client.dispose());
+  await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /Timed out waiting.*turn\/start/u);
   assert.equal(server.killed, true);
   assert.equal(client.activeTurn, undefined);
 });

@@ -1,0 +1,128 @@
+# Vesper reliability audit — 2026-10-19
+
+Vesper remains the existing Node.js terminal and VS Code prototype. This audit fixes local tracking-ref freshness and terminal app-server lifecycle failures, extends deterministic coverage, and records the interface gaps in [INTERFACE-ROADMAP.md](INTERFACE-ROADMAP.md). No dependencies, model, database, framework, local command executor, or session schema were added.
+
+**Starting state and scope**
+
+- Repository: `Vesper`; implementation: `experiments/fast-lane-app-server-poc/`.
+- Initial branch: `main`, tracking `origin/main`, clean working tree at `e8901e8`.
+- Node: `v20.18.0`; Git: `2.43.0`; Codex: `codex-cli 0.162.1`.
+- No repository `AGENTS.md`, `CLAUDE.md`, or CI workflow was found. `package.json` has `test` and `cli` scripts; the local routing benchmark is a separate Node script.
+- Baseline: **60 tests passed, 0 failed, 0 cancelled, 0 skipped**.
+- During the audit, HEAD advanced to `96c7711` and then `5ee7299`, containing earlier portions of these edits. The audit did not run Git commit, reset, checkout, rebase, or push against the user repository. Those commits and subsequent edits were preserved. Review the work relative to `e8901e8`, not only the final working-tree diff.
+- Temporary repositories, test logs, generated schemas and the isolated smoke-test home are under ignored `.audit-artifacts/`. Existing Vesper sessions, Codex credentials and user configuration were not read, copied, reset, or deleted.
+
+**Execution flow**
+
+`bin/vesper.js` invokes `runVesper()` in `cli.js`. The CLI parses new/resume arguments, canonicalizes the project directory, creates or loads private metadata through `SessionStore`, constructs the app-server client lazily, and starts `TerminalFrontend`. The session UUID and Codex thread ID remain separate. Metadata contains only schema version, session ID, project directory, thread ID, and creation/update timestamps.
+
+`routing-core.js` classifies constrained exact phrases and anchored grammatical variants into five intents: branch, working-tree status, upstream configuration, local ahead count, and recorded prototype test result. `local-handlers.js` uses fixed Git argument arrays or source-fingerprinted test evidence. No user shell text is executed. A local handler's missing, malformed or failed result becomes an explicit unknown/unavailable answer without automatically escalating.
+
+Unsupported or ambiguous requests call `AppServerClient.runTurn()`. The terminal client initializes JSON-RPC over stdio, starts or resumes a thread in the correct project, persists its ID, sends text input to `turn/start`, streams agent deltas, mediates approvals and waits for a terminal state. It inherits installed Codex configuration and authentication; production calls introduce no sandbox or approval-policy override.
+
+The VS Code extension shares the router and local handlers but still has its own older app-server client. It requests a read-only sandbox and declines approvals. It does not inherit the terminal client's transport fixes; consolidation is an incremental follow-up, not a wholesale frontend replacement.
+
+**Verified bugs and corrections**
+
+1. **Commit dates were reported as tracking-ref update dates.** `git reflog show -1 --format=%ct @{upstream}` prints the referenced commit's committer epoch. The replacement is `git reflog show -1 --format=%gD --date=raw @{upstream}`. `%gD` selects the reflog designator and explicit `--date=raw` makes its suffix `@{<entry epoch> <timezone>}`. Only a well-formed ref selector and safe, plausible epoch are accepted.
+2. **Disconnected processes could affect a recovered turn.** Old stdout listeners remained active after reconnect. Data is now accepted only from the current child and connection generation. Late old-process output, completion and close events cannot settle or stream into the new turn.
+3. **Stale turn-start events could overwrite the active turn ID.** All supported notifications now check turn identity before updating state or forwarding activity, not only deltas and completion.
+4. **An outstanding approval response could reach the replacement process.** Approval responses, denials and errors are now tied to the originating child. They cannot cross a reconnect. The existing check against approvals for a finished or different turn remains.
+5. **Early failure notifications could cause an unhandled rejection.** A turn can fail before the `turn/start` RPC responds. Its completion rejection is now observed immediately, while the original promise still carries the failure to the caller. A delayed-acknowledgement test reproduced the prior unhandled rejection.
+6. **Uncertain starts and unsupported server requests left the transport running after reporting failure.** A failed/timed-out start RPC or unsupported active server request now closes that connection and rejects pending work before another fallback. This avoids treating a potentially running operation as safely finished. Thread metadata remains available for explicit retry/resume.
+
+Two small additive changes support the interface foundation: supported tool/diff/plan/error progress events now retain their `params` instead of discarding the payload, and approval prompts print the user's choice explicitly. A choice is not a claim that the requested operation succeeded; terminal turn status continues to come from the app-server. Timeout wording now accurately explains that the next request attempts to resume the saved thread.
+
+**Why the Git evidence is appropriate**
+
+The installed `git-reflog(1)` states that reflogs record when reference tips were updated and that `reflog show` uses `log -g`. `git-log(1)` documents `%ct` as the committer timestamp, `%gD` as the reflog selector, and the explicit `--date` rule for timestamp selectors. The local manuals were inspected; no documentation fetch was needed.
+
+Disposable real Git repositories independently set commit dates and `update-ref` reflog dates. A commit from 2001 with a ref update on 2026-10-18 is recent at a fixed 2026-10-19 observation time. A commit dated 2026-10-19 with a ref update on 2026-10-01 is stale. The tests also assert that the old `%ct` command actually returns the commit date, establishing that the fixture detects the original bug.
+
+Git is asked for the relevant upstream reflog instead of reading `.git/logs` directly, which avoids assuming a worktree layout or ref-storage backend. `FETCH_HEAD` and file modification times are unsuitable substitutes: they can describe another ref, maintenance, or an unchanged fetch.
+
+The seven-day threshold and existing one-hour future-clock tolerance are retained. Empty/missing/unavailable reflogs, invalid or unsafe epochs, and implausibly future values yield `freshness.state: "unknown"` with no `lastUpdatedAt`. Missing upstreams and detached HEAD retain their prior unavailable/unknown behavior. A valid local ahead count can still have `status: "confirmed"` while **its freshness remains unknown**; the summary explicitly states that distinction.
+
+A reflog entry dates a recorded local ref update, not necessarily a fetch. The summary therefore says “local upstream reference” instead of “last fetched upstream reference.” An unchanged fetch may produce no new reflog entry, and reflogs can expire. Neither recent nor stale tracking data proves the live remote's state. Every successful local ahead answer retains the remote-not-contacted caveat. No fetch, push, or remote lookup is used.
+
+**Routing decisions**
+
+| Request | Decision | Reason |
+| --- | --- | --- |
+| What is the current Git branch? | Local, `current_git_branch` | Direct current checkout evidence |
+| Show working-tree status. | Local, `working_tree_status` | Fixed porcelain Git query |
+| What upstream does this branch track? | Local, `branch_upstream` | Local configuration, no remote claim |
+| How many commits am I ahead of upstream? | Local, `ahead_of_upstream` | Local ref count with explicit age and remote qualification |
+| Has this branch been pushed? | Codex, `local_ambiguous` | Cached refs cannot establish the requested live state |
+| `grep -nE 'freshness\|stale\|reflog\|upstream\|aheadCount' test tests 2>/dev/null` | Codex, `local_ambiguous` | Unsupported shell request; Git terms trigger the conservative topic guard |
+| Inspect the repository and explain its architecture. | Codex, `codex_fallback` | Requires analysis outside the five deterministic intents |
+| Review the code and analyze potential bugs. | Codex, `codex_fallback` | Requires code analysis |
+
+The reported classifications match the current policy. `local_ambiguous` is a fallback reason, not an instruction to execute locally. No classifier rules or local command allowlist were expanded. Failed local handlers remain explicit local failures; Codex responses never receive a confirmed-local label.
+
+**Integration matrix**
+
+All rows have deterministic coverage. “Mock protocol” means no model or real approved operation was executed.
+
+| # | Behavior | Coverage and result |
+| --- | --- | --- |
+| 1 | Current branch, no turn | Real Git + `runVesper`: confirmed branch, zero process spawns, saved thread remains null |
+| 2 | Working-tree status, no turn | Real Git with an untracked file + CLI: local counts, zero spawns |
+| 3 | Upstream configuration | Real local upstream and absent upstream; detached HEAD yields unknown |
+| 4 | Ahead count and freshness | Real zero/one counts; independent commit/ref timestamps, recent/stale/unknown cases |
+| 5 | Pushed state | Router fallback test, no local result; remote approval refusal is covered by mock decisions, not a live remote check |
+| 6 | Repository inspection | Router fallback only, no local handler invocation |
+| 7 | Code review/bug analysis | Router fallback only, no local handler invocation |
+| 8 | Insufficient evidence | Missing test record, malformed Git evidence and detached checkout return unknown/unavailable without a fabricated value |
+| 9 | Approval accepted | Terminal + real client + mock server: command/file/permission decisions; simulated operation runs only on accept; returned server outcome governs completion |
+| 10 | Approval declined/cancelled | Same integration: no simulated operation on refusal; explicit choice and refusal output; command/file cancellation ends interrupted; permission refusal returns an empty turn-scoped grant |
+| 11 | Failed/interrupted turn | Failed terminal events, partial text, early failure before start reply, acknowledged timeout and unconfirmed timeout never produce a completed answer |
+| 12 | Disconnect/recovery | Client reconnects/resumes same thread; stale old-process events and approvals ignored; terminal loop accepts another prompt after recoverable errors |
+| 13 | Session resume | CLI preserves UUID, saved thread and canonical cwd; wrong selected directory, wrong returned thread/cwd or failed resume cannot silently create a replacement |
+| 14 | Local handler failure | Router and terminal show unavailable, do not leak raw failure details, and do not create a Codex turn |
+
+Tests live in the existing `test/*.test.js` files. The new Git fixtures create local refs and configuration without creating or contacting a remote. No new test file or fixture dependency was required.
+
+**Commands and results**
+
+Commands below ran from `experiments/fast-lane-app-server-poc/` unless specified. Test temporary directories were confined using `TMPDIR="$PWD/.audit-artifacts"`; npm cache was confined there as well.
+
+| Executed command/check | Actual result |
+| --- | --- |
+| `git status --short --branch`, `git branch --show-current`, `git log`, `git ls-files`, targeted `find`, `sed`, `grep`, `cat` | Repository, documentation, tests, current changes and execution flow inspected. `rg` was unavailable; `find`/`grep` used instead. |
+| `node --version`, `git --version`, `codex --version` | Versions above |
+| Baseline `npm test` | 60 passed, 0 failed, 0 skipped/cancelled |
+| Freshness regressions before fix: `node --test test/local-handlers.test.js test/git-integration.test.js` | 23 tests: 18 passed, 5 failed |
+| Same focused freshness tests after fix | 23 passed, 0 failed |
+| Transport regressions before fix: `node --test test/app-server-client.test.js` | 13 tests: 10 passed, 3 failed |
+| Expanded suite after transport/approval matrix changes: `unshare --user --map-root-user --net npm test` | 82 passed, 0 failed |
+| Early failure/uncertain-start regressions before fix: `node --test test/app-server-client.test.js` | 27 tests including approval subtests: 24 passed, 3 failed; early failure reproduced `unhandledRejection` |
+| Final `unshare --user --map-root-user --net npm test` | **85 passed, 0 failed, 0 cancelled, 0 skipped** |
+| `unshare --user --map-root-user --net node benchmark/run-local.js 1` | 25/25 route decisions correct; 15/15 local answers correct; 10 mock fallbacks; 0 false local routes; 0 live Codex turns |
+| `codex app-server --help`, `codex app-server generate-json-schema --help` | Local command syntax inspected |
+| `unshare --user --map-root-user --net codex app-server generate-json-schema --out ...` (with and without `--experimental`) | Both schema bundles generated locally with isolated `CODEX_HOME`; 105/170 client methods, 10/11 server requests, 84 notifications |
+| `git reflog show -1 --format='%ct %gD' --date=raw '@{upstream}'` | Different commit and reflog entry epochs observed in this repository |
+| Installed `git-log(1)` / `git-reflog(1)` via `zcat` and targeted `grep` | Documented timestamp semantics verified |
+| `node .audit-artifacts/offline-smoke.cjs` | Real offline initialize/start/turn-start/event stream/interrupt/resume, details below |
+| `git diff --check` | No whitespace errors |
+
+Initial schema generation emitted a warning because the isolated Codex home was beneath `TMPDIR`; schemas were still generated. The smoke test uses sibling home/tmp directories and succeeded without relying on those aliases. The baseline npm command printed its update notice; subsequent npm runs explicitly disable that notifier and run without network access. No package installation or update was run.
+
+**Actual runtime verification and limits**
+
+The real smoke script launches the installed binary through `bwrap` with an isolated network namespace, a read-only host filesystem, and only `.audit-artifacts/` writable. It uses an empty isolated `CODEX_HOME`, a repository-local temp directory and an explicit read-only sandbox. It neither reads/copies the user's Codex credentials nor mutates their configuration or sessions.
+
+Observed: `initialize` succeeded; `thread/start` succeeded; `turn/start` produced a real `turn/started` notification and item activity; a three-second test deadline requested `turn/interrupt`; the server confirmed termination and the client returned `status: "timeout"`; a new process successfully resumed the same thread ID and verified the same project directory.
+
+No agent text deltas or successful model answer were observed. This proves local protocol startup, notification delivery, interruption and persistent resumption in this environment, not authenticated model execution. A successful network-backed turn and live command/file approval flow remain unverified because external access was not approved and the isolated home has no credentials. No live remote was contacted, and the direct network-backed `benchmark/run-codex.js` was not run. The VS Code graphical Extension Development Host was not launched; its existing automated routing tests passed.
+
+**Files changed**
+
+- `local-handlers.js`: reflog evidence, qualified local-ref wording and evidence description.
+- `app-server-client.js`: connection/turn isolation, approval reply ownership, early rejection handling, uncertain-operation shutdown, retained progress payloads and recovery wording.
+- `terminal-frontend.js`: explicit approval-choice feedback.
+- Existing tests in `test/local-handlers.test.js`, `test/git-integration.test.js`, `test/app-server-client.test.js`, `test/routing-core.test.js`, `test/terminal-frontend.test.js`, `test/cli.test.js`: regressions and the integration matrix.
+- `.gitignore`: repository-local audit scratch directory.
+- `README.md`, this report and `INTERFACE-ROADMAP.md`: behavior, verified protocol coverage, remaining risks and incremental roadmap.
+
+`session-store.js`, public result schemas, production configuration/authentication behavior, routing policy, package scripts and security defaults remain compatible. The test runner refreshed its existing ignored source-fingerprinted test record, as it normally does.

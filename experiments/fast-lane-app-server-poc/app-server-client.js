@@ -116,6 +116,7 @@ class AppServerClient extends EventEmitter {
 
     const active = this.createActiveTurn(onDelta);
     this.activeTurn = active;
+    const generation = this.connectionGeneration;
 
     try {
       const response = await this.request("turn/start", {
@@ -134,6 +135,9 @@ class AppServerClient extends EventEmitter {
         this.finishFromStatus(active, turn);
       }
     } catch (error) {
+      // A lost start reply leaves acceptance unknown. Close this transport
+      // before allowing another request, rather than leaving an orphan turn.
+      this.handleExit(error, generation);
       this.finish(active, undefined, error);
     }
 
@@ -194,6 +198,10 @@ class AppServerClient extends EventEmitter {
       resolveCompletion = resolve;
       rejectCompletion = reject;
     });
+    // Notifications may fail the turn before the turn/start RPC resolves.
+    // Observe that rejection immediately; runTurn still returns this original
+    // promise, so callers receive the failure once the start request settles.
+    completion.catch(() => {});
     const active = {
       threadId: this.threadId,
       turnId: null,
@@ -221,7 +229,7 @@ class AppServerClient extends EventEmitter {
     active.interruptTimer = setTimeout(() => {
       if (this.activeTurn !== active || active.settled) return;
       this.threadReady = false;
-      this.finish(active, undefined, new Error("Codex turn timed out; the app-server did not confirm interruption. Restart Vesper before continuing."));
+      this.finish(active, undefined, new Error("Codex turn timed out; the app-server did not confirm interruption. The connection was closed; another request will try to resume the saved thread."));
       this.terminateChild();
     }, this.interruptGraceMs);
   }
@@ -325,6 +333,7 @@ class AppServerClient extends EventEmitter {
     const { id, method, params = {} } = message;
     const active = this.activeTurn;
     const child = this.child;
+    const generation = this.connectionGeneration;
     // Approval prompts can outlive a disconnected transport. Never send their
     // replies (including denials/errors) to a replacement process with new IDs.
     const respond = (response) => {
@@ -333,7 +342,7 @@ class AppServerClient extends EventEmitter {
     try {
       if (!isApprovalMethod(method)) {
         respond({ id, error: { code: -32601, message: `Vesper does not support app-server request ${method}.` } });
-        if (active) this.finish(active, undefined, new Error(`Codex requested unsupported approval method ${method}.`));
+        if (active) this.handleExit(new Error(`Codex requested unsupported server method ${method}.`), generation);
         return;
       }
 
@@ -356,7 +365,7 @@ class AppServerClient extends EventEmitter {
       } catch {
         // A closed transport is already reported through the active turn.
       }
-      if (active) this.finish(active, undefined, error);
+      if (active && !active.settled) this.handleExit(error, generation);
     }
   }
 
