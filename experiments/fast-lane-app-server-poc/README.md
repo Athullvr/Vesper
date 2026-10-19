@@ -1,8 +1,8 @@
 # Fast Lane app-server PoC
 
-Disposable VS Code extension prototype. It routes exactly `What Git branch am I on?` to a fixed, read-only local Git command. Every other prompt is sent to a Codex app-server thread and streamed back into the panel.
+Disposable VS Code extension prototype with a small, testable routing core. Explicit deterministic questions about the current branch, working-tree status, configured upstream, commits ahead of the last fetched upstream reference, and the most recent recorded Fast Lane test run are answered locally. Ambiguous and unsupported requests use the existing Codex app-server fallback and stream into the panel.
 
-The extension uses only the VS Code Extension API, Node.js built-ins, the installed `git` command, and the documented Codex app-server JSON-RPC protocol. It has no npm runtime dependencies.
+The extension uses only the VS Code Extension API, Node.js built-ins, the installed `git` command, and the documented Codex app-server JSON-RPC protocol. Its tests use Node's built-in test runner; there are no npm runtime dependencies.
 
 ## Run locally
 
@@ -23,15 +23,28 @@ For an isolated VS Code profile, add `--user-data-dir /tmp/fast-lane-vscode-prof
 
 ## Manual validation
 
-1. Submit the exact prompt `What Git branch am I on?`. The panel should show the branch with a **Fast Lane local · no Codex turn** label.
-2. In **Output → Fast Lane PoC**, confirm a `route=local` line and `codex_turns_started=0`. App-server initialization may appear, but there must be no `thread/start` or `turn/start` RPC for this request.
-3. Submit `Explain what a Git rebase does in one sentence.` It is deliberately outside the one-rule allowlist. The panel should show a streamed Codex answer. The log should show `route=codex_fallback`, `thread/start`, `turn/start`, and the `turn/started` / `turn/completed` notifications. Token usage is logged when app-server reports it; otherwise the panel and log state that usage was unavailable.
+Run the routing-core tests from this folder with `npm test`. The command records only the test summary, exit code, timestamps, and source fingerprint in an ignored local file. A later local test-result answer is confirmed only while that fingerprint matches the routing-core test sources.
 
-If the active workspace is not a Git repository, Git is missing, the command fails, or it returns no branch name, the panel reports that condition without inventing a branch. Local checks still work if app-server cannot start. A fallback prompt displays an explicit error if app-server is unavailable or the Codex turn fails.
+Try these local requests:
+
+- `What Git branch am I on?`
+- `Is my working tree clean?`
+- `Does this branch have an upstream?`
+- `How many local commits are ahead of upstream?`
+- `Did the last test run pass?`
+
+Each local answer includes its status and structured evidence. The upstream ahead count uses local tracking refs only, checks the tracking-ref reflog for age, and always warns that the remote was not contacted. An old ref is marked stale; an unavailable reflog produces unknown freshness. A branch name alone never establishes that it is pushed. If no trustworthy test record exists, the answer is unknown; changed routing-core sources make the record stale.
+
+In **Output → Fast Lane PoC**, confirm local requests produce `route=local`, `reason=local_exact_match`, and a route metric, without an app-server spawn or `turn/start`. Requests such as `Is this branch pushed?` are ambiguous and should go to Codex with reason `local_ambiguous`. Submit `Explain what a Git rebase does in one sentence.` to exercise the normal fallback stream. The log includes route counts, latency, and local handler failures without storing prompt or answer text.
+
+If the active workspace is not a Git repository, Git is missing, a handler fails, or Git returns no branch name, the panel shows unavailable or unknown instead of inventing an answer. Local checks still work if app-server cannot start. A fallback prompt displays an explicit error if app-server is unavailable or the Codex turn fails.
 
 ## Evidence and limitations
 
-- The local route calls only `git branch --show-current` through `execFile` with an argv array and the active workspace as `cwd`. It never invokes a shell and never sends `turn/start`.
+- Routing, structured local results, local handlers, fallback selection, and privacy-safe route metrics are split into testable modules. The Git handlers use argv arrays with `execFile`; they never invoke a shell.
+- The upstream ahead check compares `HEAD` with `@{upstream}` and never fetches. Its freshness estimate uses the local upstream reflog and a seven-day threshold; it is not proof of current remote state.
+- The test-result handler trusts only the local `npm test` runner's record and verifies its source fingerprint. It reports the Fast Lane routing-core suite, not unrelated project tests.
+- The local route never launches Codex. The app-server starts lazily for a Codex fallback.
 - The extension logs each app-server RPC method and ID, routing choice, request latency, turn state, and any `thread/tokenUsage/updated` payload. Prompt text is not included in logs.
 - A successful fallback demonstrates the working signed-in Codex configuration. This prototype does not manage authentication or expose authentication material.
 - The panel owns its own conversation display. Local replies are not inserted into the built-in Codex UI. The app-server CLI is marked experimental in the installed Codex version, so protocol maturity remains a product risk.

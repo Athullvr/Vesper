@@ -2,8 +2,9 @@ const vscode = require("vscode");
 const { execFile, spawn } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
+const { createLocalHandlers } = require("./local-handlers");
+const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 
-const SUPPORTED_PROMPT = "what git branch am i on";
 const APP_SERVER_TIMEOUT_MS = 20_000;
 const TURN_TIMEOUT_MS = 5 * 60_000;
 
@@ -11,10 +12,14 @@ let output;
 let appServer;
 let panel;
 let requestSequence = 0;
+let localHandlers;
+let routeMetrics;
 
 function activate(context) {
   output = vscode.window.createOutputChannel("Fast Lane PoC");
   appServer = new AppServerClient(writeLog);
+  localHandlers = createLocalHandlers({ runGit: runGitCommand });
+  routeMetrics = new RouteMetrics();
 
   context.subscriptions.push(
     output,
@@ -53,14 +58,10 @@ function openPanel(context) {
 
   panel.webview.onDidReceiveMessage(async (message) => {
     if (message?.type === "ready") {
-      panel?.webview.postMessage({ type: "status", text: "Connecting to Codex app-server…" });
-      appServer.connect().then(
-        () => panel?.webview.postMessage({ type: "status", text: "Codex app-server connected" }),
-        (error) => {
-          writeLog(`app-server connection unavailable: ${safeMessage(error)}`);
-          panel?.webview.postMessage({ type: "status", text: "Codex app-server unavailable; local checks still work" });
-        }
-      );
+      panel?.webview.postMessage({
+        type: "status",
+        text: "Ready · local checks stay local; Codex connects when a fallback is sent",
+      });
       return;
     }
 
@@ -74,55 +75,55 @@ async function handlePrompt(prompt) {
   const requestId = ++requestSequence;
   const startedAt = performance.now();
   const cwd = activeWorkspacePath();
-  const normalized = normalizePrompt(prompt);
+  const decision = classifyRequest(prompt);
 
   panel?.webview.postMessage({ type: "user-message", text: prompt });
+  writeLog(`request=${requestId} route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"}`);
 
-  if (normalized === SUPPORTED_PROMPT) {
-    writeLog(`request=${requestId} route=local intent=current_git_branch cwd=${cwd || "<no-workspace>"}`);
-    if (!cwd) {
-      finishLocalError(requestId, startedAt, "Open a workspace folder before asking about its Git branch.");
-      return;
+  if (decision.route === "local") {
+    const routed = await routeRequest(prompt, { decision, handlers: localHandlers, context: { cwd } });
+    const result = routed.result;
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    recordRouteMetrics(requestId, decision, elapsedMs, result.status === "unavailable");
+    if (result.status === "unavailable") {
+      panel?.webview.postMessage({
+        type: "error",
+        label: "Local check unavailable",
+        text: result.summary,
+        result,
+        elapsedMs,
+      });
+    } else {
+      panel?.webview.postMessage({ type: "local-answer", text: result.summary, result, elapsedMs });
     }
-
-    runCurrentGitBranch(cwd, (error, branch) => {
-      const elapsedMs = Math.round(performance.now() - startedAt);
-      if (error) {
-        writeLog(`request=${requestId} local-check=failed elapsed_ms=${elapsedMs} reason=${safeMessage(error)}`);
-        panel?.webview.postMessage({
-          type: "error",
-          label: "Local check failed",
-          text: safeMessage(error),
-          elapsedMs,
-        });
-        return;
-      }
-
-      if (!branch) {
-        const text = "Git returned no branch name (the repository may be in detached HEAD state).";
-        writeLog(`request=${requestId} local-check=empty-branch elapsed_ms=${elapsedMs}`);
-        panel?.webview.postMessage({ type: "local-answer", text, elapsedMs });
-        return;
-      }
-
-      const text = `Current Git branch: ${branch}`;
-      writeLog(`request=${requestId} local-check=success elapsed_ms=${elapsedMs} branch=${JSON.stringify(branch)} codex_turns_started=0`);
-      panel?.webview.postMessage({ type: "local-answer", text, elapsedMs });
-    });
     return;
   }
 
-  writeLog(`request=${requestId} event=request_submitted route=codex_fallback intent=unsupported prompt_chars=${prompt.length} cwd=${cwd || "<no-workspace>"}`);
+  writeLog(`request=${requestId} event=request_submitted reason=${decision.reason}`);
   if (!cwd) {
-    finishLocalError(requestId, startedAt, "Open a workspace folder before sending a prompt to Codex.");
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    recordRouteMetrics(requestId, decision, elapsedMs);
+    panel?.webview.postMessage({
+      type: "error",
+      label: "Fast Lane",
+      text: "Open a workspace folder before sending a prompt to Codex.",
+      elapsedMs,
+    });
     return;
   }
 
   panel?.webview.postMessage({ type: "assistant-start" });
   const onDelta = (delta) => panel?.webview.postMessage({ type: "assistant-delta", text: delta });
   try {
-    const result = await appServer.runCodexTurn(prompt, cwd, requestId, onDelta);
+    const routed = await routeRequest(prompt, {
+      decision,
+      handlers: localHandlers,
+      context: { cwd },
+      fallback: () => appServer.runCodexTurn(prompt, cwd, requestId, onDelta),
+    });
+    const result = routed.fallbackResult;
     const elapsedMs = Math.round(performance.now() - startedAt);
+    recordRouteMetrics(requestId, decision, elapsedMs);
     writeLog(`request=${requestId} fallback=completed elapsed_ms=${elapsedMs} status=${result.status} usage=${result.usageSeen ? "reported" : "not-reported"}`);
     panel?.webview.postMessage({
       type: "assistant-done",
@@ -131,6 +132,7 @@ async function handlePrompt(prompt) {
     });
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
+    recordRouteMetrics(requestId, decision, elapsedMs);
     writeLog(`request=${requestId} fallback=failed elapsed_ms=${elapsedMs} reason=${safeMessage(error)}`);
     panel?.webview.postMessage({
       type: "assistant-error",
@@ -140,10 +142,9 @@ async function handlePrompt(prompt) {
   }
 }
 
-function finishLocalError(requestId, startedAt, text) {
-  const elapsedMs = Math.round(performance.now() - startedAt);
-  writeLog(`request=${requestId} route=local-error elapsed_ms=${elapsedMs}`);
-  panel?.webview.postMessage({ type: "error", label: "Fast Lane", text, elapsedMs });
+function recordRouteMetrics(requestId, decision, elapsedMs, handlerFailed = false) {
+  const metrics = routeMetrics.record(decision, elapsedMs, { handlerFailed });
+  writeLog(`request=${requestId} event=route_metric route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"} route_latency_ms=${metrics.routeLatencyMs} local_routes=${metrics.localRouteCount} fallback_routes=${metrics.fallbackCount} handler_failures=${metrics.handlerFailureCount}`);
 }
 
 function activeWorkspacePath() {
@@ -154,32 +155,23 @@ function activeWorkspacePath() {
   return folder?.uri?.fsPath;
 }
 
-function normalizePrompt(prompt) {
-  return prompt.toLocaleLowerCase().trim().replace(/[?!.\s]+$/u, "").replace(/\s+/gu, " ");
-}
+function runGitCommand(args, cwd) {
+  if (!cwd) {
+    const error = new Error("No workspace is open.");
+    error.code = "WORKSPACE_NOT_FOUND";
+    return Promise.reject(error);
+  }
 
-function runCurrentGitBranch(cwd, callback) {
-  execFile("git", ["branch", "--show-current"], {
-    cwd,
-    timeout: 3_000,
-    encoding: "utf8",
-    maxBuffer: 4_096,
-  }, (error, stdout, stderr) => {
-    if (error) {
-      const diagnostic = (stderr || "").trim();
-      if (error.code === "ENOENT") {
-        callback(new Error("Git is not available on PATH."));
-      } else if (error.code === 128 && /not a git repository/iu.test(diagnostic)) {
-        callback(new Error("The active workspace is not inside a Git repository."));
-      } else if (error.killed) {
-        callback(new Error("The Git branch check timed out."));
-      } else {
-        callback(new Error(diagnostic || `Git exited with code ${error.code ?? "unknown"}.`));
-      }
-      return;
-    }
-
-    callback(null, stdout.trim());
+  return new Promise((resolve, reject) => {
+    execFile("git", args, {
+      cwd,
+      timeout: 5_000,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(stdout);
+    });
   });
 }
 
@@ -210,7 +202,7 @@ class AppServerClient {
     this.child.stdout.on("data", (chunk) => this.handleStdout(chunk));
     this.child.stderr.on("data", (chunk) => {
       const text = String(chunk).trim();
-      if (text) this.log(`app-server stderr: ${text}`);
+      if (text) this.log(`app-server stderr received chars=${text.length}`);
     });
     this.child.on("error", (error) => this.handleExit(error));
     this.child.on("close", (code, signal) => {
@@ -359,7 +351,7 @@ class AppServerClient {
       try {
         message = JSON.parse(line);
       } catch {
-        this.log(`app-server emitted non-JSON stdout: ${line.slice(0, 300)}`);
+        this.log(`app-server emitted non-JSON stdout chars=${line.length}`);
         continue;
       }
 
@@ -591,7 +583,8 @@ function getHtml(webview) {
       if (message.type === 'status') status.textContent = message.text;
       if (message.type === 'user-message') return;
       if (message.type === 'local-answer') {
-        addMessage('assistant', 'Fast Lane local · no Codex turn · ' + message.elapsedMs + ' ms', message.text);
+        const state = message.result?.status || 'confirmed';
+        addMessage('assistant', 'Fast Lane local · ' + state + ' · no Codex turn · ' + message.elapsedMs + ' ms', message.text);
         setBusy(false);
       }
       if (message.type === 'error') {

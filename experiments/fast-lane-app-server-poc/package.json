@@ -14,6 +14,9 @@
     "onCommand:fastLane.openPanel"
   ],
   "main": "./extension.js",
+  "scripts": {
+    "test": "node ./test/run-tests.js"
+  },
   "contributes": {
     "commands": [
       {
