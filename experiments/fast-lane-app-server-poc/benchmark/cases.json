@@ -1,0 +1,122 @@
+[
+  {
+    "id": "git_branch",
+    "category": "simple_git",
+    "prompt": "What Git branch am I on?",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "oracle": "current_git_branch"
+  },
+  {
+    "id": "git_worktree_clean",
+    "category": "simple_git",
+    "prompt": "Is my working tree clean?",
+    "expectedRoute": "local",
+    "expectedIntent": "working_tree_status",
+    "oracle": "working_tree_status"
+  },
+  {
+    "id": "git_upstream",
+    "category": "simple_git",
+    "prompt": "What upstream does this branch track?",
+    "expectedRoute": "local",
+    "expectedIntent": "branch_upstream",
+    "oracle": "branch_upstream"
+  },
+  {
+    "id": "git_ahead_count",
+    "category": "simple_git",
+    "prompt": "How many commits am I ahead of upstream?",
+    "expectedRoute": "local",
+    "expectedIntent": "ahead_of_upstream",
+    "oracle": "ahead_of_upstream"
+  },
+  {
+    "id": "test_last_run",
+    "category": "test_state",
+    "prompt": "Did the last test run pass?",
+    "expectedRoute": "local",
+    "expectedIntent": "most_recent_test_result",
+    "oracle": "most_recent_test_result"
+  },
+  {
+    "id": "branch_supported_paraphrase",
+    "category": "paraphrase",
+    "prompt": "Which branch is checked out?",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "oracle": "current_git_branch"
+  },
+  {
+    "id": "branch_novel_paraphrase",
+    "category": "paraphrase",
+    "prompt": "Tell me the name of the checked-out branch.",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "oracle": "current_git_branch"
+  },
+  {
+    "id": "status_novel_paraphrase",
+    "category": "paraphrase",
+    "prompt": "Have I made any local edits?",
+    "expectedRoute": "local",
+    "expectedIntent": "working_tree_status",
+    "oracle": "working_tree_status"
+  },
+  {
+    "id": "test_novel_paraphrase",
+    "category": "paraphrase",
+    "prompt": "Were the latest test results successful?",
+    "expectedRoute": "local",
+    "expectedIntent": "most_recent_test_result",
+    "oracle": "most_recent_test_result"
+  },
+  {
+    "id": "workspace_root",
+    "category": "workspace_fact",
+    "prompt": "What is the project root directory?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "workspace_root"
+  },
+  {
+    "id": "workspace_files",
+    "category": "workspace_fact",
+    "prompt": "What files are in the project root?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "workspace_files"
+  },
+  {
+    "id": "ambiguous_pushed",
+    "category": "ambiguous",
+    "prompt": "Is this branch pushed?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "ambiguous_push_state"
+  },
+  {
+    "id": "ambiguous_tests_green",
+    "category": "ambiguous",
+    "prompt": "Are all tests green?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "ambiguous_test_state"
+  },
+  {
+    "id": "complex_build_website",
+    "category": "complex_coding",
+    "prompt": "Build a website.",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "complex_task_response"
+  },
+  {
+    "id": "complex_retry_feature",
+    "category": "complex_coding",
+    "prompt": "Implement retry with exponential backoff for API calls in this project.",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "complex_task_response"
+  }
+]
