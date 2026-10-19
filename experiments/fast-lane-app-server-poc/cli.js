@@ -112,7 +112,7 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
       onThreadId: async (threadId) => {
         session = store.update(session.sessionId, { threadId });
       },
-      onApproval: (method, params) => terminal.requestApproval(method, params),
+      onApproval: (method, params, context) => terminal.requestApproval(method, params, context),
       ...(dependencies.clientOptions || {}),
     });
 

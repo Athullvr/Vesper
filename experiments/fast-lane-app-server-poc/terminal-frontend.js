@@ -2,6 +2,7 @@
 
 const readline = require("node:readline");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
+const { createFileChangeSnapshot } = require("./file-change-approval");
 
 const QUIT_COMMANDS = new Set([":quit", ":exit", "/quit", "/exit"]);
 
@@ -109,8 +110,8 @@ class TerminalFrontend {
     }
   }
 
-  requestApproval(method, params = {}) {
-    const pending = this.approvalQueue.then(() => this.promptForApproval(method, params));
+  requestApproval(method, params = {}, context) {
+    const pending = this.approvalQueue.then(() => this.promptForApproval(method, params, context));
     this.approvalQueue = pending.catch(() => undefined);
     this.pendingApprovals.add(pending);
     pending.then(
@@ -120,8 +121,17 @@ class TerminalFrontend {
     return pending;
   }
 
-  async promptForApproval(method, params = {}) {
-    const details = approvalDetails(method, params);
+  async promptForApproval(method, params = {}, context) {
+    const fileApproval = method === "item/fileChange/requestApproval";
+    const snapshot = fileApproval && context?.fileChange ? createFileChangeSnapshot(context.fileChange) : null;
+    const currentFileReview = () => snapshot && context?.signal && !context.signal.aborted &&
+      typeof context.isCurrent === "function" && context.isCurrent() &&
+      snapshot.threadId === params.threadId && snapshot.turnId === params.turnId && snapshot.itemId === params.itemId;
+    if (method === "applyPatchApproval" || (fileApproval && (!currentFileReview() || params.grantRoot != null))) {
+      this.write("[Vesper] File-change approval declined: complete changes with an exact current thread/turn/item identity and one-time scope are required.\n");
+      return refusedApproval(method);
+    }
+    const details = approvalDetails(method, params, snapshot);
     this.write(`\n\n[Codex approval required · ${details.title}]\n`);
     if (details.body) this.write(`${details.body}\n`);
 
@@ -135,7 +145,12 @@ class TerminalFrontend {
       return refusedApproval(method);
     }
 
-    const answer = await this.lineIO.question("Type yes to approve once, cancel to cancel, or anything else to decline: ");
+    const answer = await this.lineIO.question("Type yes to approve once, cancel to cancel, or anything else to decline: ",
+      fileApproval ? { signal: context.signal } : undefined);
+    if (fileApproval && !currentFileReview()) {
+      this.write("[Vesper] File-change review expired or changed; approval declined.\n");
+      return refusedApproval(method);
+    }
     const choice = String(answer || "").trim().toLowerCase();
     const approved = choice === "yes";
     const cancelled = choice === "cancel";
@@ -165,6 +180,7 @@ class TerminalFrontend {
       case "turn_started": this.write("[Codex] Working…\n"); break;
       case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
       case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
+      case "file_approval_declined": this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.reason)}\n`); break;
       default: break;
     }
   }
@@ -206,16 +222,21 @@ function createLineIO(input, output) {
   });
 
   return {
-    question(prompt) {
-      if (closed) return Promise.resolve(null);
+    question(prompt, { signal } = {}) {
+      if (closed || signal?.aborted) return Promise.resolve(null);
       return new Promise((resolve, reject) => {
-        pendingResolve = resolve;
+        const finish = (answer) => {
+          signal?.removeEventListener("abort", abort);
+          if (pendingResolve === finish) pendingResolve = undefined;
+          resolve(answer);
+        };
+        const abort = () => finish(null);
+        pendingResolve = finish;
+        signal?.addEventListener("abort", abort, { once: true });
         try {
-          rl.question(prompt, (answer) => {
-            if (pendingResolve === resolve) pendingResolve = undefined;
-            resolve(answer);
-          });
+          rl.question(prompt, { signal }, finish);
         } catch (error) {
+          signal?.removeEventListener("abort", abort);
           pendingResolve = undefined;
           reject(error);
         }
@@ -231,7 +252,7 @@ function createLineIO(input, output) {
   };
 }
 
-function approvalDetails(method, params) {
+function approvalDetails(method, params, fileChange) {
   const lines = [];
   let truncated = false;
   const add = (label, value, json = false) => {
@@ -258,8 +279,21 @@ function approvalDetails(method, params) {
     add("Proposed future network rules", params.proposedNetworkPolicyAmendments, true);
   } else if (method === "item/fileChange/requestApproval") {
     title = "file changes";
-    add("Requested write root", params.grantRoot);
+    add("Thread / turn / item", [params.threadId, params.turnId, params.itemId], true);
     add("Reason", params.reason);
+    for (const change of fileChange?.changes || []) {
+      add("File", change.path, true);
+      add("Change", change.kind, true);
+      // Prefix content lines and escape controls visibly so patch text cannot
+      // imitate a terminal prompt or hide characters in the proposed content.
+      const diff = change.diff.replace(/\\/gu, "\\\\")
+        .replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/gu, (character) => {
+          if (character === "\n") return "\n";
+          const code = character.codePointAt(0);
+          return code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, "0")}`;
+        });
+      add("Diff (server snapshot)", diff.split("\n").map((line) => `| ${line}`).join("\n"));
+    }
   } else if (method === "item/permissions/requestApproval") {
     title = "additional permissions for this turn";
     add("Reason", params.reason);

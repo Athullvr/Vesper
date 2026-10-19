@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { parseArgs, resolveProjectDirectory, runVesper } = require("../cli");
 const { SessionStore } = require("../session-store");
+const { FileChangeApprovalStore } = require("../file-change-approval");
 
 class FakeLineIO {
   constructor(answers) { this.answers = [...answers]; this.closed = false; }
@@ -172,4 +173,42 @@ test("project path is canonicalized and must be a directory", (t) => {
   const root = fixture(t);
   assert.equal(resolveProjectDirectory(root), fs.realpathSync(root));
   assert.throws(() => resolveProjectDirectory(path.join(root, "missing")), /does not exist/u);
+});
+
+test("resumed CLI forwards file-review context while preserving session metadata and project", async (t) => {
+  const root = fixture(t);
+  const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
+  const saved = store.create(root);
+  const before = store.update(saved.sessionId, { threadId: "saved-codex-thread" });
+  const output = capture();
+  const errors = capture();
+  let approval;
+  const status = await runVesper(["--resume", saved.sessionId], {
+    store, output: output.stream, errorOutput: errors.stream,
+    lineIO: new FakeLineIO(["Edit a file", "yes", ":quit"]),
+    clientFactory: (options) => {
+      assert.equal(options.initialThreadId, before.threadId);
+      const client = new EventEmitter();
+      client.runTurn = async ({ cwd }) => {
+        assert.equal(cwd, root);
+        const params = { threadId: before.threadId, turnId: "resumed-turn", itemId: "patch-1", startedAtMs: 1 };
+        const changes = new FileChangeApprovalStore(params.threadId);
+        changes.record("item/fileChange/patchUpdated", {
+          ...params, changes: [{ path: path.join(root, "example.txt"), kind: { type: "update" }, diff: "@@ -1 +1 @@\n-before\n+after" }],
+        }, params.turnId);
+        approval = await options.onApproval("item/fileChange/requestApproval", params, changes.capture(params));
+        changes.close();
+        return { status: "completed" };
+      };
+      client.dispose = () => {};
+      return client;
+    },
+  });
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.deepEqual(approval, { decision: "accept" });
+  assert.match(output.text(), /\| -before\n\| \+after/u);
+  assert.deepEqual(store.load(saved.sessionId), before);
+  assert.equal(fs.readdirSync(store.directory).filter((file) => file.endsWith(".json")).length, 1);
+  assert.equal(fs.existsSync(path.join(root, "example.txt")), false, "the mock approval never performs a real file operation");
 });

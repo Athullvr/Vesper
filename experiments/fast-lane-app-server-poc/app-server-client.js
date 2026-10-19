@@ -3,6 +3,7 @@
 const { spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const path = require("node:path");
+const { FileChangeApprovalStore } = require("./file-change-approval");
 
 const RPC_TIMEOUT_MS = 20_000;
 const TURN_TIMEOUT_MS = 5 * 60_000;
@@ -129,6 +130,8 @@ class AppServerClient extends EventEmitter {
         throw new Error("Codex app-server did not return a turn id.");
       }
       active.turnId = turn.id;
+      active.startAcknowledged = true;
+      active.resolveStart();
       if (active.interruptRequested) await this.sendInterrupt(active);
 
       if (isTerminalStatus(turn.status) && !active.settled) {
@@ -155,6 +158,7 @@ class AppServerClient extends EventEmitter {
       return false;
     }
     active.interruptRequested = true;
+    active.fileChanges.close();
     this.emit("progress", { type: "interrupt_requested" });
     if (active.turnId) await this.sendInterrupt(active);
     return true;
@@ -192,6 +196,8 @@ class AppServerClient extends EventEmitter {
   }
 
   createActiveTurn(onDelta) {
+    let resolveStart;
+    const startReady = new Promise((resolve) => { resolveStart = resolve; });
     let resolveCompletion;
     let rejectCompletion;
     const completion = new Promise((resolve, reject) => {
@@ -205,6 +211,10 @@ class AppServerClient extends EventEmitter {
     const active = {
       threadId: this.threadId,
       turnId: null,
+      startAcknowledged: false,
+      startReady,
+      resolveStart,
+      fileChanges: new FileChangeApprovalStore(this.threadId),
       onDelta,
       completion,
       resolveCompletion,
@@ -224,6 +234,7 @@ class AppServerClient extends EventEmitter {
     if (this.activeTurn !== active || active.settled) return;
     active.timedOut = true;
     active.interruptRequested = true;
+    active.fileChanges.close();
     this.emit("progress", { type: "turn_timed_out" });
     if (active.turnId) void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error));
     active.interruptTimer = setTimeout(() => {
@@ -339,6 +350,11 @@ class AppServerClient extends EventEmitter {
     const respond = (response) => {
       if (this.child === child && child) this.write(response);
     };
+    const declineFileChange = (reason) => {
+      if (this.child !== child || !child) return;
+      respond({ id, result: defaultApproval(method) });
+      if (this.activeTurn === active) this.emit("progress", { type: "file_approval_declined", reason });
+    };
     try {
       if (!isApprovalMethod(method)) {
         respond({ id, error: { code: -32601, message: `Vesper does not support app-server request ${method}.` } });
@@ -346,14 +362,44 @@ class AppServerClient extends EventEmitter {
         return;
       }
 
+      if (method === "applyPatchApproval") {
+        // This legacy request has conversationId/callId but no turn identity.
+        declineFileChange("Legacy patch requests cannot be matched to an exact turn. Use the current file-change protocol.");
+        return;
+      }
+      const fileApproval = method === "item/fileChange/requestApproval";
+      // Bind the evidence at receipt, before any wait/queued UI. A patch that
+      // arrives later must not silently become the subject of this request.
+      const context = fileApproval && active && params?.grantRoot == null
+        ? active.fileChanges.capture(params)
+        : undefined;
+      if (fileApproval && active) await active.startReady;
       if (!isCurrentApproval(active, method, params, this.activeTurn)) {
+        if (fileApproval) {
+          declineFileChange("The file-change request does not belong to the active turn.");
+          return;
+        }
         respond({ id, result: validateApprovalResult(method, defaultApproval(method)) });
         return;
       }
 
+      if (fileApproval) {
+        if (!active.startAcknowledged || params.grantRoot != null) {
+          declineFileChange("A session write-root grant cannot be approved through the one-time file-change flow.");
+          return;
+        }
+        if (!context?.isCurrent()) {
+          declineFileChange("No complete, current, reviewable diff matches this file-change item.");
+          return;
+        }
+      }
       this.emit("progress", { type: "approval_requested", method });
-      const result = await this.onApproval(method, params);
-      if (!isCurrentApproval(active, method, params, this.activeTurn)) {
+      const result = await this.onApproval(method, params, context);
+      if (!isCurrentApproval(active, method, params, this.activeTurn) || (context && !context.isCurrent())) {
+        if (fileApproval) {
+          declineFileChange("The file-change snapshot or active request changed during review.");
+          return;
+        }
         respond({ id, result: validateApprovalResult(method, defaultApproval(method)) });
         return;
       }
@@ -372,6 +418,9 @@ class AppServerClient extends EventEmitter {
   handleNotification(method, params) {
     const active = this.activeTurn;
     if (!active) return;
+    // Retain early item snapshots, but approval waits for the authoritative
+    // turn/start response. Every cache key includes all three protocol IDs.
+    active.fileChanges.record(method, params, active.startAcknowledged ? active.turnId : null);
     if (params.threadId && params.threadId !== active.threadId) return;
     const eventTurnId = params.turnId || params.turn?.id;
     if (eventTurnId && active.turnId && eventTurnId !== active.turnId) return;
@@ -429,6 +478,8 @@ class AppServerClient extends EventEmitter {
   finish(active, value, error) {
     if (active.settled) return;
     active.settled = true;
+    active.fileChanges.close();
+    active.resolveStart();
     clearTimeout(active.turnTimer);
     clearTimeout(active.interruptTimer);
     if (this.activeTurn === active) this.activeTurn = undefined;

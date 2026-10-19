@@ -366,6 +366,13 @@ test("terminal approval choices reach the app-server and its outcome controls co
         let response;
         const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
           startRequest = request;
+          if (method === "item/fileChange/requestApproval") {
+            current.send({ method: "item/started", params: {
+              threadId: "thread-1", turnId: "turn-1", startedAtMs: 1,
+              item: { type: "fileChange", id: "item-1", status: "inProgress",
+                changes: [{ path: "/workspace/example.txt", kind: { type: "update" }, diff: "@@ -1 +1 @@\n-old\n+new\n" }] },
+            } });
+          }
           current.requestFromServer("approval-1", method, {
             threadId: "thread-1", turnId: "turn-1", itemId: "item-1", startedAtMs: 1,
             command: "git status", cwd: "/workspace", reason: "Fixture operation",
@@ -383,14 +390,21 @@ test("terminal approval choices reach the app-server and its outcome controls co
             accepted ? "Operation completed." : "Operation declined; no operation performed.");
         };
         let frontend;
-        const { client } = createClient(server, { onApproval: (name, params) => frontend.requestApproval(name, params) });
+        const { client } = createClient(server, { onApproval: (name, params, context) => frontend.requestApproval(name, params, context) });
         t.after(() => client.dispose());
         const answers = ["Inspect this repository", answer, ":quit"];
         let text = "";
         frontend = new TerminalFrontend({
           cwd: "/workspace", handlers: {}, appServer: client,
           output: { write: (chunk) => { text += chunk; } },
-          lineIO: { question: async () => answers.shift(), close() {}, onInterrupt() {} },
+          lineIO: { question: async () => {
+            const answer = answers.shift();
+            if (method === "item/fileChange/requestApproval" && ["yes", "no", "cancel"].includes(answer)) {
+              assert.match(text, /Diff \(server snapshot\):/u, "the diff must be printed before asking");
+              assert.equal(operations, 0);
+            }
+            return answer;
+          }, close() {}, onInterrupt() {} },
         });
         await frontend.run();
         assert.equal(operations, answer === "yes" ? 1 : 0);
@@ -401,6 +415,7 @@ test("terminal approval choices reach the app-server and its outcome controls co
         }
         assert.match(text, /Codex approval required/u);
         assert.match(text, /Approval choice:/u);
+        if (method === "item/fileChange/requestApproval") assert.match(text, /Diff \(server snapshot\): \| @@ -1 \+1 @@\n\| -old\n\| \+new/u);
         assert.doesNotMatch(text, /Vesper local/u);
         if (answer === "yes") assert.match(text, /Operation completed/u);
         else assert.match(text, /Operation declined; no operation performed/u);
@@ -471,4 +486,287 @@ test("turn/start timeout closes the transport because server acceptance is unkno
   await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /Timed out waiting.*turn\/start/u);
   assert.equal(server.killed, true);
   assert.equal(client.activeTurn, undefined);
+});
+
+const fileApprovalMethod = "item/fileChange/requestApproval";
+const sampleChanges = () => [{ path: "/workspace/example.txt", kind: { type: "update" }, diff: "@@ -1 +1 @@\n-old\n+new\n" }];
+const nextEvent = () => new Promise((resolve) => setImmediate(resolve));
+
+function fileItem(server, { threadId = "thread-1", turnId = "turn-1", itemId = "file-1", changes = sampleChanges(), status = "inProgress", method = "item/started" } = {}) {
+  server.send({ method, params: { threadId, turnId, startedAtMs: 1, completedAtMs: 2,
+    item: { type: "fileChange", id: itemId, status, changes } } });
+}
+
+async function fileRequest(server, id, overrides = {}) {
+  server.requestFromServer(id, fileApprovalMethod, {
+    threadId: "thread-1", turnId: "turn-1", itemId: "file-1", startedAtMs: 1, ...overrides,
+  });
+  await nextEvent();
+  return server.requests.find((message) => message.id === id && !message.method)?.result;
+}
+
+async function openFileTurn(t, options = {}) {
+  let start;
+  const server = new FakeAppServerProcess({ onTurnStart: (request) => { start = request; } });
+  const calls = [];
+  const { client } = createClient(server, {
+    ...options,
+    onApproval: async (method, params, context) => {
+      calls.push({ method, params, context });
+      return options.onApproval ? options.onApproval(method, params, context) : { decision: "accept" };
+    },
+  });
+  t.after(() => client.dispose());
+  const turn = client.runTurn({ prompt: "Update a file", cwd: "/workspace" });
+  turn.catch(() => {}); // Cleanup can reject a still-pending fixture turn.
+  await nextEvent();
+  return { server, client, calls, turn, finish: async () => {
+    server.completeTurn(start, "completed");
+    return turn;
+  } };
+}
+
+test("file approvals retain immutable item-specific snapshots and replacement patches", async (t) => {
+  const { server, calls, finish } = await openFileTurn(t);
+  fileItem(server, { itemId: "file-1" });
+  fileItem(server, { itemId: "file-2", changes: [{ path: "/workspace/second.txt", kind: { type: "add" }, diff: "+second\n" }] });
+  server.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "file-1",
+    changes: [{ path: "/workspace/example.txt", kind: { type: "update", move_path: "/workspace/moved.txt" }, diff: "@@ -1 +1 @@\n-old\n+revised\n" }],
+  } });
+  assert.deepEqual(await fileRequest(server, "approve-2", { itemId: "file-2" }), { decision: "accept" });
+  assert.deepEqual(await fileRequest(server, "approve-1"), { decision: "accept" });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].context.fileChange.itemId, "file-2");
+  const snapshot = calls[1].context.fileChange;
+  assert.deepEqual([snapshot.threadId, snapshot.turnId, snapshot.itemId], ["thread-1", "turn-1", "file-1"]);
+  assert.equal(snapshot.changes[0].kind.move_path, "/workspace/moved.txt");
+  assert.match(snapshot.changes[0].diff, /\+revised/u);
+  assert.throws(() => { snapshot.changes[0].diff = "altered"; }, TypeError);
+  assert.throws(() => { snapshot.changes[0].kind.move_path = "altered"; }, TypeError);
+  assert.equal(Object.isFrozen(snapshot.changes), true);
+  assert.deepEqual(await fileRequest(server, "replay"), { decision: "decline" });
+  await finish();
+  assert.equal(calls[1].context.signal.aborted, true);
+});
+
+test("missing, malformed and oversized file snapshots decline without invoking an approval UI", async (t) => {
+  const { server, calls, finish } = await openFileTurn(t);
+  assert.deepEqual(await fileRequest(server, "missing"), { decision: "decline" });
+  const invalid = [
+    null, [], {}, [null], [{ ...sampleChanges()[0], diff: 5 }],
+    [{ ...sampleChanges()[0], diff: "" }], [{ ...sampleChanges()[0], diff: " \n" }],
+    [{ ...sampleChanges()[0], diff: "x".repeat(8_001) }],
+    [{ ...sampleChanges()[0], path: "" }], [{ ...sampleChanges()[0], path: "bad\npath" }],
+    [{ ...sampleChanges()[0], path: "/workspace/hidden\u202epath" }],
+    [{ ...sampleChanges()[0], kind: { type: "unknown" } }],
+    [{ ...sampleChanges()[0], kind: { type: "update", move_path: 42 } }],
+    [{ ...sampleChanges()[0], binary: true }],
+    [sampleChanges()[0], sampleChanges()[0]],
+    Array.from({ length: 4 }, (_, i) => ({ path: `/workspace/file-${i}`, kind: { type: "add" }, diff: "x".repeat(6_000) })),
+  ];
+  for (const [index, changes] of invalid.entries()) {
+    const itemId = `bad-${index}`;
+    fileItem(server, { itemId, changes });
+    assert.deepEqual(await fileRequest(server, `invalid-${index}`, { itemId }), { decision: "decline" }, `case ${index}`);
+  }
+  assert.equal(calls.length, 0);
+  // A later independent item in the same turn can still be reviewed.
+  fileItem(server, { itemId: "good" });
+  assert.deepEqual(await fileRequest(server, "recovered", { itemId: "good" }), { decision: "accept" });
+  assert.equal(calls.length, 1);
+  await finish();
+});
+
+test("file approval identity never falls back to another thread, turn or item", async (t) => {
+  const { server, calls, finish } = await openFileTurn(t);
+  fileItem(server);
+  for (const [index, params] of [
+    { threadId: "other-thread" }, { turnId: "other-turn" }, { itemId: "other-item" },
+    { threadId: "" }, { turnId: null }, { itemId: "" },
+  ].entries()) {
+    assert.deepEqual(await fileRequest(server, `mismatch-${index}`, params), { decision: "decline" });
+  }
+  // Well-scoped foreign updates must not replace the valid current snapshot.
+  fileItem(server, { threadId: "other-thread", changes: [{ ...sampleChanges()[0], diff: "+foreign thread" }] });
+  server.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "previous-turn", itemId: "file-1", changes: [{ ...sampleChanges()[0], diff: "+stale turn" }],
+  } });
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await fileRequest(server, "current"), { decision: "accept" });
+  assert.equal(calls[0].context.fileChange.changes[0].diff, sampleChanges()[0].diff);
+  await finish();
+});
+
+test("invalid updates and completed items cannot reuse an earlier valid file diff", async (t) => {
+  const { server, calls, finish } = await openFileTurn(t);
+  for (const [index, status] of ["completed", "failed", "declined"].entries()) {
+    const itemId = `ended-${index}`;
+    fileItem(server, { itemId });
+    fileItem(server, { itemId, method: "item/completed", status });
+    server.send({ method: "item/fileChange/patchUpdated", params: {
+      threadId: "thread-1", turnId: "turn-1", itemId, changes: sampleChanges(),
+    } });
+    assert.deepEqual(await fileRequest(server, `ended-request-${index}`, { itemId }), { decision: "decline" });
+  }
+  fileItem(server);
+  server.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "file-1", changes: null,
+  } });
+  assert.deepEqual(await fileRequest(server, "malformed-replacement"), { decision: "decline" });
+  fileItem(server, { itemId: "another" });
+  server.send({ method: "item/fileChange/patchUpdated", params: { itemId: "another", changes: sampleChanges() } });
+  assert.deepEqual(await fileRequest(server, "unscoped", { itemId: "another" }), { decision: "decline" });
+  assert.equal(calls.length, 0);
+  await finish();
+});
+
+test("file diff changes during review invalidate the answer and duplicate requests cannot approve twice", async (t) => {
+  let answer;
+  const { server, calls, finish } = await openFileTurn(t, {
+    onApproval: () => new Promise((resolve) => { answer = resolve; }),
+  });
+  fileItem(server);
+  assert.equal(await fileRequest(server, "pending"), undefined);
+  assert.deepEqual(await fileRequest(server, "duplicate"), { decision: "decline" });
+  const context = calls[0].context;
+  server.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "file-1",
+    changes: [{ ...sampleChanges()[0], diff: "+changed while reviewing" }],
+  } });
+  assert.equal(context.signal.aborted, true);
+  assert.equal(context.isCurrent(), false);
+  answer({ decision: "accept" });
+  await nextEvent();
+  assert.deepEqual(server.requests.find((message) => message.id === "pending").result, { decision: "decline" });
+  assert.deepEqual(await fileRequest(server, "reused-item"), { decision: "decline" });
+  assert.equal(calls.length, 1);
+  await finish();
+});
+
+test("file approvals wait for the authoritative start reply and ignore pre-ack stale identities", async (t) => {
+  const server = new FakeAppServerProcess();
+  const receive = server.receive.bind(server);
+  let start;
+  server.receive = (message) => {
+    if (message.method === "turn/start") { start = message; server.requests.push(message); }
+    else receive(message);
+  };
+  let approvals = 0;
+  const { client } = createClient(server, { onApproval: async (_method, _params, context) => {
+    approvals += 1;
+    assert.equal(context.fileChange.turnId, "authoritative-turn");
+    return { decision: "accept" };
+  } });
+  t.after(() => client.dispose());
+  const turn = client.runTurn({ prompt: "Edit a file", cwd: "/workspace" });
+  await nextEvent();
+  server.send({ method: "turn/started", params: { threadId: "thread-1", turn: { id: "stale-turn", status: "inProgress" } } });
+  fileItem(server, { turnId: "stale-turn" });
+  fileItem(server, { turnId: "authoritative-turn" });
+  assert.equal(await fileRequest(server, "early", { turnId: "authoritative-turn" }), undefined);
+  assert.equal(await fileRequest(server, "old", { turnId: "stale-turn" }), undefined);
+  assert.equal(approvals, 0);
+  server.respond(start.id, { turn: { id: "authoritative-turn", status: "inProgress", items: [] } });
+  await nextEvent();
+  assert.equal(approvals, 1);
+  assert.deepEqual(server.requests.find((message) => message.id === "early").result, { decision: "accept" });
+  assert.deepEqual(server.requests.find((message) => message.id === "old").result, { decision: "decline" });
+  server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "authoritative-turn", status: "completed" } } });
+  assert.deepEqual(await turn, { status: "completed" });
+});
+
+test("the file snapshot is bound at approval receipt, not after waiting for the start reply", async (t) => {
+  for (const initiallyMissing of [false, true]) {
+    const server = new FakeAppServerProcess();
+    const receive = server.receive.bind(server);
+    let start;
+    server.receive = (message) => {
+      if (message.method === "turn/start") { start = message; server.requests.push(message); }
+      else receive(message);
+    };
+    let approvals = 0;
+    const { client } = createClient(server, { onApproval: async () => { approvals += 1; return { decision: "accept" }; } });
+    t.after(() => client.dispose());
+    const turn = client.runTurn({ prompt: "Edit", cwd: "/workspace" });
+    turn.catch(() => {});
+    await nextEvent();
+    if (!initiallyMissing) fileItem(server);
+    assert.equal(await fileRequest(server, "pending-start"), undefined);
+    fileItem(server, { changes: [{ ...sampleChanges()[0], diff: "+arrived after the approval request" }] });
+    server.respond(start.id, { turn: { id: "turn-1", status: "inProgress", items: [] } });
+    await nextEvent();
+    assert.equal(approvals, 0, "a later snapshot cannot authorize an earlier request");
+    assert.deepEqual(server.requests.find((message) => message.id === "pending-start").result, { decision: "decline" });
+    server.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "completed" } } });
+    await turn;
+  }
+});
+
+test("file snapshots and pending answers cannot survive disconnect and same-thread resumption", async (t) => {
+  const first = new FakeAppServerProcess({ onTurnStart() {} });
+  const second = new FakeAppServerProcess({ onTurnStart() {} });
+  let spawns = 0;
+  let answer;
+  const contexts = [];
+  const progress = [];
+  const client = new AppServerClient({
+    initialThreadId: "saved-thread",
+    spawnProcess: () => ++spawns === 1 ? first : second,
+    onApproval: async (_method, _params, context) => {
+      contexts.push(context);
+      if (contexts.length === 1) return new Promise((resolve) => { answer = resolve; });
+      return { decision: "accept" };
+    },
+  });
+  client.on("progress", (event) => progress.push(event));
+  t.after(() => client.dispose());
+  const failed = assert.rejects(client.runTurn({ prompt: "Edit", cwd: "/workspace" }), /exited/u);
+  await nextEvent();
+  fileItem(first, { threadId: "saved-thread" });
+  await fileRequest(first, "old-request", { threadId: "saved-thread" });
+  first.emit("close", 1, null);
+  await failed;
+  assert.equal(contexts[0].signal.aborted, true);
+  const recovered = client.runTurn({ prompt: "Try again", cwd: "/workspace" });
+  await nextEvent();
+  // Identical wire IDs from the old process must not populate the new cache.
+  fileItem(first, { threadId: "saved-thread" });
+  first.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "saved-thread", turnId: "turn-1", itemId: "file-1", changes: sampleChanges(),
+  } });
+  answer({ decision: "accept" });
+  await nextEvent();
+  assert.equal(progress.some((event) => event.type === "file_approval_declined"), false, "old approval must not emit into a recovered turn");
+  assert.deepEqual(await fileRequest(second, "missing-after-resume", { threadId: "saved-thread" }), { decision: "decline" });
+  assert.equal(second.requests.some((message) => message.id === "old-request"), false);
+  assert.equal(second.requests.some((message) => message.method === "thread/start"), false);
+  assert.equal(second.requests.find((message) => message.method === "thread/resume").params.threadId, "saved-thread");
+  fileItem(second, { threadId: "saved-thread" });
+  assert.deepEqual(await fileRequest(second, "fresh-after-resume", { threadId: "saved-thread" }), { decision: "accept" });
+  second.send({ method: "turn/completed", params: { threadId: "saved-thread", turn: { id: "turn-1", status: "completed" } } });
+  assert.deepEqual(await recovered, { status: "completed" });
+});
+
+test("session write-root requests and legacy patch requests cannot bypass exact one-time file review", async (t) => {
+  const { server, calls, finish } = await openFileTurn(t);
+  fileItem(server);
+  assert.deepEqual(await fileRequest(server, "root-grant", { grantRoot: "/workspace" }), { decision: "decline" });
+  server.requestFromServer("legacy-patch", "applyPatchApproval", {
+    conversationId: "thread-1", callId: "file-1",
+    fileChanges: { "/workspace/example.txt": { type: "update", unified_diff: sampleChanges()[0].diff } },
+  });
+  await nextEvent();
+  assert.ok(server.requests.find((message) => message.id === "legacy-patch").result.decision.denied);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await fileRequest(server, "ordinary"), { decision: "accept" });
+  await finish();
+});
+
+test("file snapshot storage has a per-turn bound and fails closed on overflow", async (t) => {
+  const { server, calls, finish } = await openFileTurn(t);
+  for (let index = 0; index < 65; index += 1) fileItem(server, { itemId: `file-${index}` });
+  assert.deepEqual(await fileRequest(server, "overflow"), { decision: "decline" });
+  assert.equal(calls.length, 0);
+  await finish();
 });

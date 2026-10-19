@@ -9,6 +9,7 @@ const TEST_RESULT_RECORDER = "vesper-fast-lane-routing-tests";
 const SOURCE_FILES = Object.freeze([
   "package.json",
   "app-server-client.js",
+  "file-change-approval.js",
   "cli.js",
   "extension.js",
   "routing-core.js",
