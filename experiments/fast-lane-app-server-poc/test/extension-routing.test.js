@@ -8,6 +8,7 @@ const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const Module = require("node:module");
 const childProcess = require("node:child_process");
+const vm = require("node:vm");
 const { SessionStore } = require("../session-store");
 
 test("VS Code keeps local routing local and persists only the Vesper session and Codex thread identifiers", async (t) => {
@@ -61,8 +62,15 @@ test("panel reopen and extension restart restore the same persisted Vesper sessi
   harness.restartExtension();
   panel = harness.openPanel();
   await panel.send({ type: "ready" });
-  assert.equal(panel.last("session-state").state, "saved");
-  assert.match(panel.last("session-state").text, /verify the same Codex thread/u);
+  assert.equal(panel.last("session-state").state, "connected");
+  assert.deepEqual(panel.all("conversation-history").at(-1).entries.map((entry) => entry.text), [
+    "Inspect this project.",
+    "Answer 1.",
+    "Codex recorded this turn as completed.",
+    "Continue after reopening the panel.",
+    "Answer 2.",
+    "Codex recorded this turn as completed.",
+  ]);
   await panel.send({ type: "submit", text: "Continue after restarting VS Code." });
 
   const resumed = harness.requests.filter((request) => request.method === "thread/resume");
@@ -72,6 +80,173 @@ test("panel reopen and extension restart restore the same persisted Vesper sessi
   assert.equal(harness.requests.filter((request) => request.method === "turn/start").at(-1).params.threadId, original.threadId);
   assert.equal(harness.store().findLatestByCwd(fs.realpathSync(project)).sessionId, original.sessionId);
   assert.equal(panel.last("session-state").text, "Connected · this Vesper session is saved.");
+});
+
+test("panel reopened while the first thread is starting waits for history instead of showing an empty conversation", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-history-thread-starting-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], { holdThreadStarts: 1 });
+  const firstPanel = harness.openPanel();
+  await firstPanel.send({ type: "ready" });
+
+  const submitting = firstPanel.send({ type: "submit", text: "Recover this active conversation." });
+  await waitFor(() => harness.state.pendingThreadStarts.length === 1);
+  firstPanel.close();
+
+  const reopenedPanel = harness.openPanel();
+  await reopenedPanel.send({ type: "ready" });
+  assert.equal(reopenedPanel.last("conversation-history").state, "loading");
+  assert.doesNotMatch(reopenedPanel.all("conversation-history").map((message) => message.text).join(" "), /no saved Vesper conversation exists/u);
+
+  harness.releaseThreadStart();
+  await submitting;
+  await waitFor(() => reopenedPanel.last("conversation-history")?.state === "available");
+  assert.deepEqual(reopenedPanel.last("conversation-history").entries.map((entry) => entry.text), [
+    "Recover this active conversation.",
+    "Answer 1.",
+    "Codex recorded this turn as completed.",
+  ]);
+});
+
+test("history retrieval failure is explicit, does not erase the saved mapping, and leaves a verified thread usable", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-history-unavailable-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], { historyFailures: 1 });
+  const saved = harness.store().create(fs.realpathSync(project));
+  harness.store().update(saved.sessionId, { threadId: "saved-thread" });
+  harness.state.threadCwds.set("saved-thread", fs.realpathSync(project));
+
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const history = panel.last("conversation-history");
+  assert.equal(history.state, "unavailable");
+  assert.match(history.text, /not treated it as empty/u);
+  assert.equal(panel.last("session-state").state, "connected");
+  assert.equal(harness.store().load(saved.sessionId).threadId, "saved-thread");
+
+  await panel.send({ type: "submit", text: "Continue with history unavailable." });
+  assert.equal(harness.requests.filter((request) => request.method === "turn/start").length, 1);
+  assert.equal(harness.store().load(saved.sessionId).threadId, "saved-thread");
+});
+
+test("valid empty history is shown as empty rather than unavailable", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-history-empty-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }]);
+  const saved = harness.store().create(fs.realpathSync(project));
+  harness.store().update(saved.sessionId, { threadId: "saved-thread" });
+  harness.state.threadCwds.set("saved-thread", fs.realpathSync(project));
+
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  assert.equal(panel.last("conversation-history").state, "empty");
+  assert.match(panel.last("conversation-history").text, /no conversation turns yet/u);
+});
+
+test("stale history from a previous project cannot replace the newly selected project history", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-stale-history-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const a = path.join(root, "a");
+  const b = path.join(root, "b");
+  fs.mkdirSync(a);
+  fs.mkdirSync(b);
+  const projectA = { name: "Project A", uri: { fsPath: a } };
+  const projectB = { name: "Project B", uri: { fsPath: b } };
+  const harness = createHarness(t, [projectA, projectB], { holdHistoryResponses: 1 });
+  const aSession = harness.store().create(fs.realpathSync(a));
+  harness.store().update(aSession.sessionId, { threadId: "thread-a" });
+  const bSession = harness.store().create(fs.realpathSync(b));
+  harness.store().update(bSession.sessionId, { threadId: "thread-b" });
+  harness.state.threadCwds.set("thread-a", fs.realpathSync(a));
+  harness.state.threadCwds.set("thread-b", fs.realpathSync(b));
+  harness.state.historyByThread.set("thread-a", [storedTurn("turn-a", "Old project history")]);
+  harness.state.historyByThread.set("thread-b", [storedTurn("turn-b", "New project history")]);
+
+  const panel = harness.openPanel();
+  const ready = panel.send({ type: "ready" });
+  await waitFor(() => harness.state.pendingHistoryResponses.length === 1);
+  harness.pick(projectB);
+  await panel.send({ type: "select-project" });
+  assert.equal(panel.last("conversation-history").entries[0].text, "New project history");
+
+  harness.releaseHistoryResponse(0);
+  await ready;
+  assert.equal(panel.last("conversation-history").entries[0].text, "New project history");
+  assert.equal(panel.all("conversation-history").some((message) => message.entries?.some((entry) => entry.text === "Old project history")), false);
+});
+
+test("stale history from a replaced session cannot repopulate a new conversation", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-history-session-switch-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], { holdHistoryResponses: 1 });
+  const oldSession = harness.store().create(fs.realpathSync(project));
+  harness.store().update(oldSession.sessionId, { threadId: "thread-old" });
+  harness.state.threadCwds.set("thread-old", fs.realpathSync(project));
+  harness.state.historyByThread.set("thread-old", [storedTurn("turn-old", "Old session transcript")]);
+
+  const panel = harness.openPanel();
+  const ready = panel.send({ type: "ready" });
+  await waitFor(() => harness.state.pendingHistoryResponses.length === 1);
+  await panel.send({ type: "start-new-session" });
+  await ready;
+  assert.equal(panel.last("conversation-history").state, "empty");
+
+  harness.releaseHistoryResponse();
+  assert.equal(panel.last("conversation-history").state, "empty");
+  assert.equal(panel.all("conversation-history").some((message) => message.entries?.some((entry) => entry.text === "Old session transcript")), false);
+  assert.notEqual(harness.store().findLatestByCwd(fs.realpathSync(project)).sessionId, oldSession.sessionId);
+});
+
+test("webview cannot select arbitrary session IDs or project paths for history retrieval", async (t) => {
+  const project = fs.realpathSync(process.cwd());
+  const harness = createHarness(t, [{ name: "Vesper", uri: { fsPath: project } }]);
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const before = harness.requests.filter((request) => request.method === "thread/turns/list").length;
+
+  await panel.send({ type: "restore-history", sessionId: "attacker-session", projectPath: "/etc" });
+  assert.equal(harness.requests.filter((request) => request.method === "thread/turns/list").length, before);
+  assert.equal(harness.store().findLatestByCwd(project), null);
+});
+
+test("webview replaces restored history, distinguishes unavailable history, and renders content as text", async (t) => {
+  const project = fs.realpathSync(process.cwd());
+  const harness = createHarness(t, [{ name: "Vesper", uri: { fsPath: project } }]);
+  const panel = harness.openPanel();
+  const webview = mountWebview(panel.html);
+  const history = {
+    type: "conversation-history",
+    state: "available",
+    text: "Saved history restored.",
+    entries: [
+      { id: "turn-1:user", kind: "user", label: "You", text: "Question <b>not HTML</b>" },
+      { id: "turn-1:assistant", kind: "assistant", label: "Codex", text: "Answer" },
+    ],
+  };
+
+  webview.dispatch(history);
+  assert.equal(webview.elements.get("messages").children.length, 2);
+  assert.equal(webview.elements.get("messages").children[0].children[1].textContent, "Question <b>not HTML</b>");
+  assert.equal(webview.elements.get("messages").children[0].children[1].innerHTML, undefined);
+
+  webview.dispatch(history);
+  assert.equal(webview.elements.get("messages").children.length, 2, "restoring the same snapshot replaces prior DOM entries");
+  webview.dispatch({ type: "conversation-history", state: "unavailable", text: "History was not available." });
+  assert.equal(webview.elements.get("messages").children.length, 0, "unavailable history clears the old snapshot instead of presenting it as current");
+  assert.equal(webview.elements.get("history-state").textContent, "History was not available.");
+  webview.dispatch(history);
+  assert.equal(webview.elements.get("messages").children.length, 2);
+  webview.dispatch({ type: "conversation-history", state: "empty", text: "No saved turns.", entries: [] });
+  assert.equal(webview.elements.get("messages").children.length, 0);
+  assert.equal(webview.elements.get("history-state").textContent, "No saved turns.");
 });
 
 test("workspace folders stay isolated and interrupt targets only the active thread and turn", async (t) => {
@@ -237,10 +412,12 @@ test("a removed workspace stays unavailable instead of falling back to another o
   harness.store().update(saved.sessionId, { threadId: "project-a-thread" });
   const panel = harness.openPanel();
   await panel.send({ type: "ready" });
+  const processesBeforeUnavailableSubmit = harness.state.children.length;
   fs.rmdirSync(a);
 
   await panel.send({ type: "submit", text: "Inspect the unavailable project." });
-  assert.equal(harness.state.children.length, 0);
+  assert.equal(harness.state.children.length, processesBeforeUnavailableSubmit);
+  assert.equal(harness.requests.some((request) => request.method === "turn/start"), false);
   assert.equal(panel.last("session-state").state, "unavailable");
   assert.match(panel.last("input-error").text, /workspace folder is unavailable/u);
   assert.equal(harness.store().load(saved.sessionId).threadId, "project-a-thread");
@@ -319,6 +496,12 @@ function createHarness(t, folders, options = {}) {
     threadCount: 0,
     turnCount: 0,
     resumeFailures: options.resumeFailures || 0,
+    historyFailures: options.historyFailures || 0,
+    holdHistoryResponses: options.holdHistoryResponses || 0,
+    holdThreadStarts: options.holdThreadStarts || 0,
+    pendingThreadStarts: [],
+    pendingHistoryResponses: [],
+    historyByThread: new Map(),
     heldTurns: new Set(options.heldTurns || []),
     approvalTurns: new Set(options.approvalTurns || []),
     statusForTurn: options.statusForTurn || (() => "completed"),
@@ -357,10 +540,12 @@ function createHarness(t, folders, options = {}) {
       if (message.method === "initialize") {
         this.send({ id: message.id, result: {} });
       } else if (message.method === "thread/start") {
-        assert.equal(message.params.cwd, this.cwd);
-        const threadId = `thread-${++state.threadCount}`;
-        state.threadCwds.set(threadId, message.params.cwd);
-        this.send({ id: message.id, result: { thread: { id: threadId }, cwd: message.params.cwd } });
+        if (state.holdThreadStarts > 0) {
+          state.holdThreadStarts -= 1;
+          state.pendingThreadStarts.push({ child: this, request: message });
+        } else {
+          this.respondThreadStart(message);
+        }
       } else if (message.method === "thread/resume") {
         if (state.resumeFailures > 0) {
           state.resumeFailures -= 1;
@@ -373,10 +558,20 @@ function createHarness(t, folders, options = {}) {
           return;
         }
         this.send({ id: message.id, result: { thread: { id: message.params.threadId }, cwd } });
+      } else if (message.method === "thread/turns/list") {
+        if (state.historyFailures > 0) {
+          state.historyFailures -= 1;
+          this.send({ id: message.id, error: { code: -32601, message: "mock history unavailable" } });
+        } else if (state.holdHistoryResponses > 0) {
+          state.holdHistoryResponses -= 1;
+          state.pendingHistoryResponses.push({ child: this, request: message });
+        } else {
+          this.respondHistory(message);
+        }
       } else if (message.method === "turn/start") {
         assert.equal(state.threadCwds.get(message.params.threadId), message.params.cwd);
         const turnId = `turn-${++state.turnCount}`;
-        const active = { threadId: message.params.threadId, turnId, request: message };
+        const active = { threadId: message.params.threadId, turnId, request: message, prompt: message.params.input?.[0]?.text };
         this.activeTurns.set(turnId, active);
         this.send({ id: message.id, result: { turn: { id: turnId, status: "inProgress" } } });
         queueMicrotask(() => {
@@ -404,6 +599,20 @@ function createHarness(t, folders, options = {}) {
 
     completeTurn(active, status, text) {
       if (!active) throw new Error("No matching fake server turn is active.");
+      if (!active.historyStored) {
+        const items = [{
+          id: `${active.turnId}-user`,
+          type: "userMessage",
+          content: [{ type: "text", text: active.prompt || "" }],
+        }];
+        if (text) items.push({ id: `${active.turnId}-assistant`, type: "agentMessage", text });
+        const record = { id: active.turnId, status, itemsView: "full", items };
+        if (status === "failed" || status === "interrupted") record.error = { message: `Turn ${status}.` };
+        const history = state.historyByThread.get(active.threadId) || [];
+        history.push(record);
+        state.historyByThread.set(active.threadId, history);
+        active.historyStored = true;
+      }
       if (text) {
         this.send({
           method: "item/agentMessage/delta",
@@ -414,6 +623,27 @@ function createHarness(t, folders, options = {}) {
         method: "turn/completed",
         params: { threadId: active.threadId, turn: { id: active.turnId, status } },
       });
+    }
+
+    respondHistory(request) {
+      const all = state.historyByThread.get(request.params.threadId) || [];
+      const limit = Number.isSafeInteger(request.params.limit) ? request.params.limit : 50;
+      const selected = all.slice(-limit);
+      this.send({
+        id: request.id,
+        result: {
+          data: selected.slice().reverse(),
+          nextCursor: all.length > limit ? "older-history" : null,
+        },
+      });
+    }
+
+    respondThreadStart(request) {
+      assert.equal(request.params.cwd, this.cwd);
+      const threadId = `thread-${++state.threadCount}`;
+      state.threadCwds.set(threadId, request.params.cwd);
+      state.historyByThread.set(threadId, []);
+      this.send({ id: request.id, result: { thread: { id: threadId }, cwd: request.params.cwd } });
     }
 
     disconnect() {
@@ -516,7 +746,83 @@ function createHarness(t, folders, options = {}) {
       for (const subscription of context.subscriptions) subscription.dispose?.();
       loadExtension();
     },
+    releaseHistoryResponse: (index = 0) => {
+      const pending = state.pendingHistoryResponses.splice(index, 1)[0];
+      if (!pending) return false;
+      pending.child.respondHistory(pending.request);
+      return true;
+    },
+    releaseThreadStart: (index = 0) => {
+      const pending = state.pendingThreadStarts.splice(index, 1)[0];
+      if (!pending) return false;
+      pending.child.respondThreadStart(pending.request);
+      return true;
+    },
   };
+}
+
+function storedTurn(id, text) {
+  return {
+    id,
+    status: "completed",
+    itemsView: "full",
+    items: [{ id: `${id}-assistant`, type: "agentMessage", text }],
+  };
+}
+
+function mountWebview(html) {
+  const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/u)?.[1];
+  assert.equal(typeof script, "string", "the panel HTML contains its nonce-bound script");
+  const ids = [
+    "messages", "status", "form", "prompt", "send", "stop", "choose-project", "project-name",
+    "project-path", "session-state", "history-state", "recovery-actions", "retry-resume", "start-new-session",
+  ];
+  const elements = new Map(ids.map((id) => [id, new MockElement(id)]));
+  let onMessage;
+  const posted = [];
+  const document = {
+    getElementById: (id) => elements.get(id) || null,
+    createElement: (tagName) => new MockElement(tagName),
+  };
+  const window = {
+    addEventListener: (type, listener) => { if (type === "message") onMessage = listener; },
+  };
+  vm.runInNewContext(script, {
+    document,
+    window,
+    acquireVsCodeApi: () => ({ postMessage: (message) => posted.push(message) }),
+  }, { timeout: 1_000 });
+  return {
+    elements,
+    posted,
+    dispatch: (data) => onMessage({ data }),
+  };
+}
+
+class MockElement {
+  constructor(tagName) {
+    this.tagName = tagName;
+    this.children = [];
+    this.dataset = {};
+    this.hidden = false;
+    this.disabled = false;
+    this.value = "";
+    this.textContent = "";
+  }
+
+  addEventListener() {}
+
+  append(...elements) {
+    this.children.push(...elements);
+  }
+
+  replaceChildren(...elements) {
+    this.children = [...elements];
+  }
+
+  focus() {}
+
+  requestSubmit() {}
 }
 
 function makeTempDirectory(prefix) {

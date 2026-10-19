@@ -8,6 +8,7 @@ const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { SessionStore } = require("./session-store");
 const { resolveProjectDirectory } = require("./cli");
+const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
 
@@ -27,6 +28,9 @@ let sessionView = { state: "unavailable", text: "Select an available workspace f
 let projectGeneration = 0;
 let activeCodexRequestId;
 let activeRequestType;
+let historyLoadSequence = 0;
+let historyLoadingSessionId;
+let deferredHistoryRestore = false;
 
 function activate(context) {
   output = vscode.window.createOutputChannel("Vesper");
@@ -74,6 +78,7 @@ function openPanel(context) {
         postToPanel(currentPanel, { type: "status", text: "A Vesper task is still active for this project." });
         postToPanel(currentPanel, { type: "active-request", requestId: activeCodexRequestId, kind: activeRequestType });
       }
+      await restoreSelectedHistory(currentPanel);
       return;
     }
 
@@ -258,6 +263,10 @@ async function handlePrompt(prompt, targetPanel = panel) {
       activeCodexRequestId = undefined;
       activeRequestType = undefined;
     }
+    if (deferredHistoryRestore && activeCodexRequestId === undefined) {
+      deferredHistoryRestore = false;
+      if (panel && selectedSession?.sessionId === session.sessionId) void restoreSelectedHistory(panel);
+    }
   }
 }
 
@@ -287,6 +296,7 @@ async function selectProject(targetPanel) {
   postToPanel(targetPanel, projectMessage());
   loadSelectedSession();
   postSessionView(targetPanel);
+  await restoreSelectedHistory(targetPanel);
 }
 
 async function retryResume(targetPanel) {
@@ -298,31 +308,31 @@ async function retryResume(targetPanel) {
   const session = selectedSession;
   const generation = projectGeneration;
   const client = appServerForSession(session, project.path, generation);
+  const historyLoadId = ++historyLoadSequence;
+  historyLoadingSessionId = session.sessionId;
   activeCodexRequestId = requestId;
   activeRequestType = "recovery";
   postToPanel(targetPanel, { type: "recovery-start" });
   setSessionView(targetPanel, { state: "restoring", text: "Verifying the saved Codex thread…", blocked: true });
+  postHistoryState(targetPanel, { state: "loading", text: "Restoring saved conversation history…", entries: [], truncated: false });
   try {
     await client.resumeThread(project.path);
-    if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
-      setSessionView(targetPanel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
-    }
+    await loadHistoryForSession(targetPanel, { client, session, projectPath: project.path, generation, historyLoadId, requestId });
   } catch (error) {
     if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
-      setSessionView(targetPanel, {
-        state: "recovery-required",
-        text: `Could not reconnect to the saved conversation: ${safeMessage(error)}. The saved session was kept. Retry or explicitly start a new conversation.`,
-        blocked: true,
-        canRetry: Boolean(client.threadId),
-        canStartNew: true,
-      });
+      showHistoryFailure(targetPanel, { client, session, projectPath: project.path, requestId, generation, historyLoadId, error });
     }
   } finally {
     if (activeCodexRequestId === requestId) {
       activeCodexRequestId = undefined;
       activeRequestType = undefined;
     }
+    if (historyLoadingSessionId === session.sessionId && historyLoadSequence === historyLoadId) historyLoadingSessionId = undefined;
     postToPanel(targetPanel, { type: "recovery-finished" });
+    if (deferredHistoryRestore && activeCodexRequestId === undefined) {
+      deferredHistoryRestore = false;
+      if (panel && selectedSession?.sessionId === session.sessionId) void restoreSelectedHistory(panel);
+    }
   }
 }
 
@@ -335,6 +345,7 @@ function startNewSession(targetPanel) {
   }
   try {
     const previousSessionId = selectedSession?.sessionId;
+    invalidateHistoryLoad();
     disposeCurrentAppServer();
     selectedSession = sessionStore.create(project.path);
     sessionLookupError = undefined;
@@ -346,6 +357,12 @@ function startNewSession(targetPanel) {
       blocked: false,
     };
     postSessionView(targetPanel);
+    postHistoryState(targetPanel, {
+      state: "empty",
+      text: "This new Vesper session has no saved Codex conversation history yet.",
+      entries: [],
+      truncated: false,
+    });
   } catch (error) {
     postToPanel(targetPanel, { type: "status", text: `Could not create a new Vesper session: ${safeMessage(error)}` });
     postSessionView(targetPanel);
@@ -394,9 +411,17 @@ function appServerForSession(session, cwd, generation) {
     if (appServer !== client || appServerSessionId !== sessionId || projectGeneration !== generation ||
         selectedSession?.sessionId !== sessionId) return;
     if (event.type === "thread_resuming") {
-      setSessionView(panel, { state: "restoring", text: "Restoring the saved Codex thread…", blocked: false });
+      setSessionView(panel, {
+        state: "restoring",
+        text: historyLoadingSessionId === sessionId ? "Restoring the saved thread and conversation history…" : "Restoring the saved Codex thread…",
+        blocked: historyLoadingSessionId === sessionId,
+      });
     } else if (event.type === "thread_resumed") {
-      setSessionView(panel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
+      if (historyLoadingSessionId === sessionId) {
+        setSessionView(panel, { state: "restoring", text: "Saved thread verified; loading conversation history…", blocked: true });
+      } else {
+        setSessionView(panel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
+      }
     } else if (event.type === "thread_starting") {
       setSessionView(panel, { state: "connecting", text: "Starting a new read-only Codex thread…", blocked: false });
     } else if (event.type === "thread_started") {
@@ -450,6 +475,7 @@ function ensureInitialProjectSelection() {
 function selectWorkspaceFolder(folder) {
   const rawPath = folder?.uri?.fsPath;
   if (typeof rawPath !== "string" || !rawPath) return;
+  invalidateHistoryLoad();
   disposeCurrentAppServer();
   projectGeneration += 1;
   selectedWorkspaceName = typeof folder.name === "string" ? folder.name : "";
@@ -539,6 +565,139 @@ function loadSelectedSession() {
   }
 }
 
+async function restoreSelectedHistory(targetPanel) {
+  const project = selectedProjectContext();
+  const session = selectedSession;
+  const historyLoadId = ++historyLoadSequence;
+  deferredHistoryRestore = false;
+
+  if (!project.available) {
+    postHistoryState(targetPanel, unavailableHistory("Conversation history cannot be checked because the selected workspace is unavailable."));
+    return;
+  }
+  if (sessionLookupError) {
+    postHistoryState(targetPanel, unavailableHistory("Saved session metadata could not be checked, so conversation history was not treated as empty."));
+    return;
+  }
+  if (activeCodexRequestId !== undefined) {
+    deferredHistoryRestore = true;
+    postHistoryState(targetPanel, {
+      state: "loading",
+      entries: [],
+      truncated: false,
+      text: "Saved history will be restored after the active Codex task finishes.",
+    });
+    return;
+  }
+  if (!session?.threadId) {
+    postHistoryState(targetPanel, {
+      state: "empty",
+      entries: [],
+      truncated: false,
+      text: session
+        ? "This saved Vesper session has no Codex thread or saved conversation history yet."
+        : "No saved Vesper conversation exists for this project yet.",
+    });
+    return;
+  }
+
+  const generation = projectGeneration;
+  const client = appServerForSession(session, project.path, generation);
+  historyLoadingSessionId = session.sessionId;
+  postHistoryState(targetPanel, {
+    state: "loading",
+    entries: [],
+    truncated: false,
+    text: "Checking the saved Codex conversation history…",
+  });
+  setSessionView(targetPanel, {
+    state: "restoring",
+    text: "Verifying the saved Codex thread and loading its history…",
+    blocked: true,
+  });
+
+  try {
+    if (!client.threadReady) await client.resumeThread(project.path);
+    await loadHistoryForSession(targetPanel, {
+      client,
+      session,
+      projectPath: project.path,
+      generation,
+      historyLoadId,
+    });
+  } catch (error) {
+    showHistoryFailure(targetPanel, { client, session, generation, historyLoadId, projectPath: project.path, error });
+  } finally {
+    if (historyLoadingSessionId === session.sessionId && historyLoadSequence === historyLoadId) historyLoadingSessionId = undefined;
+  }
+}
+
+async function loadHistoryForSession(targetPanel, { client, session, projectPath, generation, historyLoadId, requestId } = {}) {
+  if (!isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId })) return false;
+  const result = await client.readThreadHistory();
+  if (!isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId })) return false;
+  if (result.threadId !== session.threadId) throw new Error("Codex returned history for a different thread.");
+
+  const projected = projectConversationHistory(result);
+  postHistoryState(targetPanel, projected);
+  setSessionView(targetPanel, {
+    state: "connected",
+    text: projected.state === "unavailable"
+      ? "Connected to the saved conversation; its history is unavailable. New tasks are available."
+      : "Connected · saved Codex conversation restored.",
+    blocked: false,
+  });
+  return true;
+}
+
+function showHistoryFailure(targetPanel, { client, session, generation, historyLoadId, projectPath, requestId, error } = {}) {
+  const isCurrent = requestId === undefined
+    ? isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId })
+    : isCurrentRequest(requestId, client, session.sessionId, generation) &&
+      isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId });
+  if (!isCurrent) return;
+
+  const threadVerified = client.threadReady && client.threadId === session.threadId;
+  const historyError = unavailableHistory(safeMessage(error)).text;
+  postHistoryState(targetPanel, unavailableHistory(threadVerified
+    ? `The saved Codex thread is connected, but conversation history could not be retrieved: ${historyError}. Vesper has not treated it as empty.`
+    : `Conversation history could not be retrieved because the saved thread is not connected: ${historyError}. Vesper has not treated it as empty.`));
+  if (threadVerified) {
+    setSessionView(targetPanel, {
+      state: "connected",
+      text: "Connected to the saved conversation; its history is unavailable. New tasks are available.",
+      blocked: false,
+    });
+  } else {
+    setSessionView(targetPanel, {
+      state: "recovery-required",
+      text: `Could not reconnect to the saved conversation: ${historyError}. The saved session was kept. Retry or explicitly start a new conversation.`,
+      blocked: true,
+      canRetry: Boolean(session.threadId),
+      canStartNew: true,
+    });
+  }
+}
+
+function isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId } = {}) {
+  const project = selectedProjectContext();
+  return historyLoadSequence === historyLoadId &&
+    (requestId === undefined || activeCodexRequestId === requestId) &&
+    appServer === client && appServerSessionId === session?.sessionId &&
+    selectedSession?.sessionId === session?.sessionId && projectGeneration === generation &&
+    project.available && project.path === projectPath;
+}
+
+function postHistoryState(targetPanel, state) {
+  postToPanel(targetPanel, { type: "conversation-history", ...state });
+}
+
+function invalidateHistoryLoad() {
+  historyLoadSequence += 1;
+  historyLoadingSessionId = undefined;
+  deferredHistoryRestore = false;
+}
+
 function postSessionView(targetPanel) {
   postToPanel(targetPanel, { type: "session-state", ...sessionView });
 }
@@ -608,11 +767,15 @@ function getHtml(webview) {
     #project-name { font-weight: 600; }
     #project-path { color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
     #session-state { color: var(--vscode-descriptionForeground); font-size: 12px; margin-top: 4px; }
+    #history-state { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 4px; }
     #recovery-actions { display: flex; gap: 8px; margin-top: 8px; }
     #recovery-actions[hidden], #retry-resume[hidden], #start-new-session[hidden] { display: none; }
     #messages { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
     article { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     article.user { background: var(--vscode-textBlockQuote-background); }
+    article.tool, article.activity { border-style: dashed; }
+    article.error { border-color: var(--vscode-errorForeground); }
+    article.turn { border: 0; padding: 2px 8px; color: var(--vscode-descriptionForeground); font-size: 11px; }
     .label { color: var(--vscode-descriptionForeground); font-size: 11px; margin-bottom: 5px; }
     .answer { line-height: 1.45; }
     form { display: flex; gap: 8px; align-items: stretch; }
@@ -634,6 +797,7 @@ function getHtml(webview) {
       </div>
       <div id="status">Starting…</div>
       <div id="session-state" role="status">Checking saved Vesper sessions…</div>
+      <div id="history-state" role="status">Conversation history has not been checked.</div>
       <div id="recovery-actions" hidden>
         <button id="retry-resume" type="button" hidden>Retry connection</button>
         <button id="start-new-session" type="button" hidden>Start new conversation</button>
@@ -659,12 +823,14 @@ function getHtml(webview) {
     const projectName = document.getElementById('project-name');
     const projectPath = document.getElementById('project-path');
     const sessionState = document.getElementById('session-state');
+    const historyState = document.getElementById('history-state');
     const recoveryActions = document.getElementById('recovery-actions');
     const retryResume = document.getElementById('retry-resume');
     const startNewSession = document.getElementById('start-new-session');
     let activeAssistant;
     let activeRequestId;
     let sessionBlocked = false;
+    let recoveryLoading = false;
 
     function addMessage(kind, label, text) {
       const article = document.createElement('article');
@@ -682,8 +848,8 @@ function getHtml(webview) {
     }
 
     function setBusy(busy) {
-      send.disabled = busy || sessionBlocked;
-      prompt.disabled = busy || sessionBlocked;
+      send.disabled = busy || sessionBlocked || recoveryLoading;
+      prompt.disabled = busy || sessionBlocked || recoveryLoading;
       chooseProject.disabled = busy;
       if (!busy && !sessionBlocked) prompt.focus();
     }
@@ -730,9 +896,37 @@ function getHtml(webview) {
       const message = event.data || {};
       if (message.type === 'status') status.textContent = message.text;
       if (message.type === 'project') {
+        if ((projectPath.dataset.currentPath || '') !== (message.path || '')) {
+          messages.replaceChildren();
+          activeAssistant = undefined;
+          activeRequestId = undefined;
+          stop.hidden = true;
+          historyState.textContent = 'Checking this project’s saved conversation history…';
+        }
+        projectPath.dataset.currentPath = message.path || '';
         projectName.textContent = message.available ? (message.name || 'Workspace folder') : (message.name ? message.name + ' · unavailable' : 'No workspace folder selected');
         projectPath.textContent = message.path || 'Open a folder in VS Code to start a Codex task.';
         projectPath.title = message.path || '';
+      }
+      if (message.type === 'conversation-history') {
+        historyState.textContent = typeof message.text === 'string' ? message.text : 'Conversation history status unavailable.';
+        if (message.state === 'loading') {
+          if (activeRequestId === undefined) messages.replaceChildren();
+          return;
+        }
+        messages.replaceChildren();
+        activeAssistant = undefined;
+        activeRequestId = undefined;
+        stop.hidden = true;
+        if (message.state === 'unavailable') return;
+        const historyKinds = new Set(['user', 'assistant', 'tool', 'activity', 'error', 'availability', 'turn']);
+        if (Array.isArray(message.entries)) {
+          for (const entry of message.entries) {
+            if (!entry || typeof entry !== 'object' || typeof entry.label !== 'string' || typeof entry.text !== 'string') continue;
+            const kind = historyKinds.has(entry.kind) ? entry.kind : 'activity';
+            addMessage(kind, entry.label, entry.text);
+          }
+        }
       }
       if (message.type === 'session-state') {
         sessionBlocked = Boolean(message.blocked);
@@ -742,13 +936,19 @@ function getHtml(webview) {
         recoveryActions.hidden = !message.canRetry && !message.canStartNew;
         retryResume.disabled = false;
         startNewSession.disabled = false;
-        if (activeRequestId === undefined) {
+        if (activeRequestId === undefined && !recoveryLoading) {
           send.disabled = sessionBlocked;
           prompt.disabled = sessionBlocked;
         }
       }
-      if (message.type === 'recovery-start') setBusy(true);
-      if (message.type === 'recovery-finished') setBusy(false);
+      if (message.type === 'recovery-start') {
+        recoveryLoading = true;
+        setBusy(true);
+      }
+      if (message.type === 'recovery-finished') {
+        recoveryLoading = false;
+        setBusy(false);
+      }
       if (message.type === 'active-request') {
         activeRequestId = message.requestId;
         setBusy(true);
@@ -811,7 +1011,7 @@ function getHtml(webview) {
         if (activeAssistant) {
           const interrupted = message.state === 'interrupted';
           activeAssistant.title.textContent = interrupted ? 'Codex · interrupted' : 'Codex · failed · ' + message.elapsedMs + ' ms';
-          activeAssistant.body.textContent += (activeAssistant.body.textContent ? '\n\n' : '') + message.text;
+          activeAssistant.body.textContent += (activeAssistant.body.textContent ? '\\n\\n' : '') + message.text;
           activeAssistant = undefined;
         } else {
           const label = message.state === 'interrupted' ? 'Codex · interrupted' : 'Codex fallback error · ' + message.elapsedMs + ' ms';

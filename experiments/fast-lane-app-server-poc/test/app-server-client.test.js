@@ -17,6 +17,8 @@ class FakeAppServerProcess extends EventEmitter {
     this.requests = [];
     this.serverResponses = [];
     this.turnCount = 0;
+    this.historyResponse = { data: [], nextCursor: null };
+    this.historyError = null;
     this.onTurnStart = onTurnStart || ((message, server) => server.completeTurn(message, "completed", `Answer ${server.turnCount}.`));
     this.onInterrupt = onInterrupt || ((_message, server) => server.respond(_message.id, {}));
     this.killed = false;
@@ -31,6 +33,9 @@ class FakeAppServerProcess extends EventEmitter {
       this.respond(message.id, { thread: { id: "thread-1" }, cwd: message.params.cwd });
     } else if (message.method === "thread/resume") {
       this.respond(message.id, { thread: { id: message.params.threadId }, cwd: this.cwd || "/workspace" });
+    } else if (message.method === "thread/turns/list") {
+      if (this.historyError) this.send({ id: message.id, error: this.historyError });
+      else this.respond(message.id, this.historyResponse);
     } else if (message.method === "turn/start") {
       this.turnCount += 1;
       this.cwd = message.params.cwd;
@@ -168,6 +173,91 @@ test("explicit reconnect resumes the saved thread under a read-only sandbox with
   });
   assert.equal(server.requests.some((request) => request.method === "thread/start"), false);
   assert.throws(() => new AppServerClient({ sandbox: "workspace-write" }), /must be read-only/u);
+});
+
+test("reads bounded persisted turn history in chronological order after verifying the saved thread", async (t) => {
+  const server = new FakeAppServerProcess();
+  server.cwd = "/workspace/project";
+  server.historyResponse = {
+    data: [
+      { id: "turn-2", status: "completed", itemsView: "full", items: [{ id: "message-2", type: "agentMessage", text: "Second" }] },
+      { id: "turn-1", status: "completed", itemsView: "full", items: [{ id: "message-1", type: "userMessage", content: [{ type: "text", text: "First" }] }] },
+    ],
+    nextCursor: "older-turns",
+  };
+  const { client } = createClient(server, { initialThreadId: "saved-thread", sandbox: "read-only" });
+  t.after(() => client.dispose());
+
+  await client.resumeThread("/workspace/project");
+  const history = await client.readThreadHistory();
+
+  assert.deepEqual(server.requests.find((request) => request.method === "thread/turns/list").params, {
+    threadId: "saved-thread",
+    limit: 50,
+    sortDirection: "desc",
+    itemsView: "full",
+  });
+  assert.deepEqual(history.turns.map((turn) => turn.id), ["turn-1", "turn-2"]);
+  assert.equal(history.threadId, "saved-thread");
+  assert.equal(history.truncated, true);
+  assert.equal(client.threadReady, true);
+});
+
+test("history retrieval failure keeps the verified session thread usable", async (t) => {
+  const server = new FakeAppServerProcess();
+  server.cwd = "/workspace/project";
+  server.historyError = { code: -32601, message: "history method unavailable" };
+  const { client } = createClient(server, { initialThreadId: "saved-thread" });
+  t.after(() => client.dispose());
+
+  await client.resumeThread("/workspace/project");
+  await assert.rejects(client.readThreadHistory(), /history method unavailable/u);
+  assert.equal(client.threadId, "saved-thread");
+  assert.equal(client.threadReady, true);
+
+  server.historyError = null;
+  server.historyResponse = { data: [], nextCursor: null };
+  assert.deepEqual(await client.readThreadHistory(), {
+    threadId: "saved-thread",
+    turns: [],
+    truncated: false,
+  });
+});
+
+test("history responses from a replaced app-server process cannot enter the recovered thread view", async (t) => {
+  const first = new FakeAppServerProcess();
+  const second = new FakeAppServerProcess();
+  first.cwd = second.cwd = "/workspace/project";
+  first.historyResponse = { data: [{ id: "stale-turn", status: "completed", itemsView: "full", items: [] }], nextCursor: null };
+  second.historyResponse = { data: [{ id: "current-turn", status: "completed", itemsView: "full", items: [] }], nextCursor: null };
+  const receive = first.receive.bind(first);
+  let pendingHistoryRequest;
+  first.receive = (message) => {
+    if (message.method === "thread/turns/list") {
+      first.requests.push(message);
+      pendingHistoryRequest = message;
+      return;
+    }
+    receive(message);
+  };
+  let spawnCount = 0;
+  const client = new AppServerClient({
+    initialThreadId: "saved-thread",
+    spawnProcess: () => ++spawnCount === 1 ? first : second,
+  });
+  t.after(() => client.dispose());
+
+  await client.resumeThread("/workspace/project");
+  const staleRead = client.readThreadHistory();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(pendingHistoryRequest);
+  first.emit("close", 1, null);
+  await assert.rejects(staleRead, /exited/u);
+
+  await client.resumeThread("/workspace/project");
+  first.respond(pendingHistoryRequest.id, first.historyResponse);
+  const current = await client.readThreadHistory();
+  assert.deepEqual(current.turns.map((turn) => turn.id), ["current-turn"]);
 });
 
 test("a failed resume stops instead of silently starting a fresh conversation", async (t) => {

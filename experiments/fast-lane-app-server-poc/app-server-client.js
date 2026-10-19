@@ -5,6 +5,7 @@ const { EventEmitter } = require("node:events");
 const path = require("node:path");
 const { FileChangeApprovalStore } = require("./file-change-approval");
 const { TurnDiffActivityStore } = require("./turn-diff-activity");
+const { MAX_HISTORY_TURNS } = require("./conversation-history");
 
 const RPC_TIMEOUT_MS = 20_000;
 const TURN_TIMEOUT_MS = 5 * 60_000;
@@ -48,6 +49,7 @@ class AppServerClient extends EventEmitter {
     this.stdoutBuffer = "";
     this.activeTurn = undefined;
     this.startingTurn = false;
+    this.historyReadPromise = undefined;
     this.pendingInterrupt = false;
     this.disposed = false;
     this.connectionGeneration = 0;
@@ -108,6 +110,7 @@ class AppServerClient extends EventEmitter {
     if (typeof prompt !== "string" || !prompt.trim()) throw new TypeError("A non-empty prompt is required.");
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (this.activeTurn || this.startingTurn) throw new Error("A Codex turn is already active or starting.");
+    if (this.historyReadPromise) throw new Error("Codex conversation history is still loading.");
 
     this.startingTurn = true;
     try {
@@ -189,9 +192,46 @@ class AppServerClient extends EventEmitter {
   async resumeThread(cwd) {
     if (!this.threadId) throw new Error("There is no saved Codex thread to resume.");
     if (this.activeTurn || this.startingTurn) throw new Error("Cannot reconnect while a Codex turn is active or starting.");
+    if (this.historyReadPromise) throw new Error("Cannot reconnect while Codex conversation history is loading.");
     await this.connect(cwd);
     await this.ensureThread(cwd);
     return this.threadId;
+  }
+
+  readThreadHistory() {
+    if (!this.threadId || !this.threadReady) return Promise.reject(new Error("A resumed Codex thread is required before reading conversation history."));
+    if (this.activeTurn || this.startingTurn) return Promise.reject(new Error("Cannot read conversation history while a Codex turn is active or starting."));
+    if (this.historyReadPromise) return this.historyReadPromise;
+
+    const threadId = this.threadId;
+    const generation = this.connectionGeneration;
+    const promise = this.request("thread/turns/list", {
+      threadId,
+      limit: MAX_HISTORY_TURNS,
+      sortDirection: "desc",
+      itemsView: "full",
+    }).then((response) => {
+      if (this.disposed || this.connectionGeneration !== generation || this.threadId !== threadId ||
+          !this.threadReady || !this.child) {
+        throw new Error("Codex conversation history belongs to a replaced or disconnected thread.");
+      }
+      if (!response || typeof response !== "object" || !Array.isArray(response.data)) {
+        throw new Error("Codex app-server returned an invalid conversation history response.");
+      }
+      if (response.nextCursor !== undefined && response.nextCursor !== null &&
+          (typeof response.nextCursor !== "string" || !response.nextCursor.length || response.nextCursor.length > 8_192)) {
+        throw new Error("Codex app-server returned an invalid conversation history cursor.");
+      }
+      const turns = response.data.slice(0, MAX_HISTORY_TURNS).reverse();
+      const cursorMissingAtPageLimit = !Object.hasOwn(response, "nextCursor") && response.data.length >= MAX_HISTORY_TURNS;
+      const truncated = response.data.length > MAX_HISTORY_TURNS ||
+        (typeof response.nextCursor === "string" && response.nextCursor.length > 0) || cursorMissingAtPageLimit;
+      return { threadId, turns, truncated };
+    }).finally(() => {
+      if (this.historyReadPromise === promise) this.historyReadPromise = undefined;
+    });
+    this.historyReadPromise = promise;
+    return promise;
   }
 
   async ensureThread(cwd) {
