@@ -312,6 +312,10 @@ test("notifications arriving before turn/start acknowledgement wait for authorit
         threadId: "thread-1", turnId: "stale-turn", startedAtMs: 1,
         item: { type: "commandExecution", id: "stale-command", command: "stale", cwd: "/workspace", status: "inProgress" },
       } });
+      server.send({ method: "item/fileChange/patchUpdated", params: {
+        threadId: "thread-1", turnId: "stale-turn", itemId: "stale-file",
+        changes: [{ path: "/workspace/stale.txt", kind: { type: "add" }, diff: "@@ -0,0 +1 @@\n+stale\n" }],
+      } });
     } else receive(message);
   };
   const { client } = createClient(server);
@@ -329,6 +333,9 @@ test("notifications arriving before turn/start acknowledgement wait for authorit
   await nextEvent();
   assert.equal(client.activeTurn?.turnId, "current-turn");
   assert.equal(progress.some((event) => event.type === "turn_identity" && event.turnId === "current-turn"), true);
+  const currentIdentity = progress.find((event) => event.type === "turn_identity" && event.turnId === "current-turn");
+  assert.deepEqual(currentIdentity.fileChanges, [], "pre-ack summaries are filtered by the acknowledged turn ID");
+  assert.equal(progress.some((event) => event.type === "file_change_activity"), false);
   assert.equal(progress.some((event) => event.type === "turn_identity" && event.turnId === "stale-turn"), false);
   assert.equal(progress.some((event) => event.type === "turn_status" && event.turnId === "stale-turn"), false);
   assert.equal(progress.filter((event) => event.type === "codex_progress").some((event) => event.params.turnId === "stale-turn"), true,
@@ -843,4 +850,89 @@ test("file snapshot storage has a per-turn bound and fails closed on overflow", 
   assert.deepEqual(await fileRequest(server, "overflow"), { decision: "decline" });
   assert.equal(calls.length, 0);
   await finish();
+});
+
+test("file-change summaries follow cached item evidence from pending through update to completion", async (t) => {
+  const server = new FakeAppServerProcess({ onTurnStart: (request, current) => {
+    setImmediate(() => {
+      const threadId = request.params.threadId;
+      current.send({ method: "item/started", params: {
+        threadId,
+        turnId: "turn-1",
+        startedAtMs: 1,
+        item: {
+          id: "file-1", type: "fileChange", status: "inProgress",
+          changes: [{ path: "/workspace/example.txt", kind: { type: "update" }, diff: "--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+new\n" }],
+        },
+      } });
+      current.send({ method: "item/fileChange/patchUpdated", params: {
+        threadId,
+        turnId: "turn-1",
+        itemId: "file-1",
+        changes: [{ path: "/workspace/updated.txt", kind: { type: "add" }, diff: "--- /dev/null\n+++ b/updated.txt\n@@ -0,0 +1 @@\n+added\n" }],
+      } });
+      current.send({ method: "item/completed", params: {
+        threadId,
+        turnId: "turn-1",
+        completedAtMs: 2,
+        item: { id: "file-1", type: "fileChange", status: "completed", changes: [] },
+      } });
+      current.completeTurn(request, "completed");
+    });
+  } });
+  const { client } = createClient(server);
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
+  t.after(() => client.dispose());
+
+  assert.deepEqual(await client.runTurn({ prompt: "Inspect these changes", cwd: "/workspace" }), { status: "completed" });
+  assert.deepEqual(progress.filter((event) => event.type === "file_change_activity").map((event) => event.activity.state), [
+    "pending", "updated", "completed",
+  ]);
+  const updated = progress.find((event) => event.type === "file_change_activity" && event.activity.state === "updated");
+  assert.deepEqual(updated.activity.changes.map((item) => item.path), ["/workspace/updated.txt"]);
+  assert.equal(updated.activity.changes[0].addedLines, 1);
+  assert.equal(updated.activity.changes[0].removedLines, 0);
+  const completed = progress.find((event) => event.type === "file_change_activity" && event.activity.state === "completed");
+  assert.deepEqual(completed.activity.changes, []);
+});
+
+test("turn interruption invalidates file summaries and late events from the replaced process are ignored", async (t) => {
+  const first = new FakeAppServerProcess({ onTurnStart() {} });
+  const second = new FakeAppServerProcess({ onTurnStart() {} });
+  let spawns = 0;
+  const client = new AppServerClient({ spawnProcess: () => ++spawns === 1 ? first : second });
+  const progress = [];
+  client.on("progress", (event) => progress.push(event));
+  t.after(() => client.dispose());
+
+  const abandoned = assert.rejects(client.runTurn({ prompt: "Inspect file activity", cwd: "/workspace" }), /exited/u);
+  await nextEvent();
+  await nextEvent();
+  first.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "file-1",
+    changes: [{ path: "/workspace/current.txt", kind: { type: "update" }, diff: "@@ -1 +1 @@\n-before\n+after\n" }],
+  } });
+  assert.equal(progress.some((event) => event.type === "file_change_activity" && event.activity.state === "updated"), true);
+  first.emit("close", 1, null);
+  await abandoned;
+  assert.equal(progress.some((event) => event.type === "file_change_activity" && event.activity.state === "invalidated"), true);
+
+  const recovered = client.runTurn({ prompt: "Resume", cwd: "/workspace" });
+  await nextEvent();
+  const before = progress.filter((event) => event.type === "file_change_activity").length;
+  first.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "file-1",
+    changes: [{ path: "/workspace/stale.txt", kind: { type: "add" }, diff: "@@ -0,0 +1 @@\n+stale\n" }],
+  } });
+  assert.equal(progress.filter((event) => event.type === "file_change_activity").length, before);
+  assert.ok(second.requests.some((message) => message.method === "thread/resume"));
+  second.send({ method: "item/fileChange/patchUpdated", params: {
+    threadId: "thread-1", turnId: "turn-1", itemId: "resume-file",
+    changes: [{ path: "/workspace/resumed.txt", kind: { type: "add" }, diff: "@@ -0,0 +1 @@\n+proposed\n" }],
+  } });
+  assert.equal(progress.some((event) => event.type === "file_change_activity" && event.activity.itemId === "resume-file" && event.activity.state === "updated"), true);
+  second.send({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1", status: "interrupted" } } });
+  assert.deepEqual(await recovered, { status: "interrupted" });
+  assert.equal(progress.some((event) => event.type === "file_change_activity" && event.activity.itemId === "resume-file" && event.activity.state === "invalidated"), true);
 });

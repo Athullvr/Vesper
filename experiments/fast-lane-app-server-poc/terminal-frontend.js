@@ -6,6 +6,11 @@ const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 
 const QUIT_COMMANDS = new Set([":quit", ":exit", "/quit", "/exit"]);
+const MAX_FILE_ACTIVITY_ITEMS = 50;
+const MAX_FILE_ACTIVITY_OUTPUT_LENGTH = 12_000;
+const MAX_FILE_ACTIVITY_CHANGES_PER_ITEM = 8;
+const MAX_FILE_ACTIVITY_PATH_LENGTH = 1_024;
+const FILE_ACTIVITY_LIMIT_MARKER = "\n[Vesper] File-change summary output is limited; later summaries or updates are omitted.\n";
 
 class TerminalFrontend {
   constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics() } = {}) {
@@ -22,6 +27,9 @@ class TerminalFrontend {
     this.exitAfterTurn = false;
     this.closed = false;
     this.commandActivity = null;
+    this.fileActivityIdentities = new Set();
+    this.fileActivityOutputLength = 0;
+    this.fileActivityLimitReported = false;
     this.pendingApprovals = new Set();
     this.approvalQueue = Promise.resolve();
     this.handleProgress = this.handleProgress.bind(this);
@@ -80,6 +88,9 @@ class TerminalFrontend {
 
     this.activeRequest = true;
     this.commandActivity = new CommandActivityStore();
+    this.fileActivityIdentities.clear();
+    this.fileActivityOutputLength = 0;
+    this.fileActivityLimitReported = false;
     this.write(`\n[Codex · ${decision.reason} · connecting]\n`);
     try {
       const routed = await routeRequest(prompt, {
@@ -184,6 +195,7 @@ class TerminalFrontend {
       case "turn_started": this.write("[Codex] Working…\n"); break;
       case "turn_identity":
         this.renderCommandActivity(this.commandActivity?.bindTurn(event.threadId, event.turnId));
+        this.renderFileChangeActivities(event.fileChanges);
         break;
       case "turn_status":
         this.renderCommandActivity(this.commandActivity?.setTurnStatus(event.threadId, event.turnId, event.status));
@@ -203,6 +215,9 @@ class TerminalFrontend {
           this.renderCommandActivity(this.commandActivity?.applyProtocolNotification(event.method, event.params));
         }
         break;
+      case "file_change_activity":
+        this.renderFileChangeActivities([event.activity]);
+        break;
       case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
       case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
       case "file_approval_declined": this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.reason)}\n`); break;
@@ -212,6 +227,38 @@ class TerminalFrontend {
 
   renderCommandActivity(updates) {
     renderActivityUpdates(updates, (text) => this.write(text));
+  }
+
+  renderFileChangeActivities(activities) {
+    for (const activity of activities || []) {
+      if (this.fileActivityLimitReported) return;
+      if (!isFileActivityIdentity(activity)) continue;
+      const key = JSON.stringify([activity.threadId, activity.turnId, activity.itemId]);
+      if (!this.fileActivityIdentities.has(key)) {
+        if (this.fileActivityIdentities.size >= MAX_FILE_ACTIVITY_ITEMS) {
+          this.writeFileActivityLimitMarker();
+          return;
+        }
+        this.fileActivityIdentities.add(key);
+      }
+      const rendered = renderFileChangeActivity(activity);
+      const contentBudget = MAX_FILE_ACTIVITY_OUTPUT_LENGTH - FILE_ACTIVITY_LIMIT_MARKER.length;
+      if (this.fileActivityOutputLength + rendered.length > contentBudget) {
+        this.writeFileActivityLimitMarker();
+        return;
+      }
+      this.write(rendered);
+      this.fileActivityOutputLength += rendered.length;
+    }
+  }
+
+  writeFileActivityLimitMarker() {
+    if (this.fileActivityLimitReported) return;
+    this.fileActivityLimitReported = true;
+    if (this.fileActivityOutputLength + FILE_ACTIVITY_LIMIT_MARKER.length <= MAX_FILE_ACTIVITY_OUTPUT_LENGTH) {
+      this.write(FILE_ACTIVITY_LIMIT_MARKER);
+      this.fileActivityOutputLength += FILE_ACTIVITY_LIMIT_MARKER.length;
+    }
   }
 
   handleInterrupt() {
@@ -368,6 +415,78 @@ function safeStreamText(value) {
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ");
 }
 
+function isFileActivityIdentity(activity) {
+  return activity && typeof activity === "object" &&
+    [activity.threadId, activity.turnId, activity.itemId].every((value) => typeof value === "string" && value.length > 0 && value.length <= 512 &&
+      !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value));
+}
+
+function renderFileChangeActivity(activity) {
+  const number = Number.isInteger(activity.number) && activity.number > 0 ? activity.number : "?";
+  const states = new Set(["pending", "updated", "invalidated", "completed"]);
+  const state = states.has(activity.state) ? activity.state : "invalidated";
+  const lines = [`\n[Codex file-change summary #${number} · evidence ${state} · proposed changes; disk state not verified]\n`];
+
+  if (state === "invalidated") {
+    lines.push("Earlier details are no longer current; no file paths are shown.\n");
+    return lines.join("");
+  }
+  if (state === "completed") {
+    lines.push("The file-change evidence lifecycle completed; this does not verify a disk write.\n");
+    return lines.join("");
+  }
+
+  const changes = Array.isArray(activity.changes) ? activity.changes : [];
+  if (!changes.length) {
+    lines.push("Summary incomplete: no safe change details are available.\n");
+    return lines.join("");
+  }
+  let incomplete = Boolean(activity.incomplete);
+  const visible = changes.slice(0, MAX_FILE_ACTIVITY_CHANGES_PER_ITEM);
+  for (const change of visible) {
+    if (!change || typeof change !== "object" || typeof change.path !== "string" || !["add", "delete", "update"].includes(change.kind)) {
+      incomplete = true;
+      continue;
+    }
+    const pathText = safeFileSummaryField(change.path);
+    lines.push(`File: ${pathText.text}${pathText.truncated || change.pathTruncated ? " … [path truncated]" : ""}\n`);
+    lines.push(`Change: ${change.kind}`);
+    if (change.kind === "update" && typeof change.movePath === "string") {
+      const movePath = safeFileSummaryField(change.movePath);
+      lines.push(`; moved to ${movePath.text}${movePath.truncated || change.movePathTruncated ? " … [path truncated]" : ""}`);
+    }
+    if (Number.isSafeInteger(change.addedLines) && change.addedLines >= 0 && Number.isSafeInteger(change.removedLines) && change.removedLines >= 0) {
+      lines.push(` (+${change.addedLines} / −${change.removedLines} lines)`);
+    } else {
+      lines.push(" (line counts unavailable)");
+      incomplete = true;
+    }
+    lines.push("\n");
+    if (pathText.truncated || change.pathTruncated || change.movePathTruncated) incomplete = true;
+  }
+  if (changes.length > visible.length) {
+    lines.push(`[summary truncated: ${changes.length - visible.length} change entries omitted]\n`);
+    incomplete = true;
+  }
+  if (incomplete) lines.push("[summary incomplete or truncated]\n");
+  return lines.join("");
+}
+
+function safeFileSummaryField(value) {
+  const source = redactSensitiveText(String(value ?? "").slice(0, 8_000));
+  let text = "";
+  let truncated = String(value ?? "").length > 8_000;
+  for (const character of source) {
+    const escaped = escapeTerminalField(character);
+    if (text.length + escaped.length > MAX_FILE_ACTIVITY_PATH_LENGTH) {
+      truncated = true;
+      break;
+    }
+    text += escaped;
+  }
+  return { text, truncated };
+}
+
 function cloneJsonValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -386,4 +505,7 @@ module.exports = {
   createLineIO,
   safeTerminalText,
   safeStreamText,
+  renderFileChangeActivity,
+  MAX_FILE_ACTIVITY_ITEMS,
+  MAX_FILE_ACTIVITY_OUTPUT_LENGTH,
 };

@@ -5,6 +5,7 @@
 const MAX_FIELD_LENGTH = 8_000;
 const MAX_SNAPSHOT_LENGTH = 20_000;
 const MAX_ITEMS_PER_TURN = 64;
+const MAX_SUMMARY_PATH_LENGTH = 1_024;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -49,12 +50,13 @@ class FileChangeApprovalStore {
     this.threadId = threadId;
     this.items = new Map();
     this.closed = false;
+    this.nextNumber = 1;
   }
 
   record(method, params, acknowledgedTurnId) {
     const patch = method === "item/fileChange/patchUpdated";
     const lifecycle = method === "item/started" || method === "item/completed";
-    if (this.closed || (!patch && !lifecycle)) return;
+    if (this.closed || (!patch && !lifecycle)) return [];
     const itemId = patch ? params?.itemId : params?.item?.id;
     // Other tool items do not supply file-change evidence.
     if (!patch && params?.item?.type !== "fileChange") {
@@ -62,22 +64,27 @@ class FileChangeApprovalStore {
       const previous = this.items.get(key);
       if (previous) {
         previous.controller?.abort();
-        this.items.set(key, { terminal: true });
+        const invalidated = {
+          ...previous,
+          snapshot: null,
+          terminal: true,
+          state: "invalidated",
+        };
+        this.items.set(key, invalidated);
+        return [this.activitySnapshot(invalidated)];
       }
-      return;
+      return [];
     }
-    if (isIdentity(params?.threadId) && params.threadId !== this.threadId) return;
-    if (acknowledgedTurnId && isIdentity(params?.turnId) && params.turnId !== acknowledgedTurnId) return;
+    if (isIdentity(params?.threadId) && params.threadId !== this.threadId) return [];
+    if (acknowledgedTurnId && isIdentity(params?.turnId) && params.turnId !== acknowledgedTurnId) return [];
     if (![params?.threadId, params?.turnId, itemId].every(isIdentity)) {
       // An unscoped update cannot safely be assigned to an existing item.
-      this.close();
-      return;
+      return this.close();
     }
     const key = JSON.stringify([params.threadId, params.turnId, itemId]);
     const previous = this.items.get(key);
     if (!previous && this.items.size >= MAX_ITEMS_PER_TURN) {
-      this.close();
-      return;
+      return this.close();
     }
     previous?.controller?.abort();
     const terminal = previous?.terminal || method === "item/completed" ||
@@ -88,7 +95,26 @@ class FileChangeApprovalStore {
     });
     // Replace even invalid updates, so an older valid diff cannot authorize
     // newer malformed data. Item IDs cannot be reused after a request/completion.
-    this.items.set(key, { snapshot, terminal, requested: previous?.requested || false });
+    const hasValidLifecycleStatus = patch || method === "item/completed" ||
+      ["inProgress", "completed", "failed", "declined"].includes(params.item?.status);
+    const state = !hasValidLifecycleStatus || (!terminal && !snapshot)
+      ? "invalidated"
+      : terminal ? "completed" : patch ? "updated" : "pending";
+    const entry = {
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId,
+      number: previous?.number || this.nextNumber++,
+      snapshot,
+      terminal,
+      requested: previous?.requested || false,
+      state,
+    };
+    const fingerprint = JSON.stringify([state, snapshot]);
+    const changed = previous?.fingerprint !== fingerprint;
+    entry.fingerprint = fingerprint;
+    this.items.set(key, entry);
+    return changed ? [this.activitySnapshot(entry)] : [];
   }
 
   capture(params) {
@@ -105,11 +131,94 @@ class FileChangeApprovalStore {
     });
   }
 
-  close() {
-    this.closed = true;
-    for (const entry of this.items.values()) entry.controller?.abort();
-    this.items.clear();
+  activities(threadId, turnId) {
+    if (this.closed || threadId !== this.threadId || !isIdentity(threadId) || !isIdentity(turnId)) return [];
+    return [...this.items.values()]
+      .filter((entry) => entry.threadId === threadId && entry.turnId === turnId)
+      .sort((left, right) => left.number - right.number)
+      .map((entry) => this.activitySnapshot(entry));
   }
+
+  activitySnapshot(entry) {
+    const changes = entry.snapshot?.changes.map((change) => {
+      const lineCounts = summarizeDiffLineCounts(change.diff);
+      return Object.freeze({
+        path: limitSummaryPath(change.path),
+        pathTruncated: change.path.length > MAX_SUMMARY_PATH_LENGTH,
+        kind: change.kind.type,
+        movePath: change.kind.move_path ? limitSummaryPath(change.kind.move_path) : null,
+        movePathTruncated: Boolean(change.kind.move_path && change.kind.move_path.length > MAX_SUMMARY_PATH_LENGTH),
+        addedLines: lineCounts?.added ?? null,
+        removedLines: lineCounts?.removed ?? null,
+      });
+    }) || [];
+    return Object.freeze({
+      threadId: entry.threadId,
+      turnId: entry.turnId,
+      itemId: entry.itemId,
+      number: entry.number,
+      state: entry.state,
+      changes: Object.freeze(changes),
+      incomplete: entry.state === "invalidated" || changes.some((change) => change.addedLines === null),
+    });
+  }
+
+  close() {
+    const invalidated = [];
+    this.closed = true;
+    for (const entry of this.items.values()) {
+      entry.controller?.abort();
+      if (entry.snapshot && !entry.terminal) {
+        const closedEntry = { ...entry, snapshot: null, terminal: true, state: "invalidated" };
+        invalidated.push(this.activitySnapshot(closedEntry));
+      }
+    }
+    this.items.clear();
+    return invalidated;
+  }
+}
+
+function summarizeDiffLineCounts(diff) {
+  const lines = diff.split(/\r?\n/u);
+  let added = 0;
+  let removed = 0;
+  let hunk = null;
+  let sawHunk = false;
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      if (hunk && (hunk.oldRemaining !== 0 || hunk.newRemaining !== 0)) return null;
+      const match = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u);
+      if (!match) return null;
+      hunk = {
+        oldRemaining: match[2] === undefined ? 1 : Number(match[2]),
+        newRemaining: match[4] === undefined ? 1 : Number(match[4]),
+      };
+      sawHunk = true;
+      continue;
+    }
+    if (hunk && hunk.oldRemaining === 0 && hunk.newRemaining === 0) hunk = null;
+    if (!hunk || line === "" || line.startsWith("\\")) continue;
+    if (line.startsWith(" ")) {
+      hunk.oldRemaining -= 1;
+      hunk.newRemaining -= 1;
+    } else if (line.startsWith("+")) {
+      hunk.newRemaining -= 1;
+      added += 1;
+    } else if (line.startsWith("-")) {
+      hunk.oldRemaining -= 1;
+      removed += 1;
+    } else {
+      return null;
+    }
+    if (hunk.oldRemaining < 0 || hunk.newRemaining < 0) return null;
+  }
+  if (!sawHunk || (hunk && (hunk.oldRemaining !== 0 || hunk.newRemaining !== 0))) return null;
+  return { added, removed };
+}
+
+function limitSummaryPath(value) {
+  if (value.length <= MAX_SUMMARY_PATH_LENGTH) return value;
+  return `${value.slice(0, MAX_SUMMARY_PATH_LENGTH - 18)} … [path truncated]`;
 }
 
 module.exports = { FileChangeApprovalStore, createFileChangeSnapshot };

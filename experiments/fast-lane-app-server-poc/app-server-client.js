@@ -132,7 +132,12 @@ class AppServerClient extends EventEmitter {
       active.turnId = turn.id;
       active.startAcknowledged = true;
       active.resolveStart();
-      this.emit("progress", { type: "turn_identity", threadId: active.threadId, turnId: active.turnId });
+      this.emit("progress", {
+        type: "turn_identity",
+        threadId: active.threadId,
+        turnId: active.turnId,
+        fileChanges: active.fileChanges.activities(active.threadId, active.turnId),
+      });
       if (active.pendingTurnStarts.has(active.turnId) || turn.status === "inProgress") this.emitTurnStarted(active);
       for (const delta of active.pendingDeltas) {
         if (delta.turnId === active.turnId && delta.delta) active.onDelta(delta.delta);
@@ -167,7 +172,7 @@ class AppServerClient extends EventEmitter {
       return false;
     }
     active.interruptRequested = true;
-    active.fileChanges.close();
+    this.closeFileChanges(active);
     this.emit("progress", { type: "interrupt_requested" });
     if (active.turnId) await this.sendInterrupt(active);
     return true;
@@ -248,7 +253,7 @@ class AppServerClient extends EventEmitter {
     if (this.activeTurn !== active || active.settled) return;
     active.timedOut = true;
     active.interruptRequested = true;
-    active.fileChanges.close();
+    this.closeFileChanges(active);
     this.emit("progress", { type: "turn_timed_out" });
     if (active.turnId) void this.sendInterrupt(active).catch((error) => this.finish(active, undefined, error));
     active.interruptTimer = setTimeout(() => {
@@ -443,11 +448,15 @@ class AppServerClient extends EventEmitter {
     if (!active) return;
     // Retain early item snapshots, but approval waits for the authoritative
     // turn/start response. Every cache key includes all three protocol IDs.
-    active.fileChanges.record(method, params, active.startAcknowledged ? active.turnId : null);
-    if (!params || typeof params !== "object" || Array.isArray(params)) return;
+    const fileChangeUpdates = active.fileChanges.record(method, params, active.startAcknowledged ? active.turnId : null);
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      if (active.startAcknowledged) this.emitFileChangeActivities(active, fileChangeUpdates);
+      return;
+    }
     if (params.threadId && params.threadId !== active.threadId) return;
     const eventTurnId = params.turnId || params.turn?.id;
     if (eventTurnId && active.turnId && eventTurnId !== active.turnId) return;
+    if (active.startAcknowledged) this.emitFileChangeActivities(active, fileChangeUpdates);
 
     if (method === "turn/started") {
       const turnId = params.turn?.id;
@@ -540,13 +549,25 @@ class AppServerClient extends EventEmitter {
   finish(active, value, error) {
     if (active.settled) return;
     active.settled = true;
-    active.fileChanges.close();
+    this.closeFileChanges(active);
     active.resolveStart();
     clearTimeout(active.turnTimer);
     clearTimeout(active.interruptTimer);
     if (this.activeTurn === active) this.activeTurn = undefined;
     if (error) active.rejectCompletion(error);
     else active.resolveCompletion(value);
+  }
+
+  emitFileChangeActivities(active, activities) {
+    for (const activity of activities || []) {
+      if (!activity || activity.threadId !== active.threadId || activity.turnId !== active.turnId) continue;
+      this.emit("progress", { type: "file_change_activity", activity });
+    }
+  }
+
+  closeFileChanges(active) {
+    const invalidated = active.fileChanges.close();
+    if (active.startAcknowledged) this.emitFileChangeActivities(active, invalidated);
   }
 
   handleExit(error, generation) {

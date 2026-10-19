@@ -324,6 +324,42 @@ test("app-server command item and output notifications render bounded activity t
   appServer.dispose();
 });
 
+test("file-change evidence renders bounded summaries outside approval prompts and never claims a disk write", async () => {
+  const server = new FakeCodexProcess({ onTurnStart: (request, current) => {
+    setImmediate(() => {
+      current.send({ method: "item/started", params: {
+        threadId: request.params.threadId,
+        turnId: "turn-1",
+        startedAtMs: 1,
+        item: {
+          id: "file-1", type: "fileChange", status: "inProgress",
+          changes: [{ path: "/workspace/hello.txt", kind: { type: "update" }, diff: "--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n" }],
+        },
+      } });
+      current.send({ method: "item/fileChange/patchUpdated", params: {
+        threadId: request.params.threadId,
+        turnId: "turn-1",
+        itemId: "file-1",
+        changes: [{ path: "/workspace/updated.txt", kind: { type: "add" }, diff: "--- /dev/null\n+++ b/updated.txt\n@@ -0,0 +1 @@\n+new\n" }],
+      } });
+      current.completeTurn(request, "completed", "Summary ready.");
+    });
+  } });
+  const appServer = new AppServerClient({ spawnProcess: () => server });
+  const { frontend, output } = makeFrontend({ appServer, answers: ["Review the file changes", ":quit"] });
+  appServer.onApproval = (method, params, context) => frontend.requestApproval(method, params, context);
+  await frontend.run();
+  assert.match(output(), /file-change summary #1 · evidence pending/u);
+  assert.match(output(), /file-change summary #1 · evidence updated/u);
+  assert.match(output(), /file-change summary #1 · evidence invalidated/u);
+  assert.match(output(), /Earlier details are no longer current/u);
+  assert.match(output(), /File: \/workspace\/updated\.txt/u);
+  assert.match(output(), /Change: add \(\+1 \/ −0 lines\)/u);
+  assert.doesNotMatch(output(), /approval required|approval approved/u);
+  assert.doesNotMatch(output(), /file written|write succeeded|applied successfully/u);
+  appServer.dispose();
+});
+
 test("approval acceptance is shown separately and does not imply command execution", async () => {
   let startRequest;
   const server = new FakeCodexProcess({ onTurnStart: (request, current) => {

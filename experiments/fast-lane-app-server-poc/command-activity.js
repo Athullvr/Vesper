@@ -291,7 +291,7 @@ function redactSensitiveText(value) {
     .replace(/(\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)[^\s'"`]+/giu, "$1[redacted]")
     .replace(/(\bBearer\s+)[A-Za-z0-9._~+/=-]+/giu, "$1[redacted]")
     .replace(/(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|passwd|secret|client[_-]?secret|private[_-]?key)\s*[:=]\s*)(?:'[^']*'|"[^"]*"|[^\s;&|]+)/giu, "$1[redacted]")
-    .replace(/(\b--?(?:password|passwd|token|secret|api-key|access-token|client-secret)(?:=|\s+))(?:'[^']*'|"[^"]*"|[^\s;&|]+)/giu, "$1[redacted]")
+    .replace(/((?<![\p{L}\p{N}_])--?(?:password|passwd|token|secret|api-key|access-token|client-secret)(?:=|\s+))(?:'[^']*'|"[^"]*"|[^\s;&|]+)/giu, "$1[redacted]")
     .replace(/\b(https?:\/\/[^:/\s]+:)[^@/\s]+(@)/giu, "$1[redacted]$2")
     .replace(/\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b/gu, "[redacted token]");
 }
