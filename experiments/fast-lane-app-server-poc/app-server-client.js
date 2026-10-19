@@ -20,6 +20,7 @@ class AppServerClient extends EventEmitter {
     spawnProcess = spawn,
     command = "codex",
     initialThreadId = null,
+    sandbox,
     onThreadId = async () => {},
     onApproval = async (method) => defaultApproval(method),
     rpcTimeoutMs = RPC_TIMEOUT_MS,
@@ -27,9 +28,13 @@ class AppServerClient extends EventEmitter {
     interruptGraceMs = INTERRUPT_GRACE_MS,
   } = {}) {
     super();
+    if (sandbox !== undefined && sandbox !== "read-only") {
+      throw new TypeError("Vesper app-server sandbox override must be read-only.");
+    }
     this.spawnProcess = spawnProcess;
     this.command = command;
     this.threadId = initialThreadId;
+    this.sandbox = sandbox;
     this.threadReady = false;
     this.onThreadId = onThreadId;
     this.onApproval = onApproval;
@@ -181,12 +186,22 @@ class AppServerClient extends EventEmitter {
     return true;
   }
 
+  async resumeThread(cwd) {
+    if (!this.threadId) throw new Error("There is no saved Codex thread to resume.");
+    if (this.activeTurn || this.startingTurn) throw new Error("Cannot reconnect while a Codex turn is active or starting.");
+    await this.connect(cwd);
+    await this.ensureThread(cwd);
+    return this.threadId;
+  }
+
   async ensureThread(cwd) {
     if (this.threadReady) return;
 
     if (this.threadId) {
       this.emit("progress", { type: "thread_resuming" });
-      const response = await this.request("thread/resume", { threadId: this.threadId });
+      const params = { threadId: this.threadId };
+      if (this.sandbox !== undefined) params.sandbox = this.sandbox;
+      const response = await this.request("thread/resume", params);
       const resumedId = response?.thread?.id;
       if (resumedId !== this.threadId) throw new Error("Codex app-server resumed a different thread than the saved Vesper session.");
       const serverCwd = response?.cwd;
@@ -200,7 +215,9 @@ class AppServerClient extends EventEmitter {
     }
 
     this.emit("progress", { type: "thread_starting" });
-    const response = await this.request("thread/start", { cwd });
+    const params = { cwd };
+    if (this.sandbox !== undefined) params.sandbox = this.sandbox;
+    const response = await this.request("thread/start", params);
     const threadId = response?.thread?.id;
     if (typeof threadId !== "string" || !threadId) throw new Error("Codex app-server did not return a thread id.");
     if (typeof response?.cwd !== "string" || !samePath(response.cwd, cwd)) {
@@ -596,7 +613,8 @@ class AppServerClient extends EventEmitter {
   }
 
   handleExit(error, generation) {
-    if (generation !== this.connectionGeneration) return;
+    if (generation !== this.connectionGeneration || !this.child) return;
+    if (!this.disposed) this.emit("progress", { type: "disconnected", reason: safeErrorMessage(error) });
     const child = this.child;
     this.child = undefined;
     this.readyPromise = undefined;

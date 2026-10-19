@@ -7,6 +7,7 @@ const path = require("node:path");
 
 const SESSION_SCHEMA_VERSION = 1;
 const MAX_SESSION_FILE_BYTES = 16_384;
+const MAX_PROJECT_SESSION_SCAN = 10_000;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SESSION_KEYS = new Set(["schemaVersion", "sessionId", "cwd", "threadId", "createdAt", "updatedAt"]);
 
@@ -58,6 +59,30 @@ class SessionStore {
     } finally {
       if (descriptor !== undefined) fs.closeSync(descriptor);
     }
+  }
+
+  findLatestByCwd(cwd) {
+    if (typeof cwd !== "string" || !path.isAbsolute(cwd) || /[\u0000-\u001f\u007f]/u.test(cwd)) {
+      throw new TypeError("Session project directory must be an absolute path.");
+    }
+    this.ensureDirectory();
+    const files = fs.readdirSync(this.directory)
+      .filter((name) => /^[0-9a-f-]{36}\.json$/iu.test(name));
+    if (files.length > MAX_PROJECT_SESSION_SCAN) {
+      throw new Error("Too many Vesper sessions to safely find this project conversation.");
+    }
+
+    let latest;
+    for (const name of files) {
+      const sessionId = name.slice(0, -5);
+      const session = this.load(sessionId);
+      if (path.resolve(session.cwd) !== path.resolve(cwd)) continue;
+      if (!latest || Date.parse(session.updatedAt) > Date.parse(latest.updatedAt) ||
+          (session.updatedAt === latest.updatedAt && session.sessionId > latest.sessionId)) {
+        latest = session;
+      }
+    }
+    return latest || null;
   }
 
   update(sessionId, changes) {

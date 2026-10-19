@@ -155,6 +155,21 @@ test("resumes the saved thread and never silently replaces it with a new one", a
   assert.equal(server.requests.find((request) => request.method === "turn/start").params.threadId, "saved-thread");
 });
 
+test("explicit reconnect resumes the saved thread under a read-only sandbox without starting a replacement", async (t) => {
+  const server = new FakeAppServerProcess();
+  server.cwd = "/workspace/project";
+  const { client } = createClient(server, { initialThreadId: "saved-thread", sandbox: "read-only" });
+  t.after(() => client.dispose());
+
+  assert.equal(await client.resumeThread("/workspace/project"), "saved-thread");
+  assert.deepEqual(server.requests.find((request) => request.method === "thread/resume").params, {
+    threadId: "saved-thread",
+    sandbox: "read-only",
+  });
+  assert.equal(server.requests.some((request) => request.method === "thread/start"), false);
+  assert.throws(() => new AppServerClient({ sandbox: "workspace-write" }), /must be read-only/u);
+});
+
 test("a failed resume stops instead of silently starting a fresh conversation", async (t) => {
   const server = new FakeAppServerProcess();
   server.receive = function (message) {

@@ -62,3 +62,31 @@ test("session ids, thread ids, and project paths are validated", (t) => {
   const session = store.create("/workspace/project");
   assert.throws(() => store.update(session.sessionId, { threadId: "bad\nthread" }), /Invalid Vesper session metadata/u);
 });
+
+test("project lookup restores the most recently used exact canonical project session", (t) => {
+  const root = temporaryRoot(t);
+  let now = new Date("2026-10-19T12:00:00.000Z");
+  const store = new SessionStore({ directory: path.join(root, "sessions"), now: () => now });
+  const first = store.create("/workspace/project");
+  const otherProject = store.create("/workspace/other");
+  now = new Date("2026-10-19T12:01:00.000Z");
+  const recent = store.create("/workspace/project");
+  store.update(recent.sessionId, { threadId: "codex-thread-recent" });
+
+  assert.equal(store.findLatestByCwd("/workspace/project").sessionId, recent.sessionId);
+  assert.equal(store.findLatestByCwd("/workspace/project").threadId, "codex-thread-recent");
+  assert.equal(store.findLatestByCwd("/workspace/other").sessionId, otherProject.sessionId);
+  assert.equal(store.findLatestByCwd("/workspace/moved-project"), null);
+  assert.equal(store.load(first.sessionId).threadId, null);
+});
+
+test("project lookup refuses malformed session metadata instead of silently creating a replacement", (t) => {
+  const root = temporaryRoot(t);
+  const directory = path.join(root, "sessions");
+  const store = new SessionStore({ directory });
+  const session = store.create("/workspace/project");
+  fs.writeFileSync(path.join(directory, `${session.sessionId}.json`), "{ malformed", { mode: 0o600 });
+
+  assert.throws(() => store.findLatestByCwd("/workspace/project"), /invalid JSON/u);
+  assert.throws(() => store.findLatestByCwd("relative/project"), /absolute path/u);
+});

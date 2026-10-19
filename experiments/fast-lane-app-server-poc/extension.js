@@ -1,38 +1,48 @@
 const vscode = require("vscode");
-const { execFile, spawn } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
+const path = require("node:path");
 const { performance } = require("node:perf_hooks");
+const { AppServerClient } = require("./app-server-client");
 const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
+const { SessionStore } = require("./session-store");
+const { resolveProjectDirectory } = require("./cli");
 
-const APP_SERVER_TIMEOUT_MS = 20_000;
-const TURN_TIMEOUT_MS = 5 * 60_000;
+const MAX_PROMPT_LENGTH = 32 * 1024;
 
 let output;
 let appServer;
+let appServerSessionId;
 let panel;
 let requestSequence = 0;
 let localHandlers;
 let routeMetrics;
+let sessionStore;
+let selectedWorkspacePath;
+let selectedWorkspaceName;
+let selectedSession;
+let sessionLookupError;
+let sessionView = { state: "unavailable", text: "Select an available workspace folder.", blocked: true };
+let projectGeneration = 0;
+let activeCodexRequestId;
+let activeRequestType;
 
 function activate(context) {
-  output = vscode.window.createOutputChannel("Fast Lane PoC");
-  appServer = new AppServerClient(writeLog);
+  output = vscode.window.createOutputChannel("Vesper");
+  sessionStore = new SessionStore();
   localHandlers = createLocalHandlers({ runGit: runGitCommand });
   routeMetrics = new RouteMetrics();
 
   context.subscriptions.push(
     output,
-    vscode.commands.registerCommand("fastLane.openPanel", () => openPanel(context))
+    vscode.commands.registerCommand("fastLane.openPanel", () => openPanel(context)),
+    { dispose: () => disposeCurrentAppServer() }
   );
-
-  context.subscriptions.push({
-    dispose: () => appServer.dispose(),
-  });
 }
 
 function deactivate() {
-  if (appServer) appServer.dispose();
+  disposeCurrentAppServer();
 }
 
 function openPanel(context) {
@@ -43,41 +53,69 @@ function openPanel(context) {
 
   panel = vscode.window.createWebviewPanel(
     "fastLanePanel",
-    "Fast Lane PoC",
+    "Vesper",
     vscode.ViewColumn.Beside,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: false,
-    }
+    { enableScripts: true, retainContextWhenHidden: false }
   );
+  const currentPanel = panel;
   panel.webview.html = getHtml(panel.webview);
 
   panel.onDidDispose(() => {
-    panel = undefined;
+    if (panel === currentPanel) panel = undefined;
   }, null, context.subscriptions);
 
   panel.webview.onDidReceiveMessage(async (message) => {
     if (message?.type === "ready") {
-      panel?.webview.postMessage({
-        type: "status",
-        text: "Ready · local checks stay local; Codex connects when a fallback is sent",
-      });
+      ensureInitialProjectSelection();
+      postToPanel(currentPanel, projectMessage());
+      loadSelectedSession();
+      postSessionView(currentPanel);
+      if (activeCodexRequestId !== undefined) {
+        postToPanel(currentPanel, { type: "status", text: "A Vesper task is still active for this project." });
+        postToPanel(currentPanel, { type: "active-request", requestId: activeCodexRequestId, kind: activeRequestType });
+      }
       return;
     }
 
     if (message?.type === "submit" && typeof message.text === "string") {
-      await handlePrompt(message.text);
+      await handlePrompt(message.text, currentPanel);
+      return;
+    }
+
+    if (message?.type === "select-project") {
+      await selectProject(currentPanel);
+      return;
+    }
+
+    if (message?.type === "retry-resume") {
+      await retryResume(currentPanel);
+      return;
+    }
+
+    if (message?.type === "start-new-session") {
+      startNewSession(currentPanel);
+      return;
+    }
+
+    if (message?.type === "interrupt" && Number.isSafeInteger(message.requestId)) {
+      await interruptRequest(message.requestId, currentPanel);
     }
   }, undefined, context.subscriptions);
 }
 
-async function handlePrompt(prompt) {
+async function handlePrompt(prompt, targetPanel = panel) {
+  if (typeof prompt !== "string" || !prompt.trim() || prompt.length > MAX_PROMPT_LENGTH) {
+    postToPanel(targetPanel, { type: "input-error", text: `Enter a task between 1 and ${MAX_PROMPT_LENGTH.toLocaleString()} characters.` });
+    return;
+  }
+  if (activeCodexRequestId !== undefined) return;
   const requestId = ++requestSequence;
   const startedAt = performance.now();
-  const cwd = activeWorkspacePath();
+  const project = selectedProjectContext();
+  const cwd = project.available ? project.path : undefined;
   const decision = classifyRequest(prompt);
 
-  panel?.webview.postMessage({ type: "user-message", text: prompt });
+  postToPanel(targetPanel, { type: "user-message", text: prompt });
   writeLog(`request=${requestId} route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"}`);
 
   if (decision.route === "local") {
@@ -86,73 +124,447 @@ async function handlePrompt(prompt) {
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs, result.status === "unavailable");
     if (result.status === "unavailable") {
-      panel?.webview.postMessage({
-        type: "error",
-        label: "Local check unavailable",
-        text: result.summary,
-        result,
-        elapsedMs,
+      postToPanel(targetPanel, {
+        type: "error", label: "Local check unavailable", text: result.summary, result, elapsedMs,
       });
     } else {
-      panel?.webview.postMessage({ type: "local-answer", text: result.summary, result, elapsedMs });
+      postToPanel(targetPanel, { type: "local-answer", text: result.summary, result, elapsedMs });
     }
     return;
   }
 
   writeLog(`request=${requestId} event=request_submitted reason=${decision.reason}`);
-  if (!cwd) {
-    const elapsedMs = Math.round(performance.now() - startedAt);
-    recordRouteMetrics(requestId, decision, elapsedMs);
-    panel?.webview.postMessage({
-      type: "error",
-      label: "Fast Lane",
-      text: "Open a workspace folder before sending a prompt to Codex.",
-      elapsedMs,
+  if (!project.available) {
+    setSessionView(targetPanel, {
+      state: "unavailable",
+      text: "The selected workspace folder is unavailable. Its saved session was kept; choose that folder again if it returns.",
+      blocked: true,
+    });
+    postToPanel(targetPanel, {
+      type: "input-error",
+      text: "The selected workspace folder is unavailable. Choose an open folder before sending a Codex task.",
     });
     return;
   }
+  if (sessionLookupError) {
+    postToPanel(targetPanel, {
+      type: "input-error",
+      text: `Saved sessions could not be checked: ${safeMessage(sessionLookupError)}. The saved session was left unchanged.`,
+    });
+    return;
+  }
+  if (sessionView.blocked) {
+    postToPanel(targetPanel, { type: "input-error", text: sessionView.text });
+    return;
+  }
 
-  panel?.webview.postMessage({ type: "assistant-start" });
-  const onDelta = (delta) => panel?.webview.postMessage({ type: "assistant-delta", text: delta });
+  try {
+    if (!selectedSession) {
+      selectedSession = sessionStore.create(cwd);
+      sessionView = {
+        state: "new",
+        text: "New Vesper session created. Codex will start a read-only thread for this folder.",
+        blocked: false,
+      };
+      postSessionView(targetPanel);
+    }
+  } catch (error) {
+    postToPanel(targetPanel, { type: "input-error", text: `Vesper could not save session metadata: ${safeMessage(error)}` });
+    return;
+  }
+
+  const session = selectedSession;
+  const generation = projectGeneration;
+  const client = appServerForSession(session, cwd, generation);
+  activeCodexRequestId = requestId;
+  activeRequestType = "turn";
+  postToPanel(targetPanel, { type: "assistant-start", requestId });
+  if (session.threadId && !client.threadReady) {
+    setSessionView(targetPanel, {
+      state: "restoring",
+      text: "Restoring the saved Codex thread…",
+      blocked: false,
+    });
+  } else if (client.threadReady) {
+    setSessionView(targetPanel, {
+      state: "connected",
+      text: "Connected · using the active Vesper session.",
+      blocked: false,
+    });
+  } else {
+    setSessionView(targetPanel, {
+      state: "connecting",
+      text: "Connecting to Codex and starting this Vesper session…",
+      blocked: false,
+    });
+  }
+
+  const onDelta = (delta) => {
+    if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      postToPanel(targetPanel, { type: "assistant-delta", requestId, text: delta });
+    }
+  };
   try {
     const routed = await routeRequest(prompt, {
       decision,
       handlers: localHandlers,
       context: { cwd },
-      fallback: () => appServer.runCodexTurn(prompt, cwd, requestId, onDelta),
+      fallback: () => client.runTurn({ prompt, cwd, onDelta }),
     });
     const result = routed.fallbackResult;
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs);
-    writeLog(`request=${requestId} fallback=completed elapsed_ms=${elapsedMs} status=${result.status} usage=${result.usageSeen ? "reported" : "not-reported"}`);
-    panel?.webview.postMessage({
-      type: "assistant-done",
-      elapsedMs,
-      usage: result.usageSeen ? "usage reported in Output" : "usage not reported",
-    });
+    writeLog(`request=${requestId} fallback=completed elapsed_ms=${elapsedMs} status=${result.status}`);
+    if (result.status === "interrupted" || result.status === "timeout") {
+      postToPanel(targetPanel, {
+        type: "assistant-error", requestId, state: result.status,
+        text: result.status === "timeout" ? "Codex turn timed out." : "Turn interrupted.", elapsedMs,
+      });
+    } else {
+      postToPanel(targetPanel, { type: "assistant-done", requestId, elapsedMs, usage: "session saved" });
+    }
+    if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      setSessionView(targetPanel, { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false });
+    }
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs);
     writeLog(`request=${requestId} fallback=failed elapsed_ms=${elapsedMs} reason=${safeMessage(error)}`);
-    panel?.webview.postMessage({
+    const interrupted = error.turnStatus === "interrupted";
+    const terminalTurnState = ["failed", "interrupted"].includes(error.turnStatus);
+    if (!terminalTurnState) {
+      const canRetry = Boolean(client.threadId || session.threadId);
+      setSessionView(targetPanel, {
+        state: "recovery-required",
+        text: canRetry
+          ? "Connection failed before Vesper could confirm whether the task completed. The saved session identity was kept; reconnect before sending another task."
+          : "Codex did not confirm the new thread. Start a new conversation explicitly before sending another task.",
+        blocked: true,
+        canRetry,
+        canStartNew: true,
+      });
+    } else if (terminalTurnState) {
+      setSessionView(targetPanel, { state: "connected", text: "Connected · the saved conversation remains available.", blocked: false });
+    }
+    postToPanel(targetPanel, {
       type: "assistant-error",
-      text: `Codex fallback failed: ${safeMessage(error)}`,
+      requestId,
+      state: interrupted ? "interrupted" : "failed",
+      text: interrupted ? "Turn interrupted." : `Codex fallback failed: ${safeMessage(error)}`,
       elapsedMs,
     });
+  } finally {
+    if (activeCodexRequestId === requestId) {
+      activeCodexRequestId = undefined;
+      activeRequestType = undefined;
+    }
+  }
+}
+
+async function selectProject(targetPanel) {
+  if (activeCodexRequestId !== undefined) return;
+  if (typeof vscode.window.showWorkspaceFolderPick !== "function") {
+    postToPanel(targetPanel, { type: "status", text: "Project selection is unavailable in this VS Code version." });
+    return;
+  }
+
+  let picked;
+  try {
+    picked = await vscode.window.showWorkspaceFolderPick({ placeHolder: "Select the project for this conversation" });
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Project selection failed: ${safeMessage(error)}` });
+    return;
+  }
+  if (!picked) return;
+  const folder = workspaceFolders().find((candidate) => candidate === picked || candidate?.uri?.fsPath === picked?.uri?.fsPath);
+  if (!folder) {
+    postToPanel(targetPanel, { type: "status", text: "That folder is no longer in the open VS Code workspace." });
+    postToPanel(targetPanel, projectMessage());
+    return;
+  }
+
+  selectWorkspaceFolder(folder);
+  postToPanel(targetPanel, projectMessage());
+  loadSelectedSession();
+  postSessionView(targetPanel);
+}
+
+async function retryResume(targetPanel) {
+  if (activeCodexRequestId !== undefined || !sessionView.canRetry) return;
+  const project = selectedProjectContext();
+  if (!project.available || !selectedSession?.threadId) return;
+
+  const requestId = ++requestSequence;
+  const session = selectedSession;
+  const generation = projectGeneration;
+  const client = appServerForSession(session, project.path, generation);
+  activeCodexRequestId = requestId;
+  activeRequestType = "recovery";
+  postToPanel(targetPanel, { type: "recovery-start" });
+  setSessionView(targetPanel, { state: "restoring", text: "Verifying the saved Codex thread…", blocked: true });
+  try {
+    await client.resumeThread(project.path);
+    if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      setSessionView(targetPanel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
+    }
+  } catch (error) {
+    if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      setSessionView(targetPanel, {
+        state: "recovery-required",
+        text: `Could not reconnect to the saved conversation: ${safeMessage(error)}. The saved session was kept. Retry or explicitly start a new conversation.`,
+        blocked: true,
+        canRetry: Boolean(client.threadId),
+        canStartNew: true,
+      });
+    }
+  } finally {
+    if (activeCodexRequestId === requestId) {
+      activeCodexRequestId = undefined;
+      activeRequestType = undefined;
+    }
+    postToPanel(targetPanel, { type: "recovery-finished" });
+  }
+}
+
+function startNewSession(targetPanel) {
+  if (activeCodexRequestId !== undefined) return;
+  const project = selectedProjectContext();
+  if (!project.available) {
+    postToPanel(targetPanel, { type: "status", text: "The selected workspace folder is unavailable; no session was changed." });
+    return;
+  }
+  try {
+    const previousSessionId = selectedSession?.sessionId;
+    disposeCurrentAppServer();
+    selectedSession = sessionStore.create(project.path);
+    sessionLookupError = undefined;
+    sessionView = {
+      state: "new",
+      text: previousSessionId
+        ? "A new Vesper session was created. The previous saved session was retained."
+        : "New Vesper session created. Codex will start a read-only thread for this folder.",
+      blocked: false,
+    };
+    postSessionView(targetPanel);
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Could not create a new Vesper session: ${safeMessage(error)}` });
+    postSessionView(targetPanel);
+  }
+}
+
+async function interruptRequest(requestId, targetPanel) {
+  if (requestId !== activeCodexRequestId || !appServer) return;
+  try {
+    const accepted = await appServer.interrupt();
+    if (accepted && requestId === activeCodexRequestId) {
+      postToPanel(targetPanel, { type: "interrupt-requested", requestId });
+    }
+  } catch (error) {
+    if (requestId === activeCodexRequestId) {
+      postToPanel(targetPanel, { type: "assistant-interrupt-error", requestId, text: safeMessage(error) });
+    }
+  }
+}
+
+function appServerForSession(session, cwd, generation) {
+  if (appServer && appServerSessionId === session.sessionId) return appServer;
+  disposeCurrentAppServer();
+  const sessionId = session.sessionId;
+  const client = new AppServerClient({
+    initialThreadId: session.threadId,
+    sandbox: "read-only",
+    onThreadId: async (threadId) => {
+      const latest = sessionStore.load(sessionId);
+      if (latest.cwd !== cwd) throw new Error("The Vesper session belongs to a different project folder.");
+      if (latest.threadId && latest.threadId !== threadId) {
+        throw new Error("This Vesper session is already bound to another Codex thread.");
+      }
+      const saved = sessionStore.update(sessionId, { threadId });
+      if (selectedSession?.sessionId === sessionId && projectGeneration === generation) selectedSession = saved;
+    },
+    onApproval: async (method) => {
+      if (method === "item/permissions/requestApproval") return { permissions: {}, scope: "turn" };
+      if (method === "applyPatchApproval" || method === "execCommandApproval") {
+        return { decision: { denied: { rejection: "Vesper VS Code does not grant approvals." } } };
+      }
+      return { decision: "decline" };
+    },
+  });
+  client.on("progress", (event) => {
+    if (appServer !== client || appServerSessionId !== sessionId || projectGeneration !== generation ||
+        selectedSession?.sessionId !== sessionId) return;
+    if (event.type === "thread_resuming") {
+      setSessionView(panel, { state: "restoring", text: "Restoring the saved Codex thread…", blocked: false });
+    } else if (event.type === "thread_resumed") {
+      setSessionView(panel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
+    } else if (event.type === "thread_starting") {
+      setSessionView(panel, { state: "connecting", text: "Starting a new read-only Codex thread…", blocked: false });
+    } else if (event.type === "thread_started") {
+      setSessionView(panel, { state: "connected", text: "Connected · new conversation started.", blocked: false });
+    } else if (event.type === "disconnected") {
+      setSessionView(panel, {
+        state: "disconnected",
+        text: "Codex disconnected. The saved session is kept; reconnect before sending another task.",
+        blocked: true,
+        canRetry: Boolean(client.threadId),
+        canStartNew: true,
+      });
+    } else if (event.type === "turn_started" && event.threadId === client.threadId && isSafeProtocolIdentity(event.turnId) &&
+        activeCodexRequestId !== undefined) {
+      postToPanel(panel, {
+        type: "assistant-running",
+        requestId: activeCodexRequestId,
+        threadId: event.threadId,
+        turnId: event.turnId,
+        status: "inProgress",
+      });
+    }
+  });
+  appServer = client;
+  appServerSessionId = sessionId;
+  return client;
+}
+
+function disposeCurrentAppServer() {
+  const previous = appServer;
+  appServer = undefined;
+  appServerSessionId = undefined;
+  previous?.dispose();
+}
+
+function isCurrentRequest(requestId, client, sessionId, generation) {
+  const project = selectedProjectContext();
+  return activeCodexRequestId === requestId && appServer === client && appServerSessionId === sessionId &&
+    projectGeneration === generation && selectedSession?.sessionId === sessionId && project.available;
+}
+
+function ensureInitialProjectSelection() {
+  if (selectedWorkspacePath !== undefined) return;
+  const folders = workspaceFolders();
+  const activeUri = vscode.window.activeTextEditor?.document?.uri;
+  const activeFolder = activeUri ? vscode.workspace.getWorkspaceFolder(activeUri) : undefined;
+  const folder = folders.includes(activeFolder) ? activeFolder : folders[0];
+  if (folder) selectWorkspaceFolder(folder);
+}
+
+function selectWorkspaceFolder(folder) {
+  const rawPath = folder?.uri?.fsPath;
+  if (typeof rawPath !== "string" || !rawPath) return;
+  disposeCurrentAppServer();
+  projectGeneration += 1;
+  selectedWorkspaceName = typeof folder.name === "string" ? folder.name : "";
+  try {
+    selectedWorkspacePath = resolveProjectDirectory(rawPath);
+  } catch {
+    selectedWorkspacePath = path.resolve(rawPath);
+  }
+  selectedSession = undefined;
+  sessionLookupError = undefined;
+}
+
+function selectedProjectContext() {
+  ensureInitialProjectSelection();
+  if (!selectedWorkspacePath) return { path: "", name: "", available: false };
+  const folder = workspaceFolders().find((candidate) => {
+    try {
+      return resolveProjectDirectory(candidate?.uri?.fsPath) === selectedWorkspacePath;
+    } catch {
+      return false;
+    }
+  });
+  if (!folder) {
+    return { path: selectedWorkspacePath, name: selectedWorkspaceName || path.basename(selectedWorkspacePath), available: false };
+  }
+  return {
+    path: selectedWorkspacePath,
+    name: typeof folder.name === "string" ? folder.name : selectedWorkspaceName || path.basename(selectedWorkspacePath),
+    folder,
+    available: true,
+  };
+}
+
+function projectMessage() {
+  const project = selectedProjectContext();
+  return {
+    type: "project",
+    name: project.name,
+    path: project.path,
+    available: project.available,
+  };
+}
+
+function loadSelectedSession() {
+  const project = selectedProjectContext();
+  selectedSession = undefined;
+  sessionLookupError = undefined;
+  if (!project.available) {
+    sessionView = {
+      state: "unavailable",
+      text: "This workspace folder is unavailable. Choose the same folder again if it returns, or select another project explicitly.",
+      blocked: true,
+    };
+    return;
+  }
+  try {
+    selectedSession = sessionStore.findLatestByCwd(project.path);
+    if (!selectedSession) {
+      sessionView = {
+        state: "new",
+        text: "No saved conversation for this folder. A Vesper session will be created when you send a Codex task.",
+        blocked: false,
+      };
+    } else if (selectedSession.threadId) {
+      sessionView = appServer?.threadReady && appServerSessionId === selectedSession.sessionId
+        ? { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false }
+        : {
+          state: "saved",
+          text: "Saved conversation found. Vesper will verify the same Codex thread before continuing.",
+          blocked: false,
+        };
+    } else {
+      sessionView = {
+        state: "new",
+        text: "Saved Vesper session found without a Codex thread. Sending a task will start its first read-only thread.",
+        blocked: false,
+      };
+    }
+  } catch (error) {
+    sessionLookupError = error;
+    sessionView = {
+      state: "unavailable",
+      text: `Saved sessions could not be checked: ${safeMessage(error)}. No replacement was created.`,
+      blocked: true,
+      canStartNew: true,
+    };
+  }
+}
+
+function postSessionView(targetPanel) {
+  postToPanel(targetPanel, { type: "session-state", ...sessionView });
+}
+
+function setSessionView(targetPanel, view) {
+  sessionView = view;
+  postSessionView(targetPanel);
+}
+
+function workspaceFolders() {
+  return vscode.workspace.workspaceFolders || [];
+}
+
+function postToPanel(targetPanel, message) {
+  const destination = panel || targetPanel;
+  if (!destination?.webview) return;
+  try {
+    void Promise.resolve(destination.webview.postMessage(message)).catch(() => {});
+  } catch {
+    // The webview may have been disposed during a panel close or reload.
   }
 }
 
 function recordRouteMetrics(requestId, decision, elapsedMs, handlerFailed = false) {
   const metrics = routeMetrics.record(decision, elapsedMs, { handlerFailed });
   writeLog(`request=${requestId} event=route_metric route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"} route_latency_ms=${metrics.routeLatencyMs} local_routes=${metrics.localRouteCount} fallback_routes=${metrics.fallbackCount} handler_failures=${metrics.handlerFailureCount}`);
-}
-
-function activeWorkspacePath() {
-  const folders = vscode.workspace.workspaceFolders || [];
-  const activeUri = vscode.window.activeTextEditor?.document?.uri;
-  const activeFolder = activeUri ? vscode.workspace.getWorkspaceFolder(activeUri) : undefined;
-  const folder = activeFolder || folders[0];
-  return folder?.uri?.fsPath;
 }
 
 function runGitCommand(args, cwd) {
@@ -175,327 +587,6 @@ function runGitCommand(args, cwd) {
   });
 }
 
-class AppServerClient {
-  constructor(log) {
-    this.log = log;
-    this.child = undefined;
-    this.readyPromise = undefined;
-    this.threadId = undefined;
-    this.nextRpcId = 1;
-    this.pending = new Map();
-    this.stdoutBuffer = "";
-    this.activeTurn = undefined;
-    this.disposed = false;
-  }
-
-  connect() {
-    if (this.readyPromise) return this.readyPromise;
-    if (this.disposed) return Promise.reject(new Error("App-server client is disposed."));
-
-    this.log("app-server spawn codex app-server --listen stdio://");
-    this.child = spawn("codex", ["app-server", "--listen", "stdio://"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    this.child.stdout.setEncoding("utf8");
-    this.child.stderr.setEncoding("utf8");
-    this.child.stdout.on("data", (chunk) => this.handleStdout(chunk));
-    this.child.stderr.on("data", (chunk) => {
-      const text = String(chunk).trim();
-      if (text) this.log(`app-server stderr received chars=${text.length}`);
-    });
-    this.child.on("error", (error) => this.handleExit(error));
-    this.child.on("close", (code, signal) => {
-      this.handleExit(new Error(`Codex app-server exited (code=${code}, signal=${signal || "none"}).`));
-    });
-
-    this.readyPromise = this.request("initialize", {
-      clientInfo: {
-        name: "fast_lane_vscode_poc",
-        title: "Fast Lane VS Code PoC",
-        version: "0.1.0",
-      },
-    }, APP_SERVER_TIMEOUT_MS).then(() => {
-      this.write({ method: "initialized", params: {} }, "initialized");
-      this.log("app-server initialized");
-      return true;
-    }).catch((error) => {
-      this.readyPromise = undefined;
-      throw error;
-    });
-
-    return this.readyPromise;
-  }
-
-  async runCodexTurn(prompt, cwd, requestId, onDelta) {
-    await this.connect();
-
-    if (!this.threadId) {
-      this.log(`request=${requestId} rpc=thread/start`);
-      const result = await this.request("thread/start", {
-        cwd,
-        sandbox: "read-only",
-      }, APP_SERVER_TIMEOUT_MS);
-      this.threadId = result?.thread?.id;
-      if (!this.threadId) throw new Error("App-server did not return a thread id.");
-    }
-
-    let completeResolve;
-    let completeReject;
-    const completion = new Promise((resolve, reject) => {
-      completeResolve = resolve;
-      completeReject = reject;
-    });
-    let activeTurn;
-    const timer = setTimeout(() => {
-      if (this.activeTurn === activeTurn) {
-        this.log(`request=${requestId} event=turn_timeout elapsed_ms=${Math.round(performance.now() - activeTurn.startedAt)}`);
-        this.activeTurn = undefined;
-        completeReject(new Error("Codex turn timed out."));
-      }
-    }, TURN_TIMEOUT_MS);
-
-    activeTurn = {
-      requestId,
-      threadId: this.threadId,
-      onDelta,
-      startedAt: performance.now(),
-      firstServerEventLogged: false,
-      deltaCount: 0,
-      deltaChars: 0,
-      resolve: (value) => {
-        clearTimeout(timer);
-        this.activeTurn = undefined;
-        completeResolve(value);
-      },
-      reject: (error) => {
-        clearTimeout(timer);
-        this.activeTurn = undefined;
-        completeReject(error);
-      },
-      usageSeen: false,
-    };
-    this.activeTurn = activeTurn;
-
-    this.log(`request=${requestId} rpc=turn/start`);
-    try {
-      await this.request("turn/start", {
-        threadId: this.threadId,
-        cwd,
-        input: [{ type: "text", text: prompt }],
-      }, APP_SERVER_TIMEOUT_MS);
-    } catch (error) {
-      this.activeTurn?.reject(error);
-      throw error;
-    }
-
-    return completion;
-  }
-
-  request(method, params, timeoutMs) {
-    if (!this.child || this.child.killed || !this.child.stdin.writable) {
-      return Promise.reject(new Error("Codex app-server is not connected."));
-    }
-
-    const id = this.nextRpcId++;
-    const requestedAt = performance.now();
-    const timeout = setTimeout(() => {
-      const entry = this.pending.get(id);
-      if (entry) {
-        this.pending.delete(id);
-        this.log(`rpc timeout id=${id} method=${method} elapsed_ms=${Math.round(performance.now() - requestedAt)}`);
-        entry.reject(new Error(`Timed out waiting for app-server response to ${method}.`));
-      }
-    }, timeoutMs);
-
-    const promise = new Promise((resolve, reject) => {
-      this.pending.set(id, {
-        method,
-        resolve: (value) => {
-          clearTimeout(timeout);
-          resolve(value);
-        },
-        reject: (error) => {
-          clearTimeout(timeout);
-          reject(error);
-        },
-      });
-    });
-
-    try {
-      this.write({ method, id, params }, `request id=${id} method=${method}`);
-    } catch (error) {
-      const entry = this.pending.get(id);
-      this.pending.delete(id);
-      entry?.reject(error);
-      this.log(`rpc request write failed id=${id} method=${method} reason=${safeMessage(error)}`);
-    }
-    return promise;
-  }
-
-  write(message, label) {
-    if (!this.child?.stdin?.writable) throw new Error("Codex app-server stdin is unavailable.");
-    if (label) this.log(`rpc --> ${label}`);
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
-  }
-
-  handleStdout(chunk) {
-    this.stdoutBuffer += chunk;
-    let newline;
-    while ((newline = this.stdoutBuffer.indexOf("\n")) >= 0) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      if (!line) continue;
-
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        this.log(`app-server emitted non-JSON stdout chars=${line.length}`);
-        continue;
-      }
-
-      if (Object.prototype.hasOwnProperty.call(message, "id") && typeof message.method === "string") {
-        this.handleServerRequest(message);
-        continue;
-      }
-
-      if (Object.prototype.hasOwnProperty.call(message, "id")) {
-        const pending = this.pending.get(message.id);
-        if (!pending) {
-          this.log(`rpc <-- unmatched response id=${message.id}`);
-          continue;
-        }
-        this.pending.delete(message.id);
-        if (message.error) {
-          const error = new Error(message.error.message || JSON.stringify(message.error));
-          this.log(`rpc <-- id=${message.id} method=${pending.method} error=${safeMessage(error)}`);
-          pending.reject(error);
-        } else {
-          this.log(`rpc <-- id=${message.id} method=${pending.method} ok`);
-          pending.resolve(message.result || {});
-        }
-        continue;
-      }
-
-      this.handleNotification(message.method, message.params || {});
-    }
-  }
-
-  handleServerRequest(message) {
-    const { id, method } = message;
-    this.noteTurnServerEvent(method);
-    this.log(`rpc <-- server request id=${id} method=${method}`);
-
-    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
-      this.respondToServerRequest(
-        { id, result: { decision: "decline" } },
-        `server response id=${id} method=${method} decision=decline`
-      );
-      return;
-    }
-
-    if (method === "applyPatchApproval" || method === "execCommandApproval") {
-      this.respondToServerRequest(
-        { id, result: { decision: { denied: { rejection: "Fast Lane PoC does not grant approvals." } } } },
-        `server response id=${id} method=${method} decision=deny`
-      );
-      return;
-    }
-
-    const error = new Error(`Fast Lane PoC does not support app-server request ${method}.`);
-    if (this.respondToServerRequest(
-      { id, error: { code: -32601, message: error.message } },
-      `server response id=${id} method=${method} error=unsupported`
-    )) {
-      this.activeTurn?.reject(error);
-    }
-  }
-
-  respondToServerRequest(message, label) {
-    try {
-      this.write(message, label);
-      return true;
-    } catch (error) {
-      this.log(`rpc server response failed reason=${safeMessage(error)}`);
-      this.activeTurn?.reject(error);
-      return false;
-    }
-  }
-
-  noteTurnServerEvent(method) {
-    const activeTurn = this.activeTurn;
-    if (!activeTurn || activeTurn.firstServerEventLogged) return;
-    activeTurn.firstServerEventLogged = true;
-    this.log(`request=${activeTurn.requestId} event=first_server_event method=${method} elapsed_ms=${Math.round(performance.now() - activeTurn.startedAt)}`);
-  }
-
-  handleNotification(method, params) {
-    this.noteTurnServerEvent(method);
-
-    if (method === "turn/started") {
-      this.log(`rpc <-- turn/started turn=${params.turn?.id || "unknown"}`);
-      return;
-    }
-
-    if (method === "item/agentMessage/delta") {
-      const delta = typeof params.delta === "string" ? params.delta : "";
-      if (this.activeTurn && delta) {
-        this.activeTurn.deltaCount += 1;
-        this.activeTurn.deltaChars += delta.length;
-        if (this.activeTurn.deltaCount === 1 || this.activeTurn.deltaCount % 25 === 0) {
-          this.log(`request=${this.activeTurn.requestId} event=assistant_delta count=${this.activeTurn.deltaCount} chars=${this.activeTurn.deltaChars} elapsed_ms=${Math.round(performance.now() - this.activeTurn.startedAt)}`);
-        }
-        this.activeTurn.onDelta(delta);
-      }
-      return;
-    }
-
-    if (method === "thread/tokenUsage/updated") {
-      if (this.activeTurn) this.activeTurn.usageSeen = true;
-      this.log(`rpc <-- thread/tokenUsage/updated ${JSON.stringify(params)}`);
-      return;
-    }
-
-    if (method === "turn/completed") {
-      const turn = params.turn || {};
-      const elapsedMs = this.activeTurn ? Math.round(performance.now() - this.activeTurn.startedAt) : 0;
-      this.log(`request=${this.activeTurn?.requestId || "unknown"} event=turn_completed status=${turn.status || "unknown"} elapsed_ms=${elapsedMs} deltas=${this.activeTurn?.deltaCount || 0} chars=${this.activeTurn?.deltaChars || 0}`);
-      if (!this.activeTurn) return;
-      if (turn.status === "completed") {
-        this.activeTurn.resolve({ status: turn.status, usageSeen: this.activeTurn.usageSeen });
-      } else {
-        const error = new Error(turn.error?.message || `Codex turn ended with status ${turn.status || "unknown"}.`);
-        this.log(`request=${this.activeTurn.requestId} event=turn_error reason=${safeMessage(error)}`);
-        this.activeTurn.reject(error);
-      }
-      return;
-    }
-
-    if (method) this.log(`rpc <-- notification method=${method}`);
-  }
-
-  handleExit(error) {
-    const message = safeMessage(error);
-    if (!this.disposed) this.log(`app-server connection ended: ${message}`);
-    for (const [id, pending] of this.pending) {
-      this.pending.delete(id);
-      pending.reject(error);
-    }
-    this.activeTurn?.reject(error);
-    this.child = undefined;
-    this.readyPromise = undefined;
-  }
-
-  dispose() {
-    this.disposed = true;
-    if (this.child && !this.child.killed) {
-      this.log("stopping Codex app-server");
-      this.child.kill();
-    }
-  }
-}
-
 function getHtml(webview) {
   const nonce = randomBytes(16).toString("hex");
   const csp = `default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';`;
@@ -505,13 +596,20 @@ function getHtml(webview) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="${csp}">
-  <title>Fast Lane PoC</title>
+  <title>Vesper</title>
   <style>
     body { color: var(--vscode-foreground); background: var(--vscode-editor-background); font: var(--vscode-font-size) var(--vscode-font-family); padding: 16px; }
     main { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; height: calc(100vh - 32px); gap: 12px; }
     header { border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 10px; }
     h1 { font-size: 18px; margin: 0 0 4px; }
     #status { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    #project-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+    #project-details { min-width: 0; flex: 1; }
+    #project-name { font-weight: 600; }
+    #project-path { color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
+    #session-state { color: var(--vscode-descriptionForeground); font-size: 12px; margin-top: 4px; }
+    #recovery-actions { display: flex; gap: 8px; margin-top: 8px; }
+    #recovery-actions[hidden], #retry-resume[hidden], #start-new-session[hidden] { display: none; }
     #messages { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
     article { border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     article.user { background: var(--vscode-textBlockQuote-background); }
@@ -520,19 +618,34 @@ function getHtml(webview) {
     form { display: flex; gap: 8px; align-items: stretch; }
     textarea { flex: 1; min-height: 56px; resize: vertical; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); padding: 8px; font: inherit; }
     button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; padding: 0 14px; cursor: pointer; }
+    #stop { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); min-height: 40px; }
+    #stop[hidden] { display: none; }
     button:disabled { opacity: 0.6; cursor: default; }
     footer { color: var(--vscode-descriptionForeground); font-size: 11px; }
   </style>
 </head>
 <body>
   <main>
-    <header><h1>Fast Lane</h1><div id="status">Starting…</div></header>
+    <header>
+      <h1>Vesper</h1>
+      <div id="project-row">
+        <div id="project-details"><div id="project-name">Loading project…</div><div id="project-path"></div></div>
+        <button id="choose-project" type="button">Choose project</button>
+      </div>
+      <div id="status">Starting…</div>
+      <div id="session-state" role="status">Checking saved Vesper sessions…</div>
+      <div id="recovery-actions" hidden>
+        <button id="retry-resume" type="button" hidden>Retry connection</button>
+        <button id="start-new-session" type="button" hidden>Start new conversation</button>
+      </div>
+    </header>
     <section id="messages" aria-live="polite"></section>
     <form id="form">
-      <textarea id="prompt" aria-label="Prompt" placeholder="Ask a developer question…" required></textarea>
+      <textarea id="prompt" aria-label="Prompt" placeholder="Ask a developer question…" maxlength="32768" required></textarea>
       <button id="send" type="submit">Send</button>
+      <button id="stop" type="button" hidden>Stop</button>
     </form>
-    <footer>Exact local route: “What Git branch am I on?” · Other prompts go to Codex.</footer>
+    <footer>Local Git and test checks stay local. Codex uses a read-only sandbox; Vesper declines approval requests.</footer>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
@@ -541,7 +654,17 @@ function getHtml(webview) {
     const form = document.getElementById('form');
     const prompt = document.getElementById('prompt');
     const send = document.getElementById('send');
+    const stop = document.getElementById('stop');
+    const chooseProject = document.getElementById('choose-project');
+    const projectName = document.getElementById('project-name');
+    const projectPath = document.getElementById('project-path');
+    const sessionState = document.getElementById('session-state');
+    const recoveryActions = document.getElementById('recovery-actions');
+    const retryResume = document.getElementById('retry-resume');
+    const startNewSession = document.getElementById('start-new-session');
     let activeAssistant;
+    let activeRequestId;
+    let sessionBlocked = false;
 
     function addMessage(kind, label, text) {
       const article = document.createElement('article');
@@ -559,9 +682,10 @@ function getHtml(webview) {
     }
 
     function setBusy(busy) {
-      send.disabled = busy;
-      prompt.disabled = busy;
-      if (!busy) prompt.focus();
+      send.disabled = busy || sessionBlocked;
+      prompt.disabled = busy || sessionBlocked;
+      chooseProject.disabled = busy;
+      if (!busy && !sessionBlocked) prompt.focus();
     }
 
     form.addEventListener('submit', (event) => {
@@ -578,9 +702,62 @@ function getHtml(webview) {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) form.requestSubmit();
     });
 
+    chooseProject.addEventListener('click', () => {
+      if (chooseProject.disabled) return;
+      vscode.postMessage({ type: 'select-project' });
+    });
+
+    retryResume.addEventListener('click', () => {
+      if (retryResume.disabled) return;
+      retryResume.disabled = true;
+      vscode.postMessage({ type: 'retry-resume' });
+    });
+
+    startNewSession.addEventListener('click', () => {
+      if (startNewSession.disabled) return;
+      startNewSession.disabled = true;
+      vscode.postMessage({ type: 'start-new-session' });
+    });
+
+    stop.addEventListener('click', () => {
+      if (activeRequestId === undefined || stop.disabled) return;
+      stop.disabled = true;
+      status.textContent = 'Interrupt requested · waiting for Codex turn state…';
+      vscode.postMessage({ type: 'interrupt', requestId: activeRequestId });
+    });
+
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       if (message.type === 'status') status.textContent = message.text;
+      if (message.type === 'project') {
+        projectName.textContent = message.available ? (message.name || 'Workspace folder') : (message.name ? message.name + ' · unavailable' : 'No workspace folder selected');
+        projectPath.textContent = message.path || 'Open a folder in VS Code to start a Codex task.';
+        projectPath.title = message.path || '';
+      }
+      if (message.type === 'session-state') {
+        sessionBlocked = Boolean(message.blocked);
+        sessionState.textContent = message.text || '';
+        retryResume.hidden = !message.canRetry;
+        startNewSession.hidden = !message.canStartNew;
+        recoveryActions.hidden = !message.canRetry && !message.canStartNew;
+        retryResume.disabled = false;
+        startNewSession.disabled = false;
+        if (activeRequestId === undefined) {
+          send.disabled = sessionBlocked;
+          prompt.disabled = sessionBlocked;
+        }
+      }
+      if (message.type === 'recovery-start') setBusy(true);
+      if (message.type === 'recovery-finished') setBusy(false);
+      if (message.type === 'active-request') {
+        activeRequestId = message.requestId;
+        setBusy(true);
+        if (message.kind === 'turn') {
+          activeAssistant = addMessage('assistant', 'Codex · task continued after panel reopen…', '');
+          stop.hidden = false;
+          stop.disabled = false;
+        }
+      }
       if (message.type === 'user-message') return;
       if (message.type === 'local-answer') {
         const state = message.result?.status || 'confirmed';
@@ -591,26 +768,58 @@ function getHtml(webview) {
         addMessage('assistant', (message.label || 'Fast Lane') + ' · ' + message.elapsedMs + ' ms', message.text);
         setBusy(false);
       }
-      if (message.type === 'assistant-start') {
-        activeAssistant = addMessage('assistant', 'Codex · generating…', '');
+      if (message.type === 'input-error') {
+        addMessage('assistant', 'Task not sent', message.text);
+        status.textContent = message.text;
+        setBusy(false);
       }
-      if (message.type === 'assistant-delta' && activeAssistant) {
+      if (message.type === 'assistant-start') {
+        activeRequestId = message.requestId;
+        activeAssistant = addMessage('assistant', 'Codex · connecting…', '');
+        stop.hidden = false;
+        stop.disabled = false;
+        setBusy(true);
+        status.textContent = 'Codex · connecting to the selected project…';
+      }
+      if (message.type === 'assistant-running' && message.requestId === activeRequestId) {
+        status.textContent = 'Codex · running';
+        if (activeAssistant) activeAssistant.title.textContent = 'Codex · running…';
+      }
+      if (message.type === 'assistant-delta' && message.requestId === activeRequestId && activeAssistant) {
         activeAssistant.body.textContent += message.text;
         messages.scrollTop = messages.scrollHeight;
       }
-      if (message.type === 'assistant-done' && activeAssistant) {
+      if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
+        status.textContent = 'Interrupt sent · waiting for Codex to stop…';
+      }
+      if (message.type === 'assistant-interrupt-error' && message.requestId === activeRequestId) {
+        status.textContent = 'Interrupt was not confirmed · the turn may still be running.';
+        stop.disabled = false;
+        if (activeAssistant) activeAssistant.title.textContent = 'Codex · running (interrupt not confirmed)';
+      }
+      if (message.type === 'assistant-done' && message.requestId === activeRequestId && activeAssistant) {
         activeAssistant.title.textContent = 'Codex · ' + message.elapsedMs + ' ms · ' + message.usage;
         activeAssistant = undefined;
       }
-      if (message.type === 'assistant-done') setBusy(false);
-      if (message.type === 'assistant-error') {
+      if (message.type === 'assistant-done' && message.requestId === activeRequestId) {
+        activeRequestId = undefined;
+        status.textContent = 'Codex · completed';
+        stop.hidden = true;
+        setBusy(false);
+      }
+      if (message.type === 'assistant-error' && message.requestId === activeRequestId) {
         if (activeAssistant) {
-          activeAssistant.title.textContent = 'Codex fallback error · ' + message.elapsedMs + ' ms';
-          activeAssistant.body.textContent = message.text;
+          const interrupted = message.state === 'interrupted';
+          activeAssistant.title.textContent = interrupted ? 'Codex · interrupted' : 'Codex · failed · ' + message.elapsedMs + ' ms';
+          activeAssistant.body.textContent += (activeAssistant.body.textContent ? '\n\n' : '') + message.text;
           activeAssistant = undefined;
         } else {
-          addMessage('assistant', 'Codex fallback error · ' + message.elapsedMs + ' ms', message.text);
+          const label = message.state === 'interrupted' ? 'Codex · interrupted' : 'Codex fallback error · ' + message.elapsedMs + ' ms';
+          addMessage('assistant', label, message.text);
         }
+        activeRequestId = undefined;
+        status.textContent = message.state === 'interrupted' ? 'Codex · interrupted' : 'Codex · failed; the conversation remains visible in this panel.';
+        stop.hidden = true;
         setBusy(false);
       }
     });
@@ -623,7 +832,13 @@ function getHtml(webview) {
 
 function safeMessage(error) {
   if (!error) return "Unknown error.";
-  return typeof error.message === "string" ? error.message : String(error);
+  const message = typeof error.message === "string" ? error.message : String(error);
+  return message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").slice(0, 800);
+}
+
+function isSafeProtocolIdentity(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 &&
+    !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value);
 }
 
 function writeLog(message) {

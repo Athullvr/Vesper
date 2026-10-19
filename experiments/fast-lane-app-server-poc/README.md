@@ -61,7 +61,7 @@ Session metadata is stored under `~/.vesper/sessions/` (or `$VESPER_HOME/session
 1. Open the Vesper repository in VS Code.
 2. Press `F5` to launch an Extension Development Host.
 3. In that window, run **Fast Lane: Open Panel** from the Command Palette.
-4. Choose **View → Output → Fast Lane PoC** to inspect routing and RPC logs.
+4. Choose **View → Output → Vesper** to inspect routing and RPC logs.
 
 Alternatively, start the extension development host from this folder:
 
@@ -69,7 +69,11 @@ Alternatively, start the extension development host from this folder:
 code --new-window --extensionDevelopmentPath="$(pwd)" "$(pwd)/../.."
 ```
 
-The extension panel and its app-server implementation remain independent from the terminal frontend.
+The extension panel keeps its VS Code message bridge and local-first routing, and uses the same tested app-server client and session store as the terminal frontend.
+
+The panel shows the selected workspace folder and lets you choose among folders already open in the VS Code workspace. It resolves the folder to the CLI's canonical real path and looks up the most recently updated Vesper session for that exact path. The session store continues to hold only the Vesper session ID, project path, Codex thread ID, schema version, and timestamps; it does not store prompts or model output. On a Codex task, the panel resumes the stored thread and verifies the returned thread ID and project path. A failed resume keeps the saved session, blocks further tasks, and offers a retry or an explicit **Start new conversation** action. Starting a new conversation leaves the previous session record available.
+
+The panel uses the app-server client's read-only sandbox override for both `thread/start` and `thread/resume`, and declines approval requests. A **Stop** button interrupts only the active turn. The extension host keeps one panel instance; closing the webview does not dispose the session mapping, and restarting VS Code reloads it from the existing Vesper session store. The webview's visible transcript itself is not persisted or rehydrated; resumption continues the Codex thread context, while prior panel messages are not repainted after a restart.
 
 ## Tests and manual checks
 
@@ -79,7 +83,7 @@ Run the full prototype test suite from this folder:
 npm test
 ```
 
-Tests use mocks for app-server initialization, turns, stream events, failures, interruption, timeouts, approvals, and saved-thread resume. The existing Git integration test uses read-only Git commands against the current worktree. The runner records the test summary, exit code, timestamps, and source fingerprint in the ignored `.fast-lane-test-result.json`; no prompt or answer content is included. A local test-result answer is confirmed only while the fingerprint matches the prototype and test sources.
+Tests use mocks for app-server initialization, turns, stream events, failures, interruption, timeouts, approvals, and saved-thread resume. `node test/extension-routing.test.js` exercises the real `SessionStore` files under a temporary `VESPER_HOME` with a mocked app-server. The existing Git integration test uses read-only Git commands against the current worktree. The runner records the test summary, exit code, timestamps, and source fingerprint in the ignored `.fast-lane-test-result.json`; no prompt or answer content is included. A local test-result answer is confirmed only while the fingerprint matches the prototype and test sources.
 
 Try these local requests:
 
@@ -96,6 +100,7 @@ For terminal fallback, submit `Explain what a Git rebase does in one sentence.` 
 ## Limitations
 
 - Vesper is its own frontend. It does not attach to, import, or continue the original interactive Codex CLI conversation.
+- When multiple Vesper sessions exist for one canonical workspace path, the extension restores the record with the latest `updatedAt`; it does not yet offer a session-history picker. The session store persists identifiers rather than the VS Code transcript, so the panel does not redraw earlier user and assistant messages after restart.
 - Codex app-server is experimental in the inspected CLI version; protocol behavior can change. Recheck the installed generated schema before updating protocol methods.
 - The live aggregate diff view uses cursor movement and erase sequences only when both streams are TTYs and `TERM` is usable. Its terminal cell-width calculation is an approximation for combining marks and emoji sequences, so unusual glyph widths may cause imperfect wrapping. The installed event schema has no sequence/version field; Vesper scopes events by process, thread and turn and applies same-turn snapshots in transport arrival order. A local PTY smoke check exercised synthetic events and redirected output; it did not validate authenticated model behavior, live app-server delivery, or real file operations.
 - The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and the request is reported as an error. Another fallback tries to resume the same saved thread; it never silently starts a replacement conversation.
