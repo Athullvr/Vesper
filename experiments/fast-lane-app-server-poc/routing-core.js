@@ -22,6 +22,7 @@ const INTENT_PHRASES = new Map([
     "what is the current branch name",
     "what branch is checked out",
     "which branch is checked out",
+    "tell me the name of the checked out branch",
   ])],
   [LOCAL_INTENTS.WORKING_TREE_STATUS, new Set([
     "what is the working tree status",
@@ -39,6 +40,7 @@ const INTENT_PHRASES = new Map([
     "do i have uncommitted changes",
     "are there uncommitted changes",
     "are there any uncommitted changes",
+    "have i made any local edits",
   ])],
   [LOCAL_INTENTS.BRANCH_UPSTREAM, new Set([
     "does this branch have an upstream",
@@ -80,7 +82,23 @@ const INTENT_PHRASES = new Map([
     "did the last test run pass",
     "did my last test pass",
     "did the last tests pass",
+    "were the latest test results successful",
   ])],
+]);
+
+// These constrained patterns recognize common grammatical variants while
+// requiring each request to ask for one specific, locally evidenced fact.
+const INTENT_PATTERNS = new Map([
+  [LOCAL_INTENTS.CURRENT_GIT_BRANCH, [
+    /^(?:name|tell me the name of|give me the name of|what is the name of) (?:the )?(?:checked out|current|active) (?:git )?branch$/u,
+    /^(?:which|what) branch is (?:currently )?(?:active|checked out)(?: in this checkout)?$/u,
+  ]],
+  [LOCAL_INTENTS.WORKING_TREE_STATUS, [
+    /^(?:do i have|are there) (?:any )?(?:uncommitted (?:file )?(?:changes|edits)|(?:local|working tree|worktree) edits|edits in (?:my )?(?:working tree|worktree))$/u,
+  ]],
+  [LOCAL_INTENTS.MOST_RECENT_TEST_RESULT, [
+    /^(?:did|has|have|was|were) (?:the|my) (?:latest|most recent|last) (?:test run|test results|tests?) (?:pass|passed|succeed|succeeded|successful)$/u,
+  ]],
 ]);
 
 const RESULT_STATUSES = new Set(["confirmed", "unknown", "stale", "unavailable"]);
@@ -97,15 +115,22 @@ function normalizeRequest(request) {
 
 function classifyRequest(request) {
   const normalized = normalizeRequest(request);
-  const matches = [];
+  const matches = new Set();
+  let exactMatch = false;
   for (const [intent, phrases] of INTENT_PHRASES) {
-    if (phrases.has(normalized)) matches.push(intent);
+    if (phrases.has(normalized)) {
+      matches.add(intent);
+      exactMatch = true;
+    }
+  }
+  for (const [intent, patterns] of INTENT_PATTERNS) {
+    if (patterns.some((pattern) => pattern.test(normalized))) matches.add(intent);
   }
 
-  if (matches.length === 1) {
-    return { route: "local", intent: matches[0], reason: "local_exact_match" };
+  if (matches.size === 1) {
+    return { route: "local", intent: [...matches][0], reason: exactMatch ? "local_exact_match" : "local_rule_match" };
   }
-  if (matches.length > 1 || isAmbiguousLocalRequest(normalized)) {
+  if (matches.size > 1 || isAmbiguousLocalRequest(normalized)) {
     return { route: "codex", intent: null, reason: "local_ambiguous" };
   }
   return { route: "codex", intent: null, reason: "codex_fallback" };

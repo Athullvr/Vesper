@@ -19,10 +19,13 @@ test("normalization folds case, punctuation, Unicode compatibility forms, and sp
 test("each explicit deterministic intent has a local exact-match rule", () => {
   const examples = [
     ["What Git branch am I on?", LOCAL_INTENTS.CURRENT_GIT_BRANCH],
+    ["Tell me the name of the checked-out branch.", LOCAL_INTENTS.CURRENT_GIT_BRANCH],
     ["Is my working tree clean?", LOCAL_INTENTS.WORKING_TREE_STATUS],
+    ["Have I made any local edits?", LOCAL_INTENTS.WORKING_TREE_STATUS],
     ["Does this branch have an upstream?", LOCAL_INTENTS.BRANCH_UPSTREAM],
     ["How many local commits are ahead of upstream?", LOCAL_INTENTS.AHEAD_OF_UPSTREAM],
     ["Did the last test run pass?", LOCAL_INTENTS.MOST_RECENT_TEST_RESULT],
+    ["Were the latest test results successful?", LOCAL_INTENTS.MOST_RECENT_TEST_RESULT],
   ];
 
   for (const [request, intent] of examples) {
@@ -36,9 +39,20 @@ test("ambiguous local topics go to Codex with an explicit ambiguity reason", () 
     "What is my branch status?",
     "Am I behind upstream?",
     "Did the tests pass in CI?",
+    "Did the tests pass?",
+    "Do I have any local commits that are not pushed?",
+    "Implement a branch-aware retry feature in this project.",
   ]) {
     assert.deepEqual(classifyRequest(request), { route: "codex", intent: null, reason: "local_ambiguous" });
   }
+});
+
+test("unsupported commit-state questions do not become working-tree answers", () => {
+  assert.deepEqual(classifyRequest("Have I made any local commits?"), {
+    route: "codex",
+    intent: null,
+    reason: "codex_fallback",
+  });
 });
 
 test("unrelated and empty requests use the Codex fallback reason", () => {
@@ -66,6 +80,37 @@ test("a local route executes its handler and never invokes the fallback", async 
 
   assert.equal(routed.result, handlerResult);
   assert.equal(routed.decision.route, "local");
+  assert.equal(fallbackCalls, 0);
+});
+
+test("the three added local phrasings select the intended evidence source and never start a Codex turn", async () => {
+  const requests = [
+    ["Tell me the name of the checked-out branch.", LOCAL_INTENTS.CURRENT_GIT_BRANCH],
+    ["Have I made any local edits?", LOCAL_INTENTS.WORKING_TREE_STATUS],
+    ["Were the latest test results successful?", LOCAL_INTENTS.MOST_RECENT_TEST_RESULT],
+  ];
+  let fallbackCalls = 0;
+
+  for (const [request, intent] of requests) {
+    const routed = await routeRequest(request, {
+      handlers: { [intent]: async () => ({
+        kind: "local_result",
+        intent,
+        status: "unknown",
+        value: null,
+        summary: "No trustworthy result is available.",
+        evidence: ["The handler had no confirmed evidence."],
+        source: { kind: "test_fixture" },
+        freshness: { state: "unknown" },
+      }) },
+      fallback: async () => { fallbackCalls += 1; },
+    });
+
+    assert.equal(routed.decision.route, "local");
+    assert.equal(routed.decision.intent, intent);
+    assert.equal(routed.result.status, "unknown");
+  }
+
   assert.equal(fallbackCalls, 0);
 });
 

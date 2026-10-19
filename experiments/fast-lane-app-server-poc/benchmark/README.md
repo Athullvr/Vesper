@@ -1,6 +1,6 @@
 # Phase 3 routing evaluation
 
-`cases.json` is the fixed prompt set. It covers deterministic Git facts, recorded test state, an accepted paraphrase, novel paraphrases, workspace facts, ambiguous claims, and complex coding tasks. Prompts remain short and the coding prompts are never executed by this benchmark.
+`cases.json` is the development prompt set. `heldout-cases.json` contains a separate set of unseen paraphrases for post-change evaluation. Together they cover deterministic Git facts, recorded test state, workspace facts, ambiguous claims, and complex coding tasks. Prompts remain short and the coding prompts are never executed by this benchmark.
 
 Run the local routing evaluation from this directory or the prototype root:
 
@@ -8,7 +8,7 @@ Run the local routing evaluation from this directory or the prototype root:
 node benchmark/run-local.js 5
 ```
 
-The runner repeats every case, measures routing plus local-handler latency, checks local answers against current read-only Git/test evidence, records evidence/freshness labels, and calls a mock fallback for Codex-routed cases. It does not start real Codex turns. `realCodexTurnStarted` is therefore false for every row; `codexTurnRequestedTrials` records whether Vesper reached its fallback callback. The current prototype's terminal frontend passes that callback to `appServer.runTurn`.
+The runner repeats every case, measures routing plus local-handler latency, checks local answers against current read-only Git/test evidence, records evidence/freshness labels, and calls a mock fallback for Codex-routed cases. It reports development and held-out metrics separately. It does not start real Codex turns. `realCodexTurnStarted` is therefore false for every row; `codexTurnRequestedTrials` records whether Vesper reached its fallback callback. The current prototype's terminal frontend passes that callback to `appServer.runTurn`.
 
 For the direct baseline, run:
 
@@ -24,7 +24,7 @@ Direct Codex answer scoring is manual and uses these criteria: Git facts match t
 
 Correctness is evaluated for Vesper-produced local answers; direct Codex responses are scored separately against the same live facts and rubric. A fallback has no answer in the local routing harness. “Incorrect local answer rate” uses produced local answers as its denominator. Missed deterministic paraphrases are route misses/fallbacks, not incorrect local answers. Direct questions are batched into one read-only turn per trial, so their completion time is a batch latency, not a per-question response-time comparison.
 
-## Run snapshot: 2026-10-19
+## Original Phase 3 run snapshot: 2026-10-19
 
 The prototype suite was run before evaluation: `npm test` reported 53 passed, 0 failed. The local benchmark then ran five repetitions per case (75 decisions) against `/home/athulvr/Documents/My Projects/Vesper`. The working tree contained the four untracked benchmark files, so the status answers refer to that snapshot. The installed CLI was `codex-cli 0.162.1`.
 
@@ -56,9 +56,9 @@ For local answers, Vesper invoked no fallback callback in any of the 30 local tr
 
 The core claim holds for this bounded sample of recognized deterministic questions: fresh Git/test evidence yielded correct local answers in 30/30 trials without a Codex turn. Evidence is strongest for current branch, working-tree status, and the source-fingerprinted test result. Upstream configuration is local-only; ahead counts are explicitly tied to a recently fetched tracking ref and cannot establish current remote state.
 
-The observed deterministic failure class is surface-form variation, not wrong local answers. “Tell me the name of the checked-out branch” is treated as ambiguous, “Have I made any local edits?” falls through as unsupported, and “Were the latest test results successful?” is treated as ambiguous. All three direct-Codex answers were correct twice. These 15 false fallbacks out of 45 semantically local opportunities are meaningful enough to test better classification, but the small, hand-written set does not justify deploying a local model.
+At the time of the original Phase 3 report, the observed deterministic failure class was surface-form variation, not wrong local answers. “Tell me the name of the checked-out branch” was treated as ambiguous, “Have I made any local edits?” fell through as unsupported, and “Were the latest test results successful?” was treated as ambiguous. These 15 false fallbacks out of 45 semantically local opportunities motivated the deterministic Phase 1A coverage work below; the original sample did not justify deploying a local model.
 
-A bounded Phase 3 follow-up could compare the current rules with a small intent classifier on 140 held-out prompts: 20 paraphrases for each of the five supported intents, 20 ambiguous near-matches, and 20 unsupported/complex requests. The model may return only `{intent, confidence}`; it must not generate answers. Route locally only for one supported intent at confidence **≥ 0.95**. Preserve the current ambiguity guards as hard vetoes; malformed output, multiple intents, low confidence, handler failure, or any ambiguity must fall back to Codex. Adopt it only if it raises supported-paraphrase local coverage by at least 25 percentage points while producing **zero false local routes and zero incorrect local answers** on held-out ambiguous/unsupported cases. Compare route latency and classifier cost as well. A smaller deterministic phrase expansion remains the cheaper baseline.
+A larger independently authored deterministic evaluation remains the next useful step. Consider an intent-classifier experiment only if a meaningful class of paraphrase failures remains after that evaluation; any classifier must only select among supported intents and must fall back on low confidence or ambiguity.
 
 ## Limitations
 
@@ -68,3 +68,31 @@ A bounded Phase 3 follow-up could compare the current rules with a small intent 
 - Direct response correctness was manually judged; direct evidence provenance and command traces were not retained.
 - Git and workspace results describe one checkout and one point in time. No fetch or remote check was performed.
 - Test-state evidence covers only the prototype's recorded `npm test` run and source snapshot, not every project test or CI.
+
+## Phase 1A deterministic coverage results: 2026-10-19
+
+The original three paraphrase misses had different causes:
+
+| Request | Original decision | Cause |
+| --- | --- | --- |
+| “Tell me the name of the checked-out branch.” | `local_ambiguous` | No exact phrase matched; the broad `branch` topic guard then forced fallback. |
+| “Have I made any local edits?” | `codex_fallback` | No exact phrase matched and none of the Git topic guard terms appeared. |
+| “Were the latest test results successful?” | `local_ambiguous` | No exact phrase matched; `test results` triggered the ambiguity guard. |
+
+The rules now include those three explicit phrasings and narrow, anchored grammar patterns for branch-name questions, working-tree edits, and recent test-result questions. The working-tree wording maps only to `working_tree_status`; a question about local commits remains unsupported. Test-result requests use the existing source-fingerprinted test record and report unknown when no trustworthy record exists. No handler behavior, UI, or app-server protocol changed.
+
+The original Phase 3 development benchmark had 9 expected-local cases. It locally answered 6/9 (66.7%) and routed the three listed paraphrases to fallback. Across five trials, that was 30/45 local opportunities, 0 incorrect local answers, and 15 missed-local routes. Phase 1A ran the expanded 25-case benchmark for five trials per case (125 decisions):
+
+| Set | Cases | Expected local | Local coverage | Route accuracy | False local routes | Incorrect local answers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Development | 19 | 9 | 45/45 (100%) | 95/95 (100%) | 0 | 0/45 |
+| Held-out paraphrases | 6 | 6 | 30/30 (100%) | 30/30 (100%) | 0 | 0/30 |
+| Combined | 25 | 15 | 75/75 (100%) | 125/125 (100%) | 0 | 0/75 |
+
+The three requested prompts each routed locally in 5/5 trials with the expected intent and correct live evidence. All six held-out phrasings also routed locally: two branch questions, two working-tree questions, and two recent-test questions. The prior 66.7% baseline was on the original development prompts; the held-out score is from a separate six-prompt set and is not a same-prompt before/after comparison. No held-out wording was added to the exact phrase lists. The rules were not adjusted after running the held-out evaluation.
+
+The expanded prompt benchmark also kept pushed-state questions, test questions without explicit recency/scope, unsupported local-commit questions, and complex tasks on the Codex fallback route. It produced zero false local routes. Unit tests separately exercised a missing test record (unknown), malformed/unreadable test evidence (unavailable), an untracked path (counted as a working-tree edit), unavailable Git status (no answer), and a stale upstream reference (stale, with the no-remote-check caveat). Those state tests use mocks; the benchmark's working-tree and test oracles use the current checkout and its just-recorded matching test run.
+
+Across the 75 local answers, the median local-answer latency was 3.382 ms; the median fallback decision latency was 0.011 ms. No local route invoked the fallback callback. The 50 Codex-routed benchmark decisions invoked only the mock callback; this Phase 1A run started **zero live Codex turns** and makes no end-to-end fallback claim.
+
+This improves the measured surface-form failure class without adding a model. The evidence supports keeping deterministic rules for these narrowly phrased, directly evidenced intents. It does not establish broad natural-language coverage: the held-out set contains only six hand-written prompts, and status/test evidence reflects one local snapshot. A larger independently authored paraphrase set would be needed before claiming general coverage.

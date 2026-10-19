@@ -104,6 +104,30 @@
     "oracle": "ambiguous_test_state"
   },
   {
+    "id": "ambiguous_tests_without_recency",
+    "category": "ambiguous",
+    "prompt": "Did the tests pass?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "ambiguous_test_state"
+  },
+  {
+    "id": "unsupported_local_commits",
+    "category": "ambiguous",
+    "prompt": "Have I made any local commits?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "ambiguous_commit_state"
+  },
+  {
+    "id": "ambiguous_unpushed_commits",
+    "category": "ambiguous",
+    "prompt": "Do I have any local commits that are not pushed?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "ambiguous_push_state"
+  },
+  {
     "id": "complex_build_website",
     "category": "complex_coding",
     "prompt": "Build a website.",
@@ -115,6 +139,14 @@
     "id": "complex_retry_feature",
     "category": "complex_coding",
     "prompt": "Implement retry with exponential backoff for API calls in this project.",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "oracle": "complex_task_response"
+  },
+  {
+    "id": "complex_branch_feature",
+    "category": "complex_coding",
+    "prompt": "Implement a branch-aware retry feature in this project.",
     "expectedRoute": "codex",
     "expectedIntent": null,
     "oracle": "complex_task_response"

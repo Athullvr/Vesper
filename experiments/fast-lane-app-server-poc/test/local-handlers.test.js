@@ -55,6 +55,27 @@ test("working-tree handler reports status counts without retaining paths", async
   assert.match(result.summary, /5 changed paths/u);
 });
 
+test("an untracked file counts as a working-tree edit", async () => {
+  const handlers = createLocalHandlers({ runGit: async () => "?? private-file-name\0", now: () => fixedNow });
+  const result = await handlers[LOCAL_INTENTS.WORKING_TREE_STATUS]({ cwd: "/workspace" });
+
+  assert.equal(result.status, "confirmed");
+  assert.deepEqual(result.value, { clean: false, changed: 1, modified: 0, added: 0, deleted: 0, renamed: 0, untracked: 1 });
+  assert.equal(JSON.stringify(result).includes("private-file-name"), false);
+});
+
+test("unavailable Git status produces no local-edits claim", async () => {
+  const handlers = createLocalHandlers({
+    runGit: async () => { const error = new Error("private workspace path"); error.code = 128; throw error; },
+    now: () => fixedNow,
+  });
+  const result = await handlers[LOCAL_INTENTS.WORKING_TREE_STATUS]({ cwd: "/workspace" });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.value, null);
+  assert.equal(result.summary.includes("private workspace path"), false);
+});
+
 test("clean working tree is reported as confirmed", async () => {
   const handlers = createLocalHandlers({ runGit: async () => "", now: () => fixedNow });
   const result = await handlers[LOCAL_INTENTS.WORKING_TREE_STATUS]({ cwd: "/workspace" });
@@ -188,6 +209,20 @@ test("test-result handler reports unknown when no trusted runner record exists",
   assert.equal(result.status, "unknown");
   assert.match(result.summary, /No trustworthy .* test record/u);
   assert.equal(result.value, null);
+});
+
+test("unreadable or malformed test evidence cannot be reported as successful", async () => {
+  for (const testResultReader of [
+    () => { throw new Error("private record path"); },
+    () => ({ state: "invalid" }),
+  ]) {
+    const handlers = createLocalHandlers({ runGit: async () => "", testResultReader, now: () => fixedNow });
+    const result = await handlers[LOCAL_INTENTS.MOST_RECENT_TEST_RESULT]();
+    assert.equal(result.status, "unavailable");
+    assert.equal(result.value, null);
+    assert.equal(result.summary.includes("private record path"), false);
+    assert.equal(result.summary.includes("successful"), false);
+  }
 });
 
 test("test-result handler confirms only a matching source snapshot and never turns failure into pass", async () => {

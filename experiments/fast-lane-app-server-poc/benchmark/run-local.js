@@ -10,7 +10,12 @@ const { routeRequest } = require("../routing-core");
 
 const prototypeRoot = path.resolve(__dirname, "..");
 const projectRoot = path.resolve(prototypeRoot, "../..");
-const cases = JSON.parse(fs.readFileSync(path.join(__dirname, "cases.json"), "utf8"));
+const cases = [
+  ...JSON.parse(fs.readFileSync(path.join(__dirname, "cases.json"), "utf8"))
+    .map((entry) => ({ ...entry, split: "development" })),
+  ...JSON.parse(fs.readFileSync(path.join(__dirname, "heldout-cases.json"), "utf8"))
+    .map((entry) => ({ ...entry, split: "heldout" })),
+];
 
 function git(args) {
   return execFileSync("git", args, {
@@ -69,6 +74,8 @@ function readOracle(kind) {
       };
     case "ambiguous_push_state":
       return { state: "not_confirmable_without_remote_check" };
+    case "ambiguous_commit_state":
+      return { state: "not_supported_by_a_deterministic_handler" };
     case "ambiguous_test_state":
       return { state: "not_confirmable_without_defined_test_scope" };
     case "complex_task_response":
@@ -143,6 +150,7 @@ async function run(trialCount) {
   const handlers = createLocalHandlers({ runGit: async (args, cwd) => gitAt(args, cwd) });
   const rows = new Map(cases.map((entry) => [entry.id, {
     id: entry.id,
+    split: entry.split,
     category: entry.category,
     expectedRoute: entry.expectedRoute,
     expectedIntent: entry.expectedIntent,
@@ -192,12 +200,16 @@ async function run(trialCount) {
     const latencies = trials.map((trial) => trial.localLatencyMs);
     return {
       id: row.id,
+      split: row.split,
       category: row.category,
       expectedRoute: row.expectedRoute,
       expectedIntent: row.expectedIntent,
       actualRoute: trials[0].actualRoute,
       routeReason: trials[0].routeReason,
       routeCorrectTrials: trials.filter((trial) => trial.routeCorrect).length,
+      falseLocalRouteTrials: row.expectedRoute === "codex"
+        ? trials.filter((trial) => trial.actualRoute === "local").length
+        : 0,
       answerCorrectTrials: localAnswers.filter((trial) => trial.answerCorrect === true).length,
       localAnswerTrials: localAnswers.length,
       incorrectLocalAnswerTrials: incorrectLocalAnswers,
@@ -218,6 +230,7 @@ async function run(trialCount) {
   const localAnswerCount = summary.reduce((total, row) => total + row.localAnswerTrials, 0);
   const incorrectLocalAnswerCount = summary.reduce((total, row) => total + row.incorrectLocalAnswerTrials, 0);
   const fallbackRequests = summary.reduce((total, row) => total + row.codexTurnRequestedTrials, 0);
+  const falseLocalRouteCount = summary.reduce((total, row) => total + row.falseLocalRouteTrials, 0);
   const allTrials = [...rows.values()].flatMap((row) => row.trials);
   const latencySamples = allTrials.map((trial) => trial.localLatencyMs);
   const localAnswerLatencySamples = allTrials
@@ -226,6 +239,24 @@ async function run(trialCount) {
   const fallbackLatencySamples = allTrials
     .filter((trial) => trial.codexTurnRequested)
     .map((trial) => trial.localLatencyMs);
+  const splitMetrics = Object.fromEntries([...new Set(cases.map((entry) => entry.split))].map((split) => {
+    const splitCases = cases.filter((entry) => entry.split === split);
+    const splitRows = summary.filter((row) => row.split === split);
+    const expectedLocalOpportunities = splitCases.filter((entry) => entry.expectedRoute === "local").length * trialCount;
+    const localAnswers = splitRows.reduce((total, row) => total + row.localAnswerTrials, 0);
+    const incorrectLocalAnswers = splitRows.reduce((total, row) => total + row.incorrectLocalAnswerTrials, 0);
+    const falseLocalRoutes = splitRows.reduce((total, row) => total + row.falseLocalRouteTrials, 0);
+    const splitRouteCorrect = splitRows.reduce((total, row) => total + row.routeCorrectTrials, 0);
+    return [split, {
+      caseCount: splitCases.length,
+      expectedLocalCases: splitCases.filter((entry) => entry.expectedRoute === "local").length,
+      routeAccuracy: splitRouteCorrect / (splitCases.length * trialCount),
+      localCoverage: expectedLocalOpportunities ? localAnswers / expectedLocalOpportunities : null,
+      falseLocalRouteCount: falseLocalRoutes,
+      incorrectLocalAnswerCount: incorrectLocalAnswers,
+      incorrectLocalAnswerRate: localAnswers ? incorrectLocalAnswers / localAnswers : 0,
+    }];
+  }));
   const document = {
     benchmark: "Vesper deterministic routing evaluation",
     schemaVersion: 1,
@@ -235,6 +266,7 @@ async function run(trialCount) {
     caseCount: trialCases,
     expectedLocalCases: expectedLocal,
     routeAccuracy: routeCorrectTrials / (trialCases * trialCount),
+    falseLocalRouteCount,
     fallbackFrequency: fallbackRequests / (trialCases * trialCount),
     incorrectLocalAnswerRate: localAnswerCount ? incorrectLocalAnswerCount / localAnswerCount : 0,
     medianLocalLatencyMs: Number(median(latencySamples).toFixed(3)),
@@ -244,6 +276,7 @@ async function run(trialCount) {
     incorrectLocalAnswerCount,
     fallbackTurnRequests: fallbackRequests,
     liveCodexTurnsStarted: 0,
+    splitMetrics,
     cases: summary,
   };
   process.stdout.write(`${JSON.stringify(document, null, 2)}\n`);

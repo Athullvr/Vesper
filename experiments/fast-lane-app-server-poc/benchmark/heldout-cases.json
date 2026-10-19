@@ -1,0 +1,50 @@
+[
+  {
+    "id": "heldout_branch_active_checkout",
+    "category": "heldout_paraphrase",
+    "prompt": "Which branch is active in this checkout?",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "oracle": "current_git_branch"
+  },
+  {
+    "id": "heldout_branch_name_active",
+    "category": "heldout_paraphrase",
+    "prompt": "Name the active Git branch.",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "oracle": "current_git_branch"
+  },
+  {
+    "id": "heldout_status_uncommitted_files",
+    "category": "heldout_paraphrase",
+    "prompt": "Do I have any uncommitted file changes?",
+    "expectedRoute": "local",
+    "expectedIntent": "working_tree_status",
+    "oracle": "working_tree_status"
+  },
+  {
+    "id": "heldout_status_working_tree_edits",
+    "category": "heldout_paraphrase",
+    "prompt": "Are there edits in my working tree?",
+    "expectedRoute": "local",
+    "expectedIntent": "working_tree_status",
+    "oracle": "working_tree_status"
+  },
+  {
+    "id": "heldout_test_recent_run_succeed",
+    "category": "heldout_paraphrase",
+    "prompt": "Did my most recent test run succeed?",
+    "expectedRoute": "local",
+    "expectedIntent": "most_recent_test_result",
+    "oracle": "most_recent_test_result"
+  },
+  {
+    "id": "heldout_test_last_tests_successful",
+    "category": "heldout_paraphrase",
+    "prompt": "Were the last tests successful?",
+    "expectedRoute": "local",
+    "expectedIntent": "most_recent_test_result",
+    "oracle": "most_recent_test_result"
+  }
+]
