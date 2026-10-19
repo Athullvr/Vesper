@@ -9,6 +9,8 @@ The prototype uses Node.js built-ins, Git, the VS Code Extension API for the pan
 
 The [reliability audit](RELIABILITY-AUDIT.md) records the verified fixes, test matrix, and offline runtime results. The [interface inventory and roadmap](INTERFACE-ROADMAP.md) maps the terminal's remaining features to the installed protocol and describes an incremental architecture.
 
+The [TTY smoke and integration-readiness procedure](TTY-INTEGRATION-READINESS.md) documents the synthetic-event PTY check and a prepared disposable Git repository for a future explicitly authorized live test.
+
 ## Terminal frontend
 
 Requirements: Node.js 18 or newer, Git, and Codex CLI on `PATH`. Run the CLI from this folder:
@@ -89,13 +91,13 @@ Try these local requests:
 
 Each local result includes its state and evidence. Ahead-of-upstream uses local tracking refs only, checks the tracking-ref reflog for age, and warns that the remote was not contacted. A branch name alone never establishes that it is pushed. If trustworthy test evidence is absent or stale, the answer reports unknown or stale rather than claiming a pass.
 
-For terminal fallback, submit `Explain what a Git rebase does in one sentence.` and then `Give one example.`; both Codex answers should stream in the same Vesper session. Exit, copy the printed session id, and run `npm run cli -- --resume SESSION_ID` to verify resumption. Local questions should remain local in both runs.
+For terminal fallback, submit `Explain what a Git rebase does in one sentence.` and then `Give one example.`; both Codex answers should stream in the same Vesper session. Exit, copy the printed session id, and run `npm run cli -- --resume SESSION_ID` to verify resumption. Local questions should remain local in both runs. The documented synthetic TTY smoke check exercises real PTY streams without starting Codex or contacting a model.
 
 ## Limitations
 
 - Vesper is its own frontend. It does not attach to, import, or continue the original interactive Codex CLI conversation.
 - Codex app-server is experimental in the inspected CLI version; protocol behavior can change. Recheck the installed generated schema before updating protocol methods.
-- The live aggregate diff view uses cursor movement and erase sequences only when both streams are TTYs and `TERM` is usable. Its terminal cell-width calculation is an approximation for combining marks and emoji sequences, so unusual glyph widths may cause imperfect wrapping. The installed event schema has no sequence/version field; Vesper scopes events by process, thread and turn and applies same-turn snapshots in transport arrival order. Turn-level diff visibility is mock-tested and schema-inspected locally, but has not been validated against an authenticated live model turn or real file operation.
+- The live aggregate diff view uses cursor movement and erase sequences only when both streams are TTYs and `TERM` is usable. Its terminal cell-width calculation is an approximation for combining marks and emoji sequences, so unusual glyph widths may cause imperfect wrapping. The installed event schema has no sequence/version field; Vesper scopes events by process, thread and turn and applies same-turn snapshots in transport arrival order. A local PTY smoke check exercised synthetic events and redirected output; it did not validate authenticated model behavior, live app-server delivery, or real file operations.
 - The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and the request is reported as an error. Another fallback tries to resume the same saved thread; it never silently starts a replacement conversation.
 - Local Git checks do not fetch or contact a remote. Their results are bounded by local repository evidence and its freshness.
 - Upstream freshness uses the tracking ref's latest recorded reflog update (`%gD` with `--date=raw`), not the referenced commit's date. Missing or invalid reflog evidence leaves freshness unknown, even when the local ahead count is confirmed. An unchanged fetch need not add a reflog entry; a recent entry never confirms live remote state.
