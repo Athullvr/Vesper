@@ -58,16 +58,26 @@ Session metadata is stored under `~/.vesper/sessions/` (or `$VESPER_HOME/session
 
 ## VS Code extension
 
-1. Open the Vesper repository in VS Code.
-2. Press `F5` to launch an Extension Development Host.
-3. In that window, run **Fast Lane: Open Panel** from the Command Palette.
-4. Choose **View → Output → Vesper** to inspect routing and RPC logs.
+This repository is directly loadable as a VS Code extension: `package.json` points to the existing `extension.js` entry point. No build step or VSIX is required. There is no checked-in `.vscode/launch.json`, so use the command below instead of relying on `F5` to select an extension-host configuration.
 
-Alternatively, start the extension development host from this folder:
+For an isolated run, start it from a desktop terminal outside any restricted Linux command sandbox, from this repository directory. The fixture and dedicated homes are prepared by the integration procedure above; the VS Code profile and extension directories are also kept under the ignored `.audit-artifacts` directory:
 
 ```sh
-code --new-window --extensionDevelopmentPath="$(pwd)" "$(pwd)/../.."
+E2E_PROJECT="$PWD/.audit-artifacts/disposable-e2e-project"
+VS_CODE_DATA="$PWD/.audit-artifacts/phase1d-vscode-data"
+VS_CODE_EXTENSIONS="$PWD/.audit-artifacts/phase1d-vscode-extensions"
+mkdir -p "$VS_CODE_DATA" "$VS_CODE_EXTENSIONS"
+
+CODEX_HOME="$PWD/.audit-artifacts/e2e-codex-home" \
+VESPER_HOME="$PWD/.audit-artifacts/e2e-vesper-home" \
+code --new-window \
+  --user-data-dir "$VS_CODE_DATA" \
+  --extensions-dir "$VS_CODE_EXTENSIONS" \
+  --extensionDevelopmentPath="$PWD" \
+  "$E2E_PROJECT"
 ```
+
+The `code` command's exit status alone does not prove that Electron created a usable window. In this environment, launching it inside the restricted command sandbox produced `sandbox_host_linux.cc:41: Operation not permitted` while the CLI still returned status 0. Do not work around that restriction with `--no-sandbox`; run the command from the desktop session instead. Verify a separate VS Code window opened on the disposable project, run **Fast Lane: Open Panel** from the Command Palette, and confirm the Vesper webview appears. The Vesper Output channel and the Extension Host log can confirm activation after the command is invoked. Startup logs are under the selected VS Code user-data directory's `logs` folder; keep them local and do not share raw logs.
 
 The extension panel keeps its VS Code message bridge and local-first routing, and uses the same tested app-server client and session store as the terminal frontend.
 

@@ -1,4 +1,98 @@
-"use strict";
+Vesper Phase 1D — Authenticated VS Code Integration Validation
+
+Goal
+
+Validate the existing Phase 1A–1C implementation against the actual installed Codex app - server in an isolated, disposable project.This is an integration - validation milestone, not a feature - development milestone.
+
+  Repository:
+"experiments/fast-lane-app-server-poc"
+
+Safety requirements
+
+  - Inspect the existing smoke - test procedures and reliability audit first.
+- Use a disposable Git project with no remote and a separate Vesper home and Codex home.
+- Never reset, overwrite, or modify the user's normal Codex configuration or Vesper sessions.
+  - Do not test file - write approvals or permit changes to the disposable project's files in this milestone.
+    - Do not print or record credentials, authentication tokens, full prompts, or private model output in diagnostic logs.
+- Do not claim a live test passed unless it actually ran and its observable evidence supports the claim.
+- If authentication, network access, or the Extension Development Host is unavailable, report the limitation and stop at that boundary.
+
+Validation sequence
+
+1. Environment and isolation
+
+Confirm the installed Codex CLI version and locate the existing VS Code extension test entry point.
+
+Create or reuse an isolated disposable project containing one known text file.Verify that it has no Git remote and that its initial working tree is clean.
+
+Set dedicated "CODEX_HOME" and "VESPER_HOME" directories for the test.Confirm that the existing session store and credentials outside those directories will not be modified.
+
+Use the repository's existing isolation conventions rather than inventing a second setup procedure.
+
+2. Extension startup
+
+Launch the VS Code Extension Development Host if the environment supports it.
+
+Verify that the Vesper panel opens, lists the disposable workspace, and handles an invalid or unavailable workspace cleanly.
+
+If automated UI interaction is unavailable, document the exact manual steps required instead of substituting mocked UI tests for a real run.
+
+3. Read - only task execution
+
+Submit a task asking Vesper to read the known text file without modifying any files.
+
+Verify observable evidence for:
+
+  - Task submission through the extension.
+- Correct workspace and project identity.
+- Actual app - server turn creation.
+- Streaming or final completion.
+- Expected file contents in the response, where safe to inspect.
+
+Do not accept a response that merely claims the command ran.Confirm actual runtime events or tool activity.
+
+4. Persistence and history restoration
+
+Close and reopen the panel.Then restart the Extension Development Host if feasible.
+
+Verify that:
+
+- The same saved Vesper session is selected for the same workspace.
+- The app - server confirms the same Codex thread ID.
+- History restoration returns real persisted turn data.
+- Restored messages appear in chronological order.
+- Partial or unavailable history is represented honestly.
+- Switching to another workspace does not leak the first workspace's messages.
+
+If any check fails, capture sanitized event metadata and the relevant error, without exposing private content.
+
+5. Interruption and recovery
+
+Run a sufficiently long, read - only task and interrupt it using Vesper's Stop control.
+
+Verify that the active turn is interrupted and that the panel remains usable.Resume the saved conversation and submit another read - only task.Confirm whether the same thread continues.
+
+If a genuine disconnect can be induced safely, test reconnect recovery.Do not simulate a successful reconnect solely by emitting mocked success events.
+
+6. Integrity checks
+
+After testing, verify that the disposable project's tracked files are unchanged, the working tree is clean, and the expected fixture still exists.
+
+Run the full test suite, extension - routing tests, JavaScript syntax checks, and "git diff --check".
+
+  Deliverables
+
+Report:
+
+1. Which tests were genuinely live and which remained mocked.
+2. Codex CLI version and the tested extension / runtime versions.
+3. Whether thread identity survived panel reopening and host restart.
+4. Whether real history was restored and in the correct order.
+5. Whether interruption and subsequent continuation worked.
+6. Filesystem integrity results.
+7. Failures, limitations, and the smallest justified next task.
+
+Do not implement pagination, a session picker, or unrelated UI features in this phase.Fix only issues that block safe validation, and keep every change small and test - covered."use strict";
 
 const fs = require("node:fs");
 const path = require("node:path");
