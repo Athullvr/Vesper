@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const {
   LOCAL_INTENTS,
   ROUTING_OUTCOMES,
+  ROUTING_REASON_COUNT_CODES,
   RouteMetrics,
   classifyRequest,
   createRoutingDecisionRecord,
@@ -282,24 +283,65 @@ test("routing explanations match the actual decision reason and records stay bou
   assert.equal(createRoutingDecisionRecord({ route: "codex", intent: null, reason: "codex_fallback" }).route, "codex");
 });
 
-test("route metrics count local routes, fallbacks, latency, and handler failures without prompt data", () => {
+test("route metrics count completed outcomes and reasons once without prompt data", () => {
   const metrics = new RouteMetrics();
-  metrics.record({ route: "local" }, 8, { handlerFailed: true, routingDecision: { outcome: "local_unavailable" } });
-  const snapshot = metrics.record({ route: "codex" }, 13, { routingDecision: { outcome: "codex_delegated" } });
+  const decisions = [
+    ["local", "local_handled", "local_exact_match"],
+    ["local", "local_insufficient", "local_rule_match"],
+    ["local", "local_unavailable", "local_exact_match"],
+    ["codex", "codex_delegated", "local_ambiguous"],
+    ["codex", "codex_not_dispatched", "codex_fallback"],
+  ].map(([route, outcome, reasonCode]) => ({ route, outcome, reasonCode }));
+
+  metrics.record({ route: "local" }, 8, { handlerFailed: true, routingDecision: decisions[0] });
+  metrics.record({ route: "local" }, 9, { routingDecision: decisions[1] });
+  metrics.record({ route: "local" }, 10, { handlerFailed: true, routingDecision: decisions[2] });
+  metrics.record({ route: "codex" }, 11, { routingDecision: decisions[3] });
+  metrics.record({ route: "codex" }, 12, { routingDecision: decisions[4] });
+  metrics.record({ route: "local" }, 13, { routingDecision: decisions[0] });
+  metrics.record({ route: "local" }, 14, { routingDecision: { outcome: "local_selected", reasonCode: "local_exact_match" } });
+  const snapshot = metrics.snapshot();
 
   assert.deepEqual(snapshot, {
-    localRouteCount: 1,
-    fallbackCount: 1,
-    routeLatencyMs: 13,
-    handlerFailureCount: 1,
+    localRouteCount: 5,
+    fallbackCount: 2,
+    routeLatencyMs: 14,
+    handlerFailureCount: 2,
+    routingDecisionCount: 5,
     routingOutcomes: {
       local_selected: 0,
-      local_handled: 0,
-      local_insufficient: 0,
+      local_handled: 1,
+      local_insufficient: 1,
       local_unavailable: 1,
       codex_delegated: 1,
-      codex_not_dispatched: 0,
+      codex_not_dispatched: 1,
+    },
+    routingReasons: {
+      codex_fallback: 1,
+      local_ambiguous: 1,
+      local_exact_match: 2,
+      local_rule_match: 1,
+      unknown_route_reason: 0,
     },
   });
   assert.equal(JSON.stringify(snapshot).includes("prompt"), false);
+  assert.deepEqual(ROUTING_REASON_COUNT_CODES, Object.keys(snapshot.routingReasons));
+});
+
+test("classifier predictions do not count until routeRequest returns a completed routing decision", async () => {
+  const metrics = new RouteMetrics();
+  const decision = classifyRequest("What Git branch am I on?");
+  assert.equal(metrics.snapshot().routingDecisionCount, 0);
+  const routed = await routeRequest("What Git branch am I on?", {
+    decision,
+    handlers: {
+      [LOCAL_INTENTS.CURRENT_GIT_BRANCH]: async () => ({
+        kind: "local_result", intent: LOCAL_INTENTS.CURRENT_GIT_BRANCH, status: "confirmed",
+        summary: "Current Git branch: main", evidence: [], source: {}, freshness: {},
+      }),
+    },
+  });
+  metrics.record(decision, 1, { routingDecision: routed.routingDecision });
+  assert.equal(metrics.snapshot().routingDecisionCount, 1);
+  assert.equal(metrics.snapshot().routingOutcomes.local_handled, 1);
 });

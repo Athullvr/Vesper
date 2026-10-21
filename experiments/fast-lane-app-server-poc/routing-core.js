@@ -111,6 +111,11 @@ const ROUTING_OUTCOMES = Object.freeze([
   "codex_delegated",
   "codex_not_dispatched",
 ]);
+const COMPLETED_ROUTING_OUTCOMES = new Set(ROUTING_OUTCOMES.filter((outcome) => outcome !== "local_selected"));
+const ROUTING_REASON_COUNT_CODES = Object.freeze([
+  ...ROUTING_REASON_CODES,
+  "unknown_route_reason",
+].sort());
 const MAX_ROUTING_EXPLANATION_LENGTH = 220;
 
 function normalizeRequest(request) {
@@ -321,14 +326,25 @@ class RouteMetrics {
     this.handlerFailureCount = 0;
     this.lastRouteLatencyMs = 0;
     this.routingOutcomes = Object.fromEntries(ROUTING_OUTCOMES.map((outcome) => [outcome, 0]));
+    this.routingDecisionCount = 0;
+    this.routingReasons = Object.fromEntries(ROUTING_REASON_COUNT_CODES.map((reasonCode) => [reasonCode, 0]));
+    this.recordedRoutingDecisions = new WeakSet();
   }
 
   record(decision, latencyMs, { handlerFailed = false, routingDecision } = {}) {
     if (decision.route === "local") this.localRouteCount += 1;
     else this.fallbackCount += 1;
     if (handlerFailed) this.handlerFailureCount += 1;
-    if (routingDecision && Object.hasOwn(this.routingOutcomes, routingDecision.outcome)) {
+    if (routingDecision && typeof routingDecision === "object" &&
+        COMPLETED_ROUTING_OUTCOMES.has(routingDecision.outcome) &&
+        !this.recordedRoutingDecisions.has(routingDecision)) {
+      this.recordedRoutingDecisions.add(routingDecision);
+      this.routingDecisionCount += 1;
       this.routingOutcomes[routingDecision.outcome] += 1;
+      const reasonCode = Object.hasOwn(this.routingReasons, routingDecision.reasonCode)
+        ? routingDecision.reasonCode
+        : "unknown_route_reason";
+      this.routingReasons[reasonCode] += 1;
     }
     this.lastRouteLatencyMs = Math.max(0, Math.round(latencyMs));
     return this.snapshot();
@@ -340,7 +356,9 @@ class RouteMetrics {
       fallbackCount: this.fallbackCount,
       routeLatencyMs: this.lastRouteLatencyMs,
       handlerFailureCount: this.handlerFailureCount,
+      routingDecisionCount: this.routingDecisionCount,
       routingOutcomes: { ...this.routingOutcomes },
+      routingReasons: { ...this.routingReasons },
     };
   }
 }
@@ -349,6 +367,7 @@ module.exports = {
   LOCAL_INTENTS,
   MAX_ROUTING_EXPLANATION_LENGTH,
   ROUTING_OUTCOMES,
+  ROUTING_REASON_COUNT_CODES,
   RouteMetrics,
   classifyRequest,
   createLocalResult,

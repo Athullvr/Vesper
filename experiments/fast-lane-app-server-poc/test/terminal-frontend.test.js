@@ -4,8 +4,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { PassThrough } = require("node:stream");
-const { LOCAL_INTENTS, createLocalResult } = require("../routing-core");
-const { TerminalFrontend, createLineIO, safeStreamText, renderTurnDiffActivity, MAX_TURN_DIFF_RENDERED_LENGTH } = require("../terminal-frontend");
+const { LOCAL_INTENTS, RouteMetrics, createLocalResult } = require("../routing-core");
+const { TerminalFrontend, createLineIO, renderRoutingSummary, safeStreamText, renderTurnDiffActivity, MAX_TURN_DIFF_RENDERED_LENGTH } = require("../terminal-frontend");
 const { FileChangeApprovalStore } = require("../file-change-approval");
 const { AppServerClient } = require("../app-server-client");
 
@@ -101,7 +101,7 @@ class FakeCodexProcess extends EventEmitter {
   }
 }
 
-function makeFrontend({ answers, appServer, handlers, lineIO, onWrite, routingDiagnostics = false } = {}) {
+function makeFrontend({ answers, appServer, handlers, lineIO, onWrite, metrics, onTask, onWorkspaceCommand, routingDiagnostics = false } = {}) {
   const io = lineIO || new FakeLineIO(answers);
   let outputText = "";
   const output = { write: (text) => { outputText += String(text); onWrite?.(String(text)); } };
@@ -124,6 +124,9 @@ function makeFrontend({ answers, appServer, handlers, lineIO, onWrite, routingDi
     }),
     output,
     lineIO: io,
+    metrics,
+    onTask,
+    onWorkspaceCommand,
     routingDiagnostics,
   });
   return { frontend, io, output: () => outputText };
@@ -150,6 +153,62 @@ test("local question is labeled local, uses no app-server turn, and Codex fallba
   assert.match(text, /A rebase replays commits\./u);
   assert.match(text, /Codex · completed/u);
   assert.equal(appServer.turns.length, 1);
+});
+
+test(":routing displays zero activity without dispatching work or updating session activity", async () => {
+  let taskCalls = 0;
+  let workspaceCommandCalls = 0;
+  const appServer = new FakeAppServer(async () => assert.fail(":routing must not call Codex."));
+  const setup = makeFrontend({
+    answers: [":routing", ":quit"],
+    appServer,
+    metrics: new RouteMetrics(),
+    onTask: () => { taskCalls += 1; },
+    onWorkspaceCommand: () => { workspaceCommandCalls += 1; return false; },
+  });
+
+  await setup.frontend.run();
+  const text = setup.output();
+  assert.match(text, /:routing for session counts/u);
+  assert.match(text, /Total tasks routed: 0/u);
+  assert.match(text, /Local handled: 0/u);
+  assert.match(text, /Local insufficient: 0/u);
+  assert.match(text, /Local unavailable: 0/u);
+  assert.match(text, /Codex delegated: 0/u);
+  assert.match(text, /Codex not dispatched: 0/u);
+  assert.equal(taskCalls, 0);
+  assert.equal(workspaceCommandCalls, 0);
+  assert.equal(appServer.turns.length, 0);
+});
+
+test(":routing output is bounded, deterministic, and contains aggregate counts only", () => {
+  const metrics = new RouteMetrics();
+  metrics.record({ route: "codex" }, 0, { routingDecision: {
+    outcome: "codex_delegated",
+    reasonCode: "codex_fallback",
+    prompt: "private prompt phrase",
+    response: "private model response",
+    evidence: ["private evidence payload"],
+    credentials: "API_KEY=private-token",
+    rawError: "private handler error",
+  } });
+
+  const summary = renderRoutingSummary(metrics);
+  assert.equal(summary, renderRoutingSummary(metrics));
+  assert.ok(summary.length < 1_600);
+  assert.match(summary, /Total tasks routed: 1/u);
+  assert.match(summary, /Codex delegated: 1/u);
+  assert.match(summary, /codex_fallback: 1/u);
+  assert.doesNotMatch(summary, /private prompt phrase|private model response|private evidence payload|private-token|private handler error/u);
+  assert.doesNotMatch(summary, /\u001b/u);
+
+  const missing = renderRoutingSummary(null);
+  assert.match(missing, /unavailable/u);
+  const partial = renderRoutingSummary({ snapshot: () => ({ routingDecisionCount: 1, routingOutcomes: { codex_delegated: 1 } }) });
+  assert.match(partial, /Total tasks routed: 1/u);
+  assert.match(partial, /Codex delegated: 1/u);
+  assert.match(partial, /Local handled: —/u);
+  assert.match(partial, /codex_fallback: —/u);
 });
 
 test("initialization failures and timeouts are visible and the input loop recovers", async () => {

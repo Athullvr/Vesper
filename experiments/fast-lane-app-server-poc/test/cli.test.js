@@ -101,6 +101,7 @@ test("the package exposes a vesper entry point and help does not create a sessio
   assert.match(output.text(), /Usage:[\s\S]*vesper \[run\]/u);
   assert.match(output.text(), /most recently updated session/u);
   assert.match(output.text(), /vesper sessions list/u);
+  assert.match(output.text(), /:routing to inspect current-session routing counts/u);
   assert.match(output.text(), /read-only/u);
   assert.equal(fs.existsSync(store.directory), false);
 });
@@ -329,7 +330,7 @@ test("bare vesper launch enters the interactive workspace in the current project
     store,
     output: output.stream,
     errorOutput: errors.stream,
-    lineIO: new FakeLineIO(["What Git branch am I on?", ":sessions", ":quit"]),
+    lineIO: new FakeLineIO(["What Git branch am I on?", ":sessions", ":help", ":quit"]),
     runGit: async () => "feature/interactive\n",
     clientOptions: { spawnProcess: () => { codexStarts += 1; throw new Error("local routing must not start Codex"); } },
   });
@@ -340,6 +341,7 @@ test("bare vesper launch enters the interactive workspace in the current project
   assert.ok(output.text().includes(`Project: ${cwd}\n`));
   assert.match(output.text(), /feature\/interactive/u);
   assert.match(output.text(), /:switch SESSION_ID/u);
+  assert.match(output.text(), /Workspace commands: .*:routing/u);
 });
 
 test("Codex fallback persists a thread id in a fresh Vesper session", async (t) => {
@@ -529,14 +531,19 @@ test("interactive session switching lists only this project, verifies reconnect,
     output: output.stream,
     errorOutput: errors.stream,
     lineIO: new FakeLineIO([
+      ":routing",
       ":sessions",
       `:switch ${isolated.sessionId}`,
       ":switch 00000000-0000-4000-8000-000000000000",
       `:switch ${second.sessionId}`,
       "Continue the second session",
+      ":routing",
       `:switch ${first.sessionId}`,
+      ":routing",
       "Continue the first session",
+      ":routing",
       ":new",
+      ":routing",
       ":sessions",
       ":quit",
     ]),
@@ -545,6 +552,7 @@ test("interactive session switching lists only this project, verifies reconnect,
 
   const visible = output.text();
   const createdId = visible.match(/\[Vesper\] New session: ([0-9a-f-]+)/u)?.[1];
+  const routingReports = visible.split("Routing outcomes · current in-memory Vesper session").slice(1);
   assert.equal(status, 0);
   assert.equal(errors.text(), "");
   const initialList = visible.split("Use :switch SESSION_ID to resume one.")[0];
@@ -557,7 +565,13 @@ test("interactive session switching lists only this project, verifies reconnect,
   assert.match(visible, /Vesper history · empty/u);
   assert.match(visible, /Answer from codex-thread-second/u);
   assert.match(visible, /Answer from codex-thread-first/u);
+  assert.ok(routingReports[0].startsWith(` ${first.sessionId}\n`));
+  assert.ok(routingReports[1].startsWith(` ${second.sessionId}\n`));
+  assert.ok(routingReports[2].startsWith(` ${first.sessionId}\n`));
+  assert.ok(routingReports[3].startsWith(` ${first.sessionId}\n`));
+  assert.deepEqual(routingReports.map((report) => Number(report.match(/Total tasks routed: (\d+)/u)?.[1])), [0, 1, 0, 1, 0]);
   assert.ok(createdId);
+  assert.ok(routingReports[4].startsWith(` ${createdId}\n`));
   assert.notEqual(createdId, first.sessionId);
   assert.notEqual(createdId, second.sessionId);
   assert.equal(store.load(first.sessionId).threadId, "codex-thread-first");

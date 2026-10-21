@@ -64,6 +64,7 @@ The interactive workspace shows the canonical project path and active Vesper ses
 :sessions              list this project's recent sessions
 :switch SESSION_ID     switch to a saved session in this project
 :new                   create and select a separate session
+:routing               show routing outcome counts for the active session
 :help                  show workspace commands
 :quit                  exit and keep saved sessions
 ```
@@ -73,6 +74,8 @@ Session lists show at most 50 ids, update times, and whether a saved Codex threa
 Exact supported local questions are answered before the app-server starts. Other and ambiguous prompts use the installed Codex app-server. Vesper starts a Codex thread lazily on the first fallback, then sends later fallback prompts to that same thread. Resuming a saved session calls `thread/resume`; it will report an error if that thread or directory cannot be resumed rather than silently replacing it with a new conversation.
 
 Each task prints one short `[Route · …]` indicator based on the router decision and, for local requests, the handler's returned status. `VESPER_ROUTING_DEBUG=1` adds a bounded JSON routing record with stable reason/outcome codes and a concise explanation; it omits the submitted prompt, handler summary, and evidence payload. A `confirmed` handler status describes the local result's status and does not independently verify its correctness. Unknown, stale, or unavailable local results remain local; local-handler failures do not fall back to Codex.
+
+`:routing` shows counts for routing decisions recorded in the active in-memory Vesper session, grouped by stable router reason code. A Codex delegation is a routing outcome and does not mean its task succeeded. Counts are neither persisted nor restored when a saved session is resumed; they reset when switching sessions. The command reads only the bounded aggregate counters and does not display prompts, responses, evidence, or handler errors. Missing optional counters appear as `—`.
 
 Before the first Codex task in a resumed Vesper session, the terminal verifies the saved thread and restores the latest 50 Codex turns through the existing bounded history projection. If history retrieval fails after the thread is verified, Vesper reports it as unavailable and keeps the thread usable. Local answers were never sent to Codex, so they are not part of that history. This does not attach to or import a conversation started directly with `codex`.
 

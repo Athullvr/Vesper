@@ -1,7 +1,7 @@
 "use strict";
 
 const readline = require("node:readline");
-const { RouteMetrics, classifyRequest, createRoutingDecisionRecord, routeRequest } = require("./routing-core");
+const { RouteMetrics, ROUTING_REASON_COUNT_CODES, classifyRequest, createRoutingDecisionRecord, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
@@ -16,6 +16,7 @@ const MAX_FILE_ACTIVITY_PATH_LENGTH = 1_024;
 const FILE_ACTIVITY_LIMIT_MARKER = "\n[Vesper] File-change summary output is limited; later summaries or updates are omitted.\n";
 const MAX_TURN_DIFF_RENDERED_LENGTH = 16_000;
 const MAX_STREAMED_TURN_OUTPUT = 256_000;
+const MAX_ROUTING_SUMMARY_LENGTH = 1_600;
 const STREAMED_OUTPUT_LIMIT_MARKER = "\n[Vesper] Streamed response truncated at the terminal output limit.\n";
 const PRIVATE_KEY_START = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/iu;
 const PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/iu;
@@ -84,7 +85,7 @@ class TerminalFrontend {
   async run() {
     this.write("Vesper · local routing with Codex app-server fallback\n");
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions to list sessions, :switch ID to resume one, :new for a separate session, and :quit to exit. Local answers do not start Codex turns.\n\n");
+    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :routing for session counts, and :quit to exit. Local answers do not start Codex turns.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -110,13 +111,17 @@ class TerminalFrontend {
 
   async handlePrompt(prompt) {
     if (prompt.startsWith(":")) {
+      if (prompt.trim() === ":routing") {
+        this.write(renderRoutingSummary(this.metrics, this.sessionId));
+        return;
+      }
       try {
         if (await this.onWorkspaceCommand?.(prompt, this)) return;
       } catch (error) {
         this.write(`[Vesper command error] ${safeTerminalText(error?.message || error)}\n`);
         return;
       }
-      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, or :quit.\n`);
+      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :routing, or :quit.\n`);
       return;
     }
 
@@ -332,6 +337,7 @@ class TerminalFrontend {
     this.turnDiffRendered = false;
     this.pendingTurnDiffFinal = null;
     this.commandActivity = null;
+    this.metrics = new RouteMetrics();
   }
 
   writeStreamDelta(delta) {
@@ -547,6 +553,46 @@ function formatRoutingIndicator(record) {
   if (record.outcome === "local_unavailable") return `Route · local · ${intent} · unavailable; no Codex fallback`;
   if (record.outcome === "local_selected") return `Route · local · ${intent} · selected`;
   return `Route · local · ${intent} · handler status ${record.handlerStatus || "unknown"}`;
+}
+
+function renderRoutingSummary(metrics, sessionId = null) {
+  if (!metrics || typeof metrics.snapshot !== "function") {
+    return "Routing diagnostics unavailable: no session metrics are attached.\n";
+  }
+
+  let snapshot;
+  try {
+    snapshot = metrics.snapshot();
+  } catch {
+    return "Routing diagnostics unavailable: session metrics could not be read.\n";
+  }
+  if (!snapshot || typeof snapshot !== "object") {
+    return "Routing diagnostics unavailable: session metrics could not be read.\n";
+  }
+
+  const displayCount = (value) => Number.isSafeInteger(value) && value >= 0 ? String(value) : "—";
+  const outcomes = snapshot.routingOutcomes && typeof snapshot.routingOutcomes === "object"
+    ? snapshot.routingOutcomes
+    : null;
+  const reasons = snapshot.routingReasons && typeof snapshot.routingReasons === "object"
+    ? snapshot.routingReasons
+    : null;
+  const sessionLabel = sessionId ? ` ${safeTerminalText(sessionId).slice(0, 80)}` : "";
+  const lines = [
+    `Routing outcomes · current in-memory Vesper session${sessionLabel}`,
+    `Total tasks routed: ${displayCount(snapshot.routingDecisionCount)}`,
+    `Local handled: ${displayCount(outcomes?.local_handled)}`,
+    `Local insufficient: ${displayCount(outcomes?.local_insufficient)}`,
+    `Local unavailable: ${displayCount(outcomes?.local_unavailable)}`,
+    `Codex delegated: ${displayCount(outcomes?.codex_delegated)}`,
+    `Codex not dispatched: ${displayCount(outcomes?.codex_not_dispatched)}`,
+    "By reason code:",
+    ...ROUTING_REASON_COUNT_CODES.map((reasonCode) => `  ${reasonCode}: ${displayCount(reasons?.[reasonCode])}`),
+    "Counts are recorded routing outcomes; delegation does not indicate task success. Saved sessions have no historical counters.",
+  ];
+  let summary = `${lines.join("\n")}\n`;
+  if (summary.length > MAX_ROUTING_SUMMARY_LENGTH) summary = `${summary.slice(0, MAX_ROUTING_SUMMARY_LENGTH - 1)}\n`;
+  return summary;
 }
 
 function createLineIO(input, output) {
@@ -915,6 +961,7 @@ module.exports = {
   TerminalFrontend,
   approvalDetails,
   createLineIO,
+  renderRoutingSummary,
   safeTerminalText,
   safeStreamText,
   renderFileChangeActivity,

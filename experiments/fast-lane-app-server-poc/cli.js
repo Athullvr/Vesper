@@ -27,8 +27,8 @@ Without --new or --resume, Vesper resumes the most recently updated session for 
 or creates one when no session exists. The default project is the current working directory.
 Session listings are project-scoped and show at most ${MAX_SESSION_LIST_ENTRIES} recent metadata records.
 Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID to resume one,
-:new to start another session, and :quit to exit. Ctrl+C interrupts an active turn and returns
-to the prompt when the turn ends.
+:new to start another session, :routing to inspect current-session routing counts, and :quit to exit.
+Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
 Discovery commands are read-only. They show local sources and report unknown state when Codex does not
 expose it. Vesper does not install or change integrations.
@@ -298,7 +298,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     const handleWorkspaceCommand = async (command) => {
       const [name, ...args] = command.trim().split(/\s+/u);
       if (name === ":help" && args.length === 0) {
-        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :quit\n");
+        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :routing, :quit\n");
         return true;
       }
       if (name === ":sessions" && args.length === 0) {
@@ -330,7 +330,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         await activateSession(selected, "Session switched");
         return true;
       }
-      output.write("Usage: :sessions | :switch SESSION_ID | :new | :help | :quit\n");
+      output.write("Usage: :sessions | :switch SESSION_ID | :new | :routing | :help | :quit\n");
       return true;
     };
 
