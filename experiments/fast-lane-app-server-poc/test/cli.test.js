@@ -28,16 +28,28 @@ function fixture(t) {
   return root;
 }
 
-function clientFactoryFor(calls) {
+function clientFactoryFor(calls, historyTurns = []) {
   return (options) => {
     const client = new EventEmitter();
     client.initialThreadId = options.initialThreadId;
+    client.threadId = options.initialThreadId;
     client.turns = [];
+    client.events = [];
+    client.resumeThread = async (cwd) => {
+      client.events.push(["resume", cwd]);
+      return client.threadId;
+    };
+    client.readThreadHistory = async () => {
+      client.events.push(["history"]);
+      return { threadId: client.threadId, turns: historyTurns, truncated: false };
+    };
     client.runTurn = async (request) => {
+      client.events.push(["turn"]);
       client.turns.push(request);
-      if (!client.initialThreadId) {
+      if (!client.threadId) {
         client.initialThreadId = "codex-thread-1";
-        await options.onThreadId(client.initialThreadId);
+        client.threadId = client.initialThreadId;
+        await options.onThreadId(client.threadId);
       }
       request.onDelta("Mocked Codex answer.");
       return { status: "completed" };
@@ -58,6 +70,27 @@ test("CLI parsing supports explicit new sessions and resume without silently acc
   });
   assert.throws(() => parseArgs(["--new", "--resume", "00000000-0000-4000-8000-000000000000"]), /either --new or --resume/u);
   assert.throws(() => parseArgs(["--skip-approval"]), /Unknown option/u);
+  assert.equal(parseArgs(["run", "--help"]).help, true);
+  assert.throws(() => parseArgs(["plugins"]), /command is not available/u);
+});
+
+test("the package exposes a vesper entry point and help does not create a session", async (t) => {
+  const root = path.resolve(__dirname, "..");
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const entryPoint = path.resolve(root, manifest.bin.vesper);
+  const store = new SessionStore({ directory: path.join(fixture(t), "sessions") });
+  const output = capture();
+  const errors = capture();
+  const status = await runVesper(["--help"], { store, output: output.stream, errorOutput: errors.stream });
+
+  assert.equal(manifest.bin.vesper, "./bin/vesper.js");
+  assert.equal(fs.existsSync(entryPoint), true);
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.match(output.text(), /Usage:[\s\S]*vesper \[run\]/u);
+  assert.match(output.text(), /most recently updated session/u);
+  assert.match(output.text(), /no Vesper plugins, MCP, skills, or modules/u);
+  assert.equal(fs.existsSync(store.directory), false);
 });
 
 test("local request returns without invoking Codex or creating a Codex thread", async (t) => {
@@ -92,6 +125,29 @@ test("local request returns without invoking Codex or creating a Codex thread", 
   assert.match(output.text(), /Session status: new · no Codex thread yet/u);
   assert.equal(appServerSpawnCount, 0);
   assert.equal(store.load(sessionId).threadId, null);
+});
+
+test("a launch without a project argument uses the current working directory", async (t) => {
+  const cwd = fs.realpathSync(process.cwd());
+  const store = new SessionStore({ directory: path.join(fixture(t), "sessions") });
+  const output = capture();
+  let gitCwd;
+
+  const status = await runVesper(["--new"], {
+    store,
+    output: output.stream,
+    errorOutput: capture().stream,
+    lineIO: new FakeLineIO(["What Git branch am I on?", ":quit"]),
+    runGit: async (_args, selectedCwd) => {
+      gitCwd = selectedCwd;
+      return "feature/cwd\n";
+    },
+    clientOptions: { spawnProcess: () => assert.fail("A local request must not start Codex.") },
+  });
+
+  assert.equal(status, 0);
+  assert.equal(gitCwd, cwd);
+  assert.ok(output.text().includes(`Project: ${cwd}\n`));
 });
 
 test("Codex fallback persists a thread id in a fresh Vesper session", async (t) => {
@@ -144,7 +200,129 @@ test("resuming a Vesper session passes its saved Codex thread id to the frontend
   assert.match(output.text(), new RegExp(saved.sessionId));
   assert.equal(store.load(saved.sessionId).cwd, root);
   assert.match(output.text(), /Vesper session: /u);
+  assert.match(output.text(), /\[Vesper history · empty\]/u);
+  assert.deepEqual(clients[0].events.slice(0, 3), [
+    ["resume", root], ["history"], ["turn"],
+  ]);
   assert.equal(fs.readdirSync(store.directory).filter((name) => name.endsWith(".json")).length, 1);
+});
+
+test("a project launch reuses its latest Vesper session and restores bounded Codex history before the next turn", async (t) => {
+  const root = fixture(t);
+  const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
+  const saved = store.create(root);
+  store.update(saved.sessionId, { threadId: "codex-saved-thread" });
+  const clients = [];
+  const output = capture();
+  const errors = capture();
+  const history = [{
+    id: "turn-1",
+    status: "completed",
+    itemsView: "full",
+    items: [
+      { id: "user-1", type: "userMessage", content: [{ type: "text", text: "Prior question" }] },
+      { id: "answer-1", type: "agentMessage", text: "Prior answer" },
+    ],
+  }];
+
+  const status = await runVesper([root], {
+    store,
+    output: output.stream,
+    errorOutput: errors.stream,
+    lineIO: new FakeLineIO(["Continue this project", ":quit"]),
+    clientFactory: clientFactoryFor(clients, history),
+  });
+
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.match(output.text(), new RegExp(`Vesper session: ${saved.sessionId}`, "u"));
+  assert.match(output.text(), /Session status: resumed · saved Codex thread/u);
+  assert.match(output.text(), /Prior question/u);
+  assert.match(output.text(), /Prior answer/u);
+  assert.equal(store.load(saved.sessionId).threadId, "codex-saved-thread");
+  assert.equal(fs.readdirSync(store.directory).filter((name) => name.endsWith(".json")).length, 1);
+  assert.deepEqual(clients[0].events.slice(0, 3), [
+    ["resume", root], ["history"], ["turn"],
+  ]);
+});
+
+test("a failed saved-thread reconnect keeps the session and the next prompt can recover it", async (t) => {
+  const root = fixture(t);
+  const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
+  const saved = store.create(root);
+  store.update(saved.sessionId, { threadId: "codex-saved-thread" });
+  const output = capture();
+  let resumeAttempts = 0;
+  let turnCount = 0;
+
+  const status = await runVesper([root], {
+    store,
+    output: output.stream,
+    errorOutput: capture().stream,
+    lineIO: new FakeLineIO(["Continue", "Try again", ":quit"]),
+    clientFactory: (options) => {
+      assert.equal(options.initialThreadId, "codex-saved-thread");
+      const client = new EventEmitter();
+      client.resumeThread = async () => {
+        resumeAttempts += 1;
+        if (resumeAttempts === 1) throw new Error("temporary reconnect failure");
+        return "codex-saved-thread";
+      };
+      client.readThreadHistory = async () => ({ threadId: "codex-saved-thread", turns: [], truncated: false });
+      client.runTurn = async ({ onDelta }) => {
+        turnCount += 1;
+        onDelta("Recovered answer.");
+        return { status: "completed" };
+      };
+      client.interrupt = async () => false;
+      client.dispose = () => {};
+      return client;
+    },
+  });
+
+  assert.equal(status, 0);
+  assert.equal(resumeAttempts, 2);
+  assert.equal(turnCount, 1);
+  assert.match(output.text(), /Codex error .* temporary reconnect failure/u);
+  assert.match(output.text(), /Recovered answer\./u);
+  assert.equal(store.load(saved.sessionId).threadId, "codex-saved-thread");
+  assert.equal(fs.readdirSync(store.directory).filter((name) => name.endsWith(".json")).length, 1);
+});
+
+test("history retrieval failure is visible but does not prevent a verified saved thread from continuing", async (t) => {
+  const root = fixture(t);
+  const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
+  const saved = store.create(root);
+  store.update(saved.sessionId, { threadId: "codex-saved-thread" });
+  const output = capture();
+  let turnCount = 0;
+
+  const status = await runVesper(["--resume", saved.sessionId], {
+    store,
+    output: output.stream,
+    errorOutput: capture().stream,
+    lineIO: new FakeLineIO(["Continue without restored history", ":quit"]),
+    clientFactory: (options) => {
+      const client = new EventEmitter();
+      client.resumeThread = async () => options.initialThreadId;
+      client.readThreadHistory = async () => { throw new Error("history endpoint unavailable"); };
+      client.runTurn = async ({ onDelta }) => {
+        turnCount += 1;
+        onDelta("The saved thread remains usable.");
+        return { status: "completed" };
+      };
+      client.interrupt = async () => false;
+      client.dispose = () => {};
+      return client;
+    },
+  });
+
+  assert.equal(status, 0);
+  assert.equal(turnCount, 1);
+  assert.match(output.text(), /Vesper history · unavailable/u);
+  assert.match(output.text(), /not treated it as empty/u);
+  assert.match(output.text(), /The saved thread remains usable\./u);
+  assert.equal(store.load(saved.sessionId).threadId, "codex-saved-thread");
 });
 
 test("resume rejects a different project directory before starting the app-server", async (t) => {
@@ -171,8 +349,12 @@ test("resume rejects a different project directory before starting the app-serve
 
 test("project path is canonicalized and must be a directory", (t) => {
   const root = fixture(t);
+  const file = path.join(root, "file.txt");
+  fs.writeFileSync(file, "temporary fixture");
   assert.equal(resolveProjectDirectory(root), fs.realpathSync(root));
+  assert.equal(resolveProjectDirectory(), fs.realpathSync(process.cwd()));
   assert.throws(() => resolveProjectDirectory(path.join(root, "missing")), /does not exist/u);
+  assert.throws(() => resolveProjectDirectory(file), /not a directory/u);
 });
 
 test("resumed CLI forwards file-review context while preserving session metadata and project", async (t) => {
@@ -189,6 +371,8 @@ test("resumed CLI forwards file-review context while preserving session metadata
     clientFactory: (options) => {
       assert.equal(options.initialThreadId, before.threadId);
       const client = new EventEmitter();
+      client.resumeThread = async () => before.threadId;
+      client.readThreadHistory = async () => ({ threadId: before.threadId, turns: [], truncated: false });
       client.runTurn = async ({ cwd }) => {
         assert.equal(cwd, root);
         const params = { threadId: before.threadId, turnId: "resumed-turn", itemId: "patch-1", startedAtMs: 1 };

@@ -8,33 +8,44 @@ const { createLocalHandlers } = require("./local-handlers");
 const { SessionStore } = require("./session-store");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
 
+const FUTURE_COMMANDS = new Set(["plugins", "mcp", "skills", "modules"]);
+
 const USAGE = `Vesper terminal frontend
 
 Usage:
-  vesper [--new] [PROJECT_DIRECTORY]
+  vesper [run] [--new] [PROJECT_DIRECTORY]
   vesper --resume SESSION_ID [PROJECT_DIRECTORY]
+  vesper --help
 
-Start a new Vesper session with --new, or resume a saved session with --resume.
-Without either option, Vesper starts a new session in the current directory.
+Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
+or creates one when no session exists. Use --new to always start a separate Vesper session.
+The default project is the current working directory.
 The optional project directory must match the saved directory when resuming.
 Inside Vesper, enter :quit to exit. Session ids are printed at startup.
 
-For this checkout, run: node ./bin/vesper.js --new [PROJECT_DIRECTORY]
+This build provides terminal sessions only; it has no Vesper plugins, MCP, skills, or modules
+management commands. Run vesper --help for supported usage.
 `;
 
 function parseArgs(argv) {
+  const args = [...argv];
+  if (args[0] === "run") args.shift();
+  else if (FUTURE_COMMANDS.has(args[0])) {
+    throw new Error(`The "vesper ${args[0]}" command is not available in this build; Vesper currently supports terminal sessions only.`);
+  }
+
   let newSession = false;
   let resumeId = null;
   let help = false;
   const positional = [];
 
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
     if (arg === "--help" || arg === "-h") help = true;
     else if (arg === "--new") newSession = true;
     else if (arg === "--resume") {
       if (resumeId !== null) throw new Error("Use --resume only once.");
-      const value = argv[index + 1];
+      const value = args[index + 1];
       if (!value || value.startsWith("--")) throw new Error("--resume requires a Vesper session id.");
       resumeId = value;
       index += 1;
@@ -88,19 +99,23 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
     const store = dependencies.store || new SessionStore();
     let session;
     let cwd;
+    let resumed = false;
     if (options.resumeId) {
       session = store.load(options.resumeId);
       const storedCwd = resolveProjectDirectory(session.cwd);
       const selectedCwd = options.projectDirectory ? resolveProjectDirectory(options.projectDirectory) : storedCwd;
       if (selectedCwd !== storedCwd) throw new Error("The selected directory does not match this saved Vesper session.");
       cwd = storedCwd;
+      resumed = true;
     } else {
       cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
-      session = store.create(cwd);
+      session = options.newSession ? null : store.findLatestByCwd(cwd);
+      resumed = Boolean(session);
+      if (!session) session = store.create(cwd);
     }
 
     output.write(`Vesper session: ${session.sessionId}\n`);
-    const sessionStatus = options.resumeId ? "resumed" : "new";
+    const sessionStatus = resumed ? "resumed" : "new";
     const threadStatus = session.threadId ? "saved Codex thread" : "no Codex thread yet";
     output.write(`Session status: ${sessionStatus} · ${threadStatus}\n`);
     output.write(`Project: ${cwd}\n`);
@@ -125,6 +140,7 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
       output,
       lineIO: dependencies.lineIO,
       metrics: dependencies.metrics,
+      savedThreadId: session.threadId,
     });
     await terminal.run();
     return 0;

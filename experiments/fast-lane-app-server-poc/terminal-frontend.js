@@ -4,6 +4,7 @@ const readline = require("node:readline");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
+const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
 const { LiveTurnDiffView } = require("./live-turn-diff-view");
 
@@ -16,13 +17,15 @@ const FILE_ACTIVITY_LIMIT_MARKER = "\n[Vesper] File-change summary output is lim
 const MAX_TURN_DIFF_RENDERED_LENGTH = 16_000;
 
 class TerminalFrontend {
-  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics() } = {}) {
+  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null } = {}) {
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (!handlers || typeof handlers !== "object") throw new TypeError("Local handlers are required.");
     if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
     this.cwd = cwd;
     this.handlers = handlers;
     this.appServer = appServer;
+    this.savedThreadId = savedThreadId;
+    this.savedHistoryState = savedThreadId ? "pending" : "not-needed";
     this.output = output;
     this.lineIO = lineIO || createLineIO(input, output);
     this.metrics = metrics;
@@ -113,11 +116,14 @@ class TerminalFrontend {
         decision,
         handlers: this.handlers,
         context: { cwd: this.cwd },
-        fallback: () => this.appServer.runTurn({
-          prompt,
-          cwd: this.cwd,
-          onDelta: (delta) => this.write(safeStreamText(delta)),
-        }),
+        fallback: async () => {
+          await this.restoreSavedHistory();
+          return this.appServer.runTurn({
+            prompt,
+            cwd: this.cwd,
+            onDelta: (delta) => this.write(safeStreamText(delta)),
+          });
+        },
       });
       const result = routed.fallbackResult;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
@@ -221,6 +227,40 @@ class TerminalFrontend {
       };
     }
     return { decision: approved ? "accept" : cancelled ? "cancel" : "decline" };
+  }
+
+  async restoreSavedHistory() {
+    if (!this.savedThreadId || this.savedHistoryState === "loaded") return;
+
+    let resumedThreadId;
+    try {
+      resumedThreadId = await this.appServer.resumeThread(this.cwd);
+      if (resumedThreadId !== this.savedThreadId) {
+        throw new Error("Codex app-server resumed a different thread than the saved Vesper session.");
+      }
+    } catch (error) {
+      this.savedHistoryState = "pending";
+      throw error;
+    }
+
+    this.savedHistoryState = "loaded";
+    let historyView;
+    try {
+      const history = await this.appServer.readThreadHistory();
+      if (history?.threadId !== this.savedThreadId) {
+        throw new Error("Codex returned history for a different saved thread.");
+      }
+      historyView = projectConversationHistory(history);
+    } catch (error) {
+      historyView = unavailableHistory(
+        `The saved Codex thread is connected, but conversation history could not be retrieved: ${safeTerminalText(error?.message || error)}. Vesper has not treated it as empty.`
+      );
+    }
+
+    this.write(`\n[Vesper history · ${historyView.state}] ${historyView.text}\n`);
+    for (const entry of historyView.entries) {
+      this.write(`[${entry.label}] ${entry.text}\n`);
+    }
   }
 
   handleProgress(event) {
