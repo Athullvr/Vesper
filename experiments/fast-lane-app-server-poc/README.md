@@ -9,7 +9,7 @@ The prototype uses Node.js built-ins, Git, the VS Code Extension API for the pan
 
 The [reliability audit](RELIABILITY-AUDIT.md) records the verified fixes, test matrix, and offline runtime results. The [interface inventory and roadmap](INTERFACE-ROADMAP.md) maps the terminal's remaining features to the installed protocol and describes an incremental architecture.
 
-The [TTY smoke and integration-readiness procedure](TTY-INTEGRATION-READINESS.md) documents the synthetic-event PTY check and a prepared disposable Git repository for a future explicitly authorized live test.
+The [TTY smoke and integration-readiness procedure](TTY-INTEGRATION-READINESS.md) documents the no-Codex CLI lifecycle PTY check, the synthetic-event PTY check, and a prepared disposable Git repository for a future explicitly authorized live test. Run `npm run test:pty` for the CLI lifecycle check.
 
 ## Terminal frontend
 

@@ -1,5 +1,11 @@
 # TTY smoke test and integration readiness
 
+## Actual CLI lifecycle smoke without Codex
+
+Run `npm run test:pty` on a POSIX system with Python 3, Node.js and Git. The script launches the real `bin/vesper.js` in fresh PTYs, creates a disposable Git project and sets `HOME`, `CODEX_HOME` and `VESPER_HOME` to temporary directories. Its child `PATH` contains only Node.js and Git, so a Codex executable is unavailable. It sends only a locally routed Git-branch question and Vesper workspace/exit commands; it does not start the app-server or make network requests.
+
+The check observes the prompt's raw terminal modes, project path, ordinary input, PTY resize responsiveness, idle Ctrl+C, Ctrl+D EOF, normal `:quit`, terminal-mode restoration, process-group cleanup, saved-session persistence, and redirected output bounds/control sequences. A PTY does not expose the cursor's rendered visibility, so the script verifies that Vesper emits no cursor-hide sequence; actual terminal-emulator rendering is outside this check.
+
 ## Local terminal smoke test
 
 `test/tty-live-diff-smoke.cjs` is a controlled frontend driver. It feeds synthetic progress notifications through `TerminalFrontend` and does not construct `AppServerClient`, start Codex, execute a command, authenticate, or contact a model. The interactive mode requires an actual PTY (`stdin.isTTY` and `stdout.isTTY`) and a usable `TERM`.
