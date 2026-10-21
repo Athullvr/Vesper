@@ -31,6 +31,7 @@ const SOURCE_FILES = Object.freeze([
   "test/terminal-frontend.test.js",
   "test/fixtures/routing-quality-cases.json",
   "test/fixtures/routing-quality-heldout-cases.json",
+  "test/fixtures/routing-quality-generalization-cases.json",
   "test/fixtures/routing-quality-fingerprints.json",
 ]);
 

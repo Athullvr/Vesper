@@ -11,13 +11,16 @@ const { ROUTING_OUTCOMES, ROUTING_REASON_COUNT_CODES, RouteMetrics, routeRequest
 const FIXTURE_DIRECTORY = path.join(__dirname, "fixtures");
 const BASELINE_FIXTURE_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-cases.json");
 const HELDOUT_FIXTURE_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-heldout-cases.json");
+const GENERALIZATION_FIXTURE_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-generalization-cases.json");
 const FINGERPRINT_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-fingerprints.json");
 const BASELINE_CASES = JSON.parse(fs.readFileSync(BASELINE_FIXTURE_PATH, "utf8"));
 const HELDOUT_CASES = JSON.parse(fs.readFileSync(HELDOUT_FIXTURE_PATH, "utf8"));
+const GENERALIZATION_CASES = JSON.parse(fs.readFileSync(GENERALIZATION_FIXTURE_PATH, "utf8"));
 const FINGERPRINTS = JSON.parse(fs.readFileSync(FINGERPRINT_PATH, "utf8"));
 const EXPECTED_FINGERPRINTS = Object.freeze({
   baseline: "00d9ec3db031dfc54fb1325fd649163a86d54d10cab02f936ac3c6988720b22a",
   heldout: "14e4df137fd8e4306f5989c2cc1d23cb770956d112d7bae0df447a646c522970",
+  generalization: "efad9827a96e276c93b51d8f7b361b0d707f8becd9708bc943409c55bdd628a2",
 });
 const EVALUATION_CWD = "/offline-routing-evaluation/project";
 const FIXED_NOW = new Date("2026-10-21T12:00:00.000Z");
@@ -25,13 +28,15 @@ const STALE_UPSTREAM_EPOCH = Math.floor(Date.parse("2026-10-01T12:00:00.000Z") /
 const EXPECTED_LOCAL_STATUSES = new Set(["confirmed", "unknown", "stale", "unavailable"]);
 const ABSTENTION_STATUSES = new Set(["unknown", "stale", "unavailable"]);
 
-test("baseline and held-out fixture labels are static and fingerprint-pinned", () => {
+test("baseline, prior regression, and new generalization fixture labels are static and fingerprint-pinned", () => {
   assertFixtureFingerprints();
   validateFixtures(BASELINE_CASES);
   validateFixtures(HELDOUT_CASES, { requireExpectedOutcome: true });
+  validateFixtures(GENERALIZATION_CASES, { requireExpectedOutcome: true });
   assert.equal(BASELINE_CASES.length, 12);
   assert.equal(HELDOUT_CASES.length, 40);
-  const allIds = [...BASELINE_CASES, ...HELDOUT_CASES].map(({ id }) => id);
+  assert.equal(GENERALIZATION_CASES.length, 55);
+  const allIds = [...BASELINE_CASES, ...HELDOUT_CASES, ...GENERALIZATION_CASES].map(({ id }) => id);
   assert.equal(new Set(allIds).size, allIds.length);
 });
 
@@ -112,6 +117,32 @@ test("the previously evaluated held-out set remains a routing regression diagnos
   assertReportDoesNotExposePromptsOrEvidence(report, HELDOUT_CASES, metricsSnapshot);
 });
 
+test("new independently reviewed generalization cases report behavior without tuning labels", async (t) => {
+  assertFixtureFingerprints();
+  const { metricsSnapshot, report } = await evaluateFixtureSet(GENERALIZATION_CASES);
+  writeEvaluationDiagnostic(t, report, "new independently reviewed generalization set", EXPECTED_FINGERPRINTS.generalization);
+
+  assert.equal(report.casesEvaluated, 55);
+  assert.equal(report.correctRouteDecisions + report.incorrectRouteDecisions, 55);
+  assert.equal(report.expectedBehaviorMatches + report.expectedBehaviorMismatches, 55);
+  assert.equal(metricsSnapshot.routingDecisionCount, 55);
+  assert.equal(report.mockFallbackRequests, metricsSnapshot.routingOutcomes.codex_delegated);
+  assert.equal(report.liveCodexTurns, 0);
+  assert.deepEqual(Object.fromEntries(Object.entries(report.byCategory).map(([category, value]) => [category, value.cases])), {
+    configured_upstream_vs_live_remote: 6,
+    complex_task: 4,
+    current_vs_other_branch_scope: 6,
+    informal_underspecified: 5,
+    local_handler_failure: 4,
+    missing_evidence: 5,
+    stale_evidence: 4,
+    unavailable_evidence: 3,
+    unseen_supported_paraphrase: 14,
+    unsupported_local_intent: 4,
+  });
+  assertReportDoesNotExposePromptsOrEvidence(report, GENERALIZATION_CASES, metricsSnapshot);
+});
+
 test("evaluation scoring rejects mismatched abstentions and flags unsafe answers and unnecessary delegation", () => {
   const expectedMissing = {
     expectedRoute: "local", expectedIntent: "most_recent_test_result", expectedEvidenceStatus: "unknown",
@@ -171,7 +202,8 @@ async function evaluateFixtureSet(fixtures) {
     const score = scoreEvaluationCase(entry, actual);
     evaluations.push({ entry, actual, score });
     metrics.record(routed.decision, 0, {
-      handlerFailed: entry.handlerFixture === "git_command_failure",
+      handlerFailed: entry.handlerFixture === "git_command_failure" && routed.decision.route === "local" &&
+        routed.result?.status === "unavailable",
       routingDecision: routed.routingDecision,
     });
   }
@@ -185,8 +217,15 @@ function assertFixtureFingerprints() {
   assert.equal(FINGERPRINTS.heldout.file, path.basename(HELDOUT_FIXTURE_PATH));
   assert.equal(FINGERPRINTS.baseline.sha256, EXPECTED_FINGERPRINTS.baseline);
   assert.equal(FINGERPRINTS.heldout.sha256, EXPECTED_FINGERPRINTS.heldout);
+  assert.equal(FINGERPRINTS.generalization.file, path.basename(GENERALIZATION_FIXTURE_PATH));
+  assert.equal(FINGERPRINTS.generalization.sha256, EXPECTED_FINGERPRINTS.generalization);
   assert.match(FINGERPRINTS.heldoutLabelingProvenance, /^Developer-authored held-out set;/u);
-  for (const [name, fixturePath] of [["baseline", BASELINE_FIXTURE_PATH], ["heldout", HELDOUT_FIXTURE_PATH]]) {
+  assert.match(FINGERPRINTS.generalizationLabelingProvenance, /^Developer-authored generalization set; independently reviewed before evaluation by a reviewer who did not inspect router implementation or run evaluation\.$/u);
+  for (const [name, fixturePath] of [
+    ["baseline", BASELINE_FIXTURE_PATH],
+    ["heldout", HELDOUT_FIXTURE_PATH],
+    ["generalization", GENERALIZATION_FIXTURE_PATH],
+  ]) {
     const actual = crypto.createHash("sha256").update(fs.readFileSync(fixturePath)).digest("hex");
     assert.equal(actual, EXPECTED_FINGERPRINTS[name], `${name} routing fixture fingerprint changed`);
   }
@@ -219,7 +258,7 @@ function makeFixtureHandlers(fixtureName) {
     if (args[0] === "for-each-ref") {
       return fixtureName === "ahead_no_upstream" ? "\n" : "origin/main\n";
     }
-    if (args[0] === "rev-list") return "2\n";
+    if (args[0] === "rev-list") return fixtureName === "ahead_invalid_count" ? "not-a-count\n" : "2\n";
     if (args[0] === "reflog") {
       const epoch = fixtureName === "stale_upstream" || fixtureName === "ahead_stale"
         ? STALE_UPSTREAM_EPOCH
@@ -230,6 +269,8 @@ function makeFixtureHandlers(fixtureName) {
   };
   const testResultReader = () => {
     if (fixtureName === "test_record_missing") return { state: "missing" };
+    if (fixtureName === "test_record_invalid") return { state: "invalid" };
+    if (fixtureName === "test_record_unavailable") return { state: "unavailable" };
     if (fixtureName === "test_record_current" || fixtureName === "test_record_stale") {
       return {
         state: "valid",

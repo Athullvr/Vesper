@@ -51,7 +51,48 @@ The case-by-case Phase 2E diagnosis and proposed narrowly scoped repair are in [
 
 The baseline remains **12/12 expected behavior matches**. After adding the narrowly scoped Git-intent rules, the same pinned 40-case Phase 2D set was rerun as a **previously evaluated regression diagnostic**, not as a fresh holdout: **40/40 expected behavior matches**, 0 incorrect routes, 11 appropriate abstentions, 0 unsafe confirmed local-answer decisions, and 0 unnecessary delegations. The five Phase 2D paraphrase misses now reach their expected local handlers using synthetic Git evidence. Mock fallback counts show dispatch only; no live Codex turns were started. This repeated set does not establish generalization from the five repairs; a new, independently reviewed evaluation set is still needed.
 
-The repair-specific routing, handler, evidence-state, fail-closed, metrics-deduplication, and diagnostic-privacy tests are in `test/git-paraphrase-routing.test.js`. The original fixture labels and fingerprints remain unchanged.
+The repair-specific routing, handler, evidence-state, fail-closed, metrics-deduplication, and diagnostic-privacy tests are in `test/git-paraphrase-routing.test.js`. The original fixture labels and fingerprints remain unchanged. At Phase 2F completion, a new generalization evaluation was still needed; Phase 2G below records that later evaluation.
+
+### Phase 2G independently reviewed routing generalization evaluation
+
+`test/fixtures/routing-quality-generalization-cases.json` is a new 55-case deterministic set. It covers unseen supported paraphrases (14), current versus other branch scope (6), configured upstream versus live remote state (6), informal or underspecified requests (5), missing evidence (5), stale evidence (4), unavailable evidence (3), unsupported local intents (4), complex tasks (4), and local-handler failures (4). The synthetic Git and test-record fixtures are offline. The labels are developer-authored; an independent reviewer inspected the final fixture and relevant handler/evidence contracts before evaluation, did not inspect the router implementation or run the evaluator, and found no label corrections. The final fixture fingerprint was pinned before evaluation: `efad9827a96e276c93b51d8f7b361b0d707f8becd9708bc943409c55bdd628a2`.
+
+The original 12-case baseline remains unchanged. The 40-case set is a previously evaluated regression set, not a fresh holdout. Results from the three sets are:
+
+| Set | Cases | Expected behavior matches | Incorrect route decisions | Appropriate abstentions | Unsafe confirmed local answers | Unnecessary delegations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original baseline | 12 | 12/12 (100%) | 0 | 3 | 0 | 0 |
+| Previously evaluated regression set | 40 | 40/40 (100%) | 0 | 11 | 0 | 0 |
+| New independently reviewed generalization set | 55 | 25/55 (45.5%) | 30 | 5 | 0 | 30 |
+
+All 30 generalization mismatches were conservative delegations of cases labeled for a local intent. The router made 25/55 correct route decisions; none of its local results were confirmed, so this set found no unsafe confirmed local-answer decision. The five appropriate abstentions were local-handler failures or unavailable evidence that reached a handler. The other missing, stale, and unavailable evidence examples were delegated before evidence validation. `RouteMetrics` recorded 50 `codex_delegated` and 5 `local_unavailable` outcomes, with no `local_handled` or `local_insufficient` outcomes. Of the 50 mock fallback requests, 30 were unnecessary for the fixture's expected local route and 20 were expected Codex delegations. No live Codex turn was started. These results measure route, intent, evidence-status, outcome, and dispatch matching; they do not assess factual answer quality or prove a mocked Codex task completed.
+
+| Generalization category | Cases | Expected behavior matches | Failure IDs |
+| --- | ---: | ---: | --- |
+| `configured_upstream_vs_live_remote` | 6 | 3/6 | `upstream_configured_remote_tracking_ref`, `upstream_pull_target`, `upstream_recorded_target` |
+| `complex_task` | 4 | 4/4 | — |
+| `current_vs_other_branch_scope` | 6 | 4/6 | `scope_branch_project_directory`, `scope_name_worktree_branch` |
+| `informal_underspecified` | 5 | 5/5 | — |
+| `local_handler_failure` | 4 | 4/4 | — |
+| `missing_evidence` | 5 | 0/5 | `missing_detached_branch`, `missing_detached_upstream`, `missing_detached_ahead_count`, `missing_test_record`, `missing_ahead_upstream` |
+| `stale_evidence` | 4 | 0/4 | `stale_ahead_worktree_count`, `stale_ahead_fetched_ref`, `stale_test_execution_record`, `stale_previous_suite_run` |
+| `unavailable_evidence` | 3 | 1/3 | `unavailable_test_record`, `unavailable_upstream_config` |
+| `unseen_supported_paraphrase` | 14 | 0/14 | `general_branch_checkout_readout`, `general_branch_worktree_question`, `general_branch_workspace_checked_out`, `general_worktree_changes_left`, `general_checkout_modified_anything`, `general_checkout_free_local_edits`, `general_tracking_ref_assigned`, `general_current_checkout_upstream`, `general_remote_tracking_destination`, `general_fetched_ref_ahead_count`, `general_head_commits_ahead`, `general_recorded_test_execution`, `general_recorded_suite_run`, `general_latest_test_outcome` |
+| `unsupported_local_intent` | 4 | 4/4 | — |
+
+The result grouped by actual reason code was:
+
+| Actual reason code | Cases | Expected behavior matches | Mismatches |
+| --- | ---: | ---: | ---: |
+| `codex_fallback` | 11 | 7/11 | 4 |
+| `local_ambiguous` | 39 | 13/39 | 26 |
+| `local_exact_match` | 2 | 2/2 | 0 |
+| `local_rule_match` | 3 | 3/3 | 0 |
+| `unknown_route_reason` | 0 | 0/0 | 0 |
+
+All 30 incorrect routes returned `route=codex`, no local intent or evidence status, and one mock fallback request where the fixture expected a local intent. The four `codex_fallback` misses were `general_checkout_modified_anything`, `general_checkout_free_local_edits`, `general_tracking_ref_assigned`, and `general_fetched_ref_ahead_count`. The other failure IDs above were classified `local_ambiguous`. In contrast, the complex, unsupported, and other-branch/live-remote negatives delegated as expected. The router and handlers were not changed for this evaluation.
+
+The next justified improvement is a source-backed recognition-gap analysis for the 30 missed local cases, grouped by intent and paired with negative scope/remote examples. If a narrowly anchored repair is approved later, add a separate repair-specific regression set; do not reuse this now-evaluated fixture as a fresh holdout or broaden the router with fuzzy matching.
 
 For the direct baseline, run:
 

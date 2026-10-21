@@ -7,5 +7,10 @@
     "file": "routing-quality-heldout-cases.json",
     "sha256": "14e4df137fd8e4306f5989c2cc1d23cb770956d112d7bae0df447a646c522970"
   },
-  "heldoutLabelingProvenance": "Developer-authored held-out set; no independent reviewer inspected the labels before evaluation."
+  "generalization": {
+    "file": "routing-quality-generalization-cases.json",
+    "sha256": "efad9827a96e276c93b51d8f7b361b0d707f8becd9708bc943409c55bdd628a2"
+  },
+  "heldoutLabelingProvenance": "Developer-authored held-out set; no independent reviewer inspected the labels before evaluation.",
+  "generalizationLabelingProvenance": "Developer-authored generalization set; independently reviewed before evaluation by a reviewer who did not inspect router implementation or run evaluation."
 }
