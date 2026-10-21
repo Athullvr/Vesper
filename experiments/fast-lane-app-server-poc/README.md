@@ -56,7 +56,19 @@ Vesper prints the session id at startup. Resume that Vesper session and its save
 vesper --resume SESSION_ID
 ```
 
-An optional project path on resume must resolve to the same directory recorded for that session. Enter `:quit` to exit. Ctrl+C requests interruption of an active Codex turn and then exits; the Vesper session metadata remains available to resume.
+An optional project path on resume must resolve to the same directory recorded for that session.
+
+The interactive workspace shows the canonical project path and active Vesper session. Enter a task at `vesper> ` to use local-first routing or a streamed Codex turn. The workspace commands are:
+
+```text
+:sessions              list this project's recent sessions
+:switch SESSION_ID     switch to a saved session in this project
+:new                   create and select a separate session
+:help                  show workspace commands
+:quit                  exit and keep saved sessions
+```
+
+Session lists show at most 50 ids, update times, and whether a saved Codex thread exists; they do not show prompts or conversation text. Switching verifies the saved thread through Codex `thread/resume` before restoring bounded history. A reconnect failure leaves that session selected and saved, reports the error, and retries on a later task. `Ctrl+C` during a Codex turn requests interruption and returns to the prompt when the turn ends; `Ctrl+C` at an idle prompt exits cleanly. EOF also exits. TTY output uses the existing bounded live diff view and cleans up its resize listener; redirected input/output stays line based with no cursor-mode changes.
 
 Exact supported local questions are answered before the app-server starts. Other and ambiguous prompts use the installed Codex app-server. Vesper starts a Codex thread lazily on the first fallback, then sends later fallback prompts to that same thread. Resuming a saved session calls `thread/resume`; it will report an error if that thread or directory cannot be resumed rather than silently replacing it with a new conversation.
 

@@ -318,6 +318,30 @@ test("a launch without a project argument uses the current working directory", a
   assert.ok(output.text().includes(`Project: ${cwd}\n`));
 });
 
+test("bare vesper launch enters the interactive workspace in the current project", async (t) => {
+  const cwd = fs.realpathSync(process.cwd());
+  const store = new SessionStore({ directory: path.join(fixture(t), "sessions") });
+  const output = capture();
+  const errors = capture();
+  let codexStarts = 0;
+
+  const status = await runVesper([], {
+    store,
+    output: output.stream,
+    errorOutput: errors.stream,
+    lineIO: new FakeLineIO(["What Git branch am I on?", ":sessions", ":quit"]),
+    runGit: async () => "feature/interactive\n",
+    clientOptions: { spawnProcess: () => { codexStarts += 1; throw new Error("local routing must not start Codex"); } },
+  });
+
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.equal(codexStarts, 0);
+  assert.ok(output.text().includes(`Project: ${cwd}\n`));
+  assert.match(output.text(), /feature\/interactive/u);
+  assert.match(output.text(), /:switch SESSION_ID/u);
+});
+
 test("Codex fallback persists a thread id in a fresh Vesper session", async (t) => {
   const root = fixture(t);
   const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
@@ -457,6 +481,98 @@ test("a failed saved-thread reconnect keeps the session and the next prompt can 
   assert.equal(fs.readdirSync(store.directory).filter((name) => name.endsWith(".json")).length, 1);
 });
 
+test("interactive session switching lists only this project, verifies reconnect, and recovers without losing sessions", async (t) => {
+  const root = fixture(t);
+  const otherProject = path.join(root, "other-project");
+  fs.mkdirSync(otherProject);
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  const first = store.create(root);
+  store.update(first.sessionId, { threadId: "codex-thread-first" });
+  const second = store.create(root);
+  store.update(second.sessionId, { threadId: "codex-thread-second" });
+  const isolated = store.create(fs.realpathSync(otherProject));
+  store.update(isolated.sessionId, { threadId: "codex-thread-other-project" });
+  const clients = [];
+  const output = capture();
+  const errors = capture();
+
+  const clientFactory = (options) => {
+    const client = new EventEmitter();
+    client.options = options;
+    client.events = [];
+    client.turns = [];
+    client.resumeThread = async (cwd) => {
+      client.events.push(["resume", cwd]);
+      if (options.initialThreadId === "codex-thread-second" && client.events.filter(([kind]) => kind === "resume").length === 1) {
+        throw new Error("temporary reconnect failure");
+      }
+      return options.initialThreadId;
+    };
+    client.readThreadHistory = async () => {
+      client.events.push(["history"]);
+      return { threadId: options.initialThreadId, turns: [], truncated: false };
+    };
+    client.runTurn = async (request) => {
+      client.turns.push(request);
+      client.events.push(["turn"]);
+      request.onDelta(`Answer from ${options.initialThreadId}.`);
+      return { status: "completed" };
+    };
+    client.interrupt = async () => false;
+    client.dispose = () => { client.disposed = true; };
+    clients.push(client);
+    return client;
+  };
+
+  const status = await runVesper(["--resume", first.sessionId], {
+    store,
+    output: output.stream,
+    errorOutput: errors.stream,
+    lineIO: new FakeLineIO([
+      ":sessions",
+      `:switch ${isolated.sessionId}`,
+      ":switch 00000000-0000-4000-8000-000000000000",
+      `:switch ${second.sessionId}`,
+      "Continue the second session",
+      `:switch ${first.sessionId}`,
+      "Continue the first session",
+      ":new",
+      ":sessions",
+      ":quit",
+    ]),
+    clientFactory,
+  });
+
+  const visible = output.text();
+  const createdId = visible.match(/\[Vesper\] New session: ([0-9a-f-]+)/u)?.[1];
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  const initialList = visible.split("Use :switch SESSION_ID to resume one.")[0];
+  assert.match(initialList, new RegExp(first.sessionId, "u"));
+  assert.match(initialList, new RegExp(second.sessionId, "u"));
+  assert.doesNotMatch(initialList, new RegExp(isolated.sessionId, "u"));
+  assert.match(visible, /belongs to .* Vesper is running in/u);
+  assert.match(visible, /was not found/u);
+  assert.match(visible, /temporary reconnect failure/u);
+  assert.match(visible, /Vesper history · empty/u);
+  assert.match(visible, /Answer from codex-thread-second/u);
+  assert.match(visible, /Answer from codex-thread-first/u);
+  assert.ok(createdId);
+  assert.notEqual(createdId, first.sessionId);
+  assert.notEqual(createdId, second.sessionId);
+  assert.equal(store.load(first.sessionId).threadId, "codex-thread-first");
+  assert.equal(store.load(second.sessionId).threadId, "codex-thread-second");
+  assert.equal(store.load(isolated.sessionId).threadId, "codex-thread-other-project");
+  assert.equal(store.load(createdId).cwd, root);
+  assert.equal(clients.length, 4);
+  assert.deepEqual(clients[1].events.slice(0, 3), [["resume", root], ["resume", root], ["history"]]);
+  assert.equal(clients[1].turns.length, 1);
+  assert.deepEqual(clients[2].events.slice(0, 3), [["resume", root], ["history"], ["turn"]]);
+  assert.equal(clients[0].disposed, true);
+  assert.equal(clients[1].disposed, true);
+  assert.equal(clients[2].disposed, true);
+});
+
 test("history retrieval failure is visible but does not prevent a verified saved thread from continuing", async (t) => {
   const root = fixture(t);
   const store = new SessionStore({ directory: path.join(root, ".vesper", "sessions") });
@@ -560,7 +676,11 @@ test("resumed CLI forwards file-review context while preserving session metadata
   assert.equal(errors.text(), "");
   assert.deepEqual(approval, { decision: "accept" });
   assert.match(output.text(), /\| -before\n\| \+after/u);
-  assert.deepEqual(store.load(saved.sessionId), before);
+  const after = store.load(saved.sessionId);
+  assert.equal(after.sessionId, before.sessionId);
+  assert.equal(after.cwd, before.cwd);
+  assert.equal(after.threadId, before.threadId);
+  assert.ok(Date.parse(after.updatedAt) >= Date.parse(before.updatedAt));
   assert.equal(fs.readdirSync(store.directory).filter((file) => file.endsWith(".json")).length, 1);
   assert.equal(fs.existsSync(path.join(root, "example.txt")), false, "the mock approval never performs a real file operation");
 });

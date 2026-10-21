@@ -204,21 +204,46 @@ test("failed and interrupted fallback turns never print a completed or confirmed
   assert.equal(io.questions.length, 3);
 });
 
-test("Ctrl+C requests interruption, reports terminal status, and ends the current frontend run", async () => {
+test("Codex deltas reach the terminal before the turn completes", async () => {
+  let setup;
+  const appServer = new FakeAppServer(async ({ onDelta }) => {
+    onDelta("The streamed answer ");
+    assert.match(setup.output(), /The streamed answer /u);
+    onDelta("continues here.");
+    return { status: "completed" };
+  });
+  setup = makeFrontend({ appServer, answers: ["Explain a design", ":quit"] });
+
+  await setup.frontend.run();
+
+  assert.match(setup.output(), /The streamed answer continues here\./u);
+  assert.ok(setup.output().indexOf("continues here.") < setup.output().indexOf("[Codex · completed"));
+});
+
+test("Ctrl+C interrupts the active turn and the workspace accepts a later task", async () => {
   let io;
-  const appServer = new FakeAppServer(async () => new Promise((resolve) => {
-    queueMicrotask(() => {
-      io.interrupt();
-      resolve({ status: "interrupted" });
-    });
-  }));
-  const setup = makeFrontend({ answers: ["Build a website", ":quit"], appServer });
+  let turnCount = 0;
+  const appServer = new FakeAppServer(async ({ onDelta }) => {
+    turnCount += 1;
+    if (turnCount === 1) {
+      return new Promise((resolve) => queueMicrotask(() => {
+        io.interrupt();
+        resolve({ status: "interrupted" });
+      }));
+    }
+    onDelta("The next task still works.");
+    return { status: "completed" };
+  });
+  const setup = makeFrontend({ answers: ["Build a website", "Explain Git refs", ":quit"], appServer });
   io = setup.io;
 
   await setup.frontend.run();
   assert.equal(appServer.interrupted, true);
-  assert.match(setup.output(), /interrupting Codex/u);
+  assert.match(setup.output(), /interrupting this turn/u);
   assert.match(setup.output(), /Codex · interrupted/u);
+  assert.match(setup.output(), /The next task still works\./u);
+  assert.match(setup.output(), /Codex · completed/u);
+  assert.equal(turnCount, 2);
   assert.equal(setup.io.closed, true);
 });
 
@@ -289,6 +314,32 @@ test("approval details that exceed the review limit are declined without asking"
 
 test("streamed model text cannot inject terminal control sequences", () => {
   assert.equal(safeStreamText("answer\u001b[2J\rnext"), "answer\\x1b[2J\\rnext");
+  assert.equal(safeStreamText("API_KEY=stream-secret"), "API_KEY=[redacted]");
+  assert.equal(safeStreamText("safe\u202e text"), "safe\\u202e text");
+});
+
+test("streamed responses redact secrets and stop at a bounded terminal output size", async () => {
+  const appServer = new FakeAppServer(async ({ onDelta }) => {
+    onDelta("API_KEY=");
+    onDelta("stream-secret\n");
+    onDelta("-----BEGIN PRI");
+    onDelta("VATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----\n");
+    onDelta("sk-proj-1234");
+    onDelta("56789012\n");
+    onDelta("https://user:");
+    onDelta("url-password@host.test \n");
+    onDelta("x".repeat(300_000));
+    return { status: "completed" };
+  });
+  const { frontend, output } = makeFrontend({ appServer, answers: ["Explain the project", ":quit"] });
+  await frontend.run();
+  assert.match(output(), /API_KEY=\[redacted\]/u);
+  assert.doesNotMatch(output(), /stream-secret/u);
+  assert.doesNotMatch(output(), /private-key-material/u);
+  assert.doesNotMatch(output(), /sk-proj-123456789012/u);
+  assert.doesNotMatch(output(), /url-password/u);
+  assert.match(output(), /Streamed response truncated at the terminal output limit/u);
+  assert.ok(output().length < 260_000);
 });
 
 test("app-server command item and output notifications render bounded activity through the terminal", async () => {
@@ -494,6 +545,47 @@ test("invalidating an open file review cancels readline and permits the next pro
   input.write("What is the current Git branch?\n");
   assert.equal(await nextPrompt, "What is the current Git branch?");
   assert.equal(frontend.pendingApprovals.size, 0);
+});
+
+test("TTY resize listeners are removed on exit and the live diff does not hide the cursor", async () => {
+  const outputStream = new EventEmitter();
+  outputStream.isTTY = true;
+  outputStream.columns = 80;
+  outputStream.rows = 24;
+  let outputText = "";
+  outputStream.write = (text) => { outputText += String(text); return true; };
+  const input = { isTTY: true };
+  let frontend;
+  const appServer = new FakeAppServer(async () => {
+    frontend.handleProgress({ type: "turn_identity", threadId: "thread-1", turnId: "turn-1", fileChanges: [] });
+    frontend.handleProgress({ type: "turn_diff_updated", activity: {
+      threadId: "thread-1", turnId: "turn-1", evidenceState: "available", diff: "+line",
+    } });
+    assert.equal(outputStream.listenerCount("resize"), 1);
+    outputStream.emit("resize");
+    return { status: "completed" };
+  });
+  const lineIO = new FakeLineIO(["Explain the change", ":quit"]);
+  frontend = new TerminalFrontend({
+    cwd: "/workspace/project", handlers: {}, appServer, input, output: outputStream, lineIO,
+  });
+  await frontend.run();
+  assert.equal(outputStream.listenerCount("resize"), 0);
+  assert.equal(lineIO.closed, true);
+  assert.doesNotMatch(outputText, /\u001b\[\?25l/u);
+});
+
+test("redirected line input reads prompts and EOF without enabling terminal controls", async (t) => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const io = createLineIO(input, output);
+  t.after(() => { io.close(); input.destroy(); output.destroy(); });
+  const answer = io.question("vesper> ");
+  input.write("A task from a pipe\n");
+  assert.equal(await answer, "A task from a pipe");
+  input.end();
+  assert.equal(await io.question("vesper> "), null);
+  assert.equal(output.isTTY, undefined);
 });
 
 test("terminal renders one distinct, bounded turn-level aggregate view for the latest snapshot", () => {

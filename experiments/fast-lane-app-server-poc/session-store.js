@@ -107,6 +107,13 @@ class SessionStore {
     return next;
   }
 
+  touch(sessionId) {
+    const current = this.load(sessionId);
+    const next = { ...current, updatedAt: this.now().toISOString() };
+    this.write(next);
+    return next;
+  }
+
   write(session) {
     if (!isValidSession(session)) throw new TypeError("Invalid Vesper session metadata.");
     this.ensureDirectory();

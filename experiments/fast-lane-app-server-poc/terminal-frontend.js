@@ -15,9 +15,27 @@ const MAX_FILE_ACTIVITY_CHANGES_PER_ITEM = 8;
 const MAX_FILE_ACTIVITY_PATH_LENGTH = 1_024;
 const FILE_ACTIVITY_LIMIT_MARKER = "\n[Vesper] File-change summary output is limited; later summaries or updates are omitted.\n";
 const MAX_TURN_DIFF_RENDERED_LENGTH = 16_000;
+const MAX_STREAMED_TURN_OUTPUT = 256_000;
+const STREAMED_OUTPUT_LIMIT_MARKER = "\n[Vesper] Streamed response truncated at the terminal output limit.\n";
+const PRIVATE_KEY_START = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/iu;
+const PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/iu;
+const STREAM_URL_CREDENTIAL_START = /\bhttps?:\/\/[^:/\s]+:/giu;
+const STREAM_PARTIAL_TOKEN_SUFFIX = /(?:\bhttps?:\/\/\S*|\bsk-(?:proj-)?[A-Za-z0-9_-]*|\bgh[pousr]_[A-Za-z0-9_]*|\bgithub_pat_[A-Za-z0-9_]*|\bxox[baprs]-[A-Za-z0-9-]*|\bAKIA[0-9A-Z]*)$/iu;
+const STREAM_SENSITIVE_STARTS = [
+  /\bAuthorization\s*:\s*(?:Bearer|Basic)\s+/giu,
+  /\bBearer\s+/giu,
+  /\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|password|passwd|secret|client[_-]?secret|private[_-]?key)\s*[:=]\s*/giu,
+  /(?<![\p{L}\p{N}_])--?(?:password|passwd|token|secret|api-key|access-token|client-secret)(?:=|\s+)/giu,
+];
+const STREAM_SENSITIVE_MARKER_NAMES = [
+  "authorization", "bearer", "api_key", "api-key", "apikey", "access_token", "access-token", "accesstoken",
+  "refresh_token", "refresh-token", "refreshtoken", "auth_token", "auth-token", "authtoken", "password", "passwd",
+  "secret", "client_secret", "client-secret", "clientsecret", "private_key", "private-key", "privatekey",
+  "--password", "--passwd", "--token", "--secret", "--api-key", "--access-token", "--client-secret",
+];
 
 class TerminalFrontend {
-  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null } = {}) {
+  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask } = {}) {
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (!handlers || typeof handlers !== "object") throw new TypeError("Local handlers are required.");
     if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
@@ -26,12 +44,21 @@ class TerminalFrontend {
     this.appServer = appServer;
     this.savedThreadId = savedThreadId;
     this.savedHistoryState = savedThreadId ? "pending" : "not-needed";
+    this.sessionId = sessionId;
+    this.onWorkspaceCommand = onWorkspaceCommand;
+    this.onTask = onTask;
     this.output = output;
     this.lineIO = lineIO || createLineIO(input, output);
     this.metrics = metrics;
     this.activeRequest = false;
     this.exitAfterTurn = false;
+    this.interruptPending = false;
     this.closed = false;
+    this.streamedOutputLength = 0;
+    this.streamLimitReported = false;
+    this.streamInputLength = 0;
+    this.streamInputLimitReached = false;
+    this.streamPending = "";
     this.commandActivity = null;
     this.fileActivityIdentities = new Set();
     this.fileActivityOutputLength = 0;
@@ -55,8 +82,8 @@ class TerminalFrontend {
 
   async run() {
     this.write("Vesper · local routing with Codex app-server fallback\n");
-    this.write(`Project: ${this.cwd}\n`);
-    this.write("Use :quit to exit. Local answers do not start Codex turns.\n\n");
+    this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
+    this.write("Use :sessions to list sessions, :switch ID to resume one, :new for a separate session, and :quit to exit. Local answers do not start Codex turns.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -81,6 +108,23 @@ class TerminalFrontend {
   }
 
   async handlePrompt(prompt) {
+    if (prompt.startsWith(":")) {
+      try {
+        if (await this.onWorkspaceCommand?.(prompt, this)) return;
+      } catch (error) {
+        this.write(`[Vesper command error] ${safeTerminalText(error?.message || error)}\n`);
+        return;
+      }
+      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, or :quit.\n`);
+      return;
+    }
+
+    try {
+      await this.onTask?.(prompt);
+    } catch (error) {
+      this.write(`[Vesper session warning] Could not update session activity time: ${safeTerminalText(error?.message || error)}\n`);
+    }
+
     const startedAt = Date.now();
     const decision = classifyRequest(prompt);
 
@@ -102,7 +146,13 @@ class TerminalFrontend {
     }
 
     this.activeRequest = true;
+    this.interruptPending = false;
     this.commandActivity = new CommandActivityStore();
+    this.streamedOutputLength = 0;
+    this.streamLimitReported = false;
+    this.streamInputLength = 0;
+    this.streamInputLimitReached = false;
+    this.streamPending = "";
     this.turnDiffIdentity = null;
     this.turnDiffRendered = false;
     this.pendingTurnDiffFinal = null;
@@ -121,13 +171,14 @@ class TerminalFrontend {
           return this.appServer.runTurn({
             prompt,
             cwd: this.cwd,
-            onDelta: (delta) => this.write(safeStreamText(delta)),
+            onDelta: (delta) => this.writeStreamDelta(delta),
           });
         },
       });
       const result = routed.fallbackResult;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs);
+      this.finishStream();
       if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
       else if (result?.status === "timeout") this.write("\n\n[Codex · timed out and interrupted]\n");
@@ -135,8 +186,10 @@ class TerminalFrontend {
     } catch (error) {
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs);
+      this.finishStream();
       this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
+      this.finishStream();
       this.turnDiffView.end();
       this.activeRequest = false;
       this.commandActivity = null;
@@ -263,6 +316,87 @@ class TerminalFrontend {
     }
   }
 
+  replaceAppServer(appServer, { sessionId = null, savedThreadId = null } = {}) {
+    if (this.activeRequest || this.pendingApprovals.size) throw new Error("A Vesper session can only be switched while the terminal is idle.");
+    if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
+    this.appServer.off?.("progress", this.handleProgress);
+    this.appServer = appServer;
+    this.appServer.on?.("progress", this.handleProgress);
+    this.sessionId = sessionId;
+    this.savedThreadId = savedThreadId;
+    this.savedHistoryState = savedThreadId ? "pending" : "not-needed";
+    this.turnDiffIdentity = null;
+    this.turnDiffRendered = false;
+    this.pendingTurnDiffFinal = null;
+    this.commandActivity = null;
+  }
+
+  writeStreamDelta(delta) {
+    if (this.streamLimitReported || this.streamInputLimitReached) return;
+    const source = String(delta ?? "");
+    const remainingInput = Math.max(0, MAX_STREAMED_TURN_OUTPUT - this.streamInputLength);
+    const accepted = source.slice(0, remainingInput);
+    this.streamInputLength += accepted.length;
+    this.streamPending += accepted;
+    this.flushStreamPrefix();
+    if (accepted.length < source.length) {
+      this.streamInputLimitReached = true;
+      this.finishStreamPending();
+      this.writeStreamLimitMarker();
+    }
+  }
+
+  flushStreamPrefix() {
+    if (!this.streamPending) return;
+    const protectedStart = findOpenSensitiveSpan(this.streamPending, this.streamPending.length);
+    const partialMarkerStart = findPartialSensitiveMarkerStart(this.streamPending);
+    let cut = protectedStart < 0 ? this.streamPending.length : protectedStart;
+    if (partialMarkerStart >= 0) cut = Math.min(cut, partialMarkerStart);
+    if (cut <= 0) return;
+    const prefix = this.streamPending.slice(0, cut);
+    this.streamPending = this.streamPending.slice(cut);
+    this.writeSanitizedStreamText(prefix);
+  }
+
+  finishStream() {
+    if (this.streamPending) this.finishStreamPending();
+    if (this.streamInputLimitReached) this.writeStreamLimitMarker();
+  }
+
+  finishStreamPending() {
+    const pending = this.streamPending;
+    this.streamPending = "";
+    const start = PRIVATE_KEY_START.exec(pending);
+    if (start && !PRIVATE_KEY_END.test(pending.slice(start.index + start[0].length))) {
+      const prefix = pending.slice(0, start.index);
+      this.writeSanitizedStreamText(prefix);
+      this.writeSanitizedStreamText("[redacted private key]");
+      return;
+    }
+    this.writeSanitizedStreamText(pending);
+  }
+
+  writeSanitizedStreamText(value) {
+    if (this.streamLimitReported || !value) return;
+    const text = safeStreamText(value);
+    const contentLimit = MAX_STREAMED_TURN_OUTPUT - STREAMED_OUTPUT_LIMIT_MARKER.length;
+    const remaining = Math.max(0, contentLimit - this.streamedOutputLength);
+    const visible = text.slice(0, remaining);
+    if (visible) {
+      this.write(visible);
+      this.streamedOutputLength += visible.length;
+    }
+    if (visible.length < text.length) {
+      this.writeStreamLimitMarker();
+    }
+  }
+
+  writeStreamLimitMarker() {
+    if (this.streamLimitReported) return;
+    this.write(STREAMED_OUTPUT_LIMIT_MARKER);
+    this.streamLimitReported = true;
+  }
+
   handleProgress(event) {
     if (!event || typeof event !== "object") return;
     switch (event.type) {
@@ -305,6 +439,7 @@ class TerminalFrontend {
         this.updateTurnDiffActivity(event.activity);
         break;
       case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
+      case "disconnected": this.write(`[Codex disconnected] ${safeTerminalText(event.reason || "app-server connection closed")}\n`); break;
       case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
       case "file_approval_declined": this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.reason)}\n`); break;
       default: break;
@@ -366,13 +501,16 @@ class TerminalFrontend {
   }
 
   handleInterrupt() {
-    this.exitAfterTurn = true;
     if (this.activeRequest) {
-      this.write("\n[Vesper] Ctrl+C received; interrupting Codex and saving the session.\n");
+      if (this.interruptPending) return;
+      this.interruptPending = true;
+      this.lineIO.cancelPending?.();
+      this.write("\n[Vesper] Ctrl+C received; interrupting this turn. Vesper will return to the prompt when it ends.\n");
       Promise.resolve(this.appServer.interrupt?.()).catch((error) => {
         this.write(`[Vesper interrupt error] ${safeTerminalText(error?.message || error)}\n`);
       });
     } else {
+      this.exitAfterTurn = true;
       this.lineIO.close?.();
     }
   }
@@ -391,10 +529,12 @@ function createLineIO(input, output) {
   const rl = readline.createInterface({ input, output, terminal: Boolean(input.isTTY && output.isTTY) });
   let closed = false;
   let pendingResolve;
+  let pendingAbortController;
   const interruptHandlers = new Set();
 
   rl.on("close", () => {
     closed = true;
+    pendingAbortController?.abort();
     if (pendingResolve) {
       const resolve = pendingResolve;
       pendingResolve = undefined;
@@ -402,27 +542,47 @@ function createLineIO(input, output) {
     }
   });
   rl.on("SIGINT", () => {
+    if (!interruptHandlers.size) {
+      pendingAbortController?.abort();
+      rl.close();
+      return;
+    }
     for (const handler of interruptHandlers) handler();
-    rl.close();
   });
 
   return {
     question(prompt, { signal } = {}) {
       if (closed || signal?.aborted) return Promise.resolve(null);
       return new Promise((resolve, reject) => {
+        const controller = new AbortController();
+        pendingAbortController = controller;
+        let settled = false;
         const finish = (answer) => {
+          if (settled) return;
+          settled = true;
           signal?.removeEventListener("abort", abort);
-          if (pendingResolve === finish) pendingResolve = undefined;
-          resolve(answer);
+          controller.signal.removeEventListener("abort", onAbort);
+          if (pendingResolve === finish) {
+            pendingResolve = undefined;
+            pendingAbortController = undefined;
+          }
+          resolve(answer ?? null);
         };
-        const abort = () => finish(null);
+        const abort = () => {
+          controller.abort();
+          finish(null);
+        };
+        const onAbort = () => finish(null);
         pendingResolve = finish;
+        controller.signal.addEventListener("abort", onAbort, { once: true });
         signal?.addEventListener("abort", abort, { once: true });
         try {
-          rl.question(prompt, { signal }, finish);
+          rl.question(prompt, { signal: controller.signal }, finish);
         } catch (error) {
           signal?.removeEventListener("abort", abort);
           pendingResolve = undefined;
+          pendingAbortController = undefined;
+          controller.signal.removeEventListener("abort", onAbort);
           reject(error);
         }
       });
@@ -433,6 +593,11 @@ function createLineIO(input, output) {
     },
     close() {
       if (!closed) rl.close();
+    },
+    cancelPending() {
+      if (!pendingAbortController) return false;
+      pendingAbortController.abort();
+      return true;
     },
   };
 }
@@ -507,7 +672,7 @@ function approvalDetails(method, params, fileChange) {
 }
 
 function safeTerminalText(value) {
-  return escapeTerminalControls(value).slice(0, 4_000);
+  return escapeTerminalField(redactSensitiveText(value)).slice(0, 4_000);
 }
 
 function escapeTerminalControls(value) {
@@ -518,10 +683,69 @@ function escapeTerminalControls(value) {
 }
 
 function safeStreamText(value) {
-  return String(value ?? "")
-    .replace(/\u001b/gu, "\\x1b")
-    .replace(/\r/gu, "\\r")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ");
+  return escapeTerminalOutput(redactSensitiveText(value));
+}
+
+function findOpenSensitiveSpan(text, cut) {
+  const privateKeyStart = PRIVATE_KEY_START.exec(text);
+  if (privateKeyStart && privateKeyStart.index < cut) {
+    const end = PRIVATE_KEY_END.exec(text.slice(privateKeyStart.index + privateKeyStart[0].length));
+    if (!end || privateKeyStart.index + privateKeyStart[0].length + end.index >= cut) return privateKeyStart.index;
+  }
+
+  let protectedStart = -1;
+  STREAM_URL_CREDENTIAL_START.lastIndex = 0;
+  let urlMatch;
+  while ((urlMatch = STREAM_URL_CREDENTIAL_START.exec(text)) !== null) {
+    if (urlMatch.index >= cut) break;
+    const afterCredentials = urlMatch.index + urlMatch[0].length;
+    const at = text.indexOf("@", afterCredentials);
+    const delimiter = text.slice(afterCredentials).search(/[\s/]/u);
+    if (at < 0 && (delimiter < 0 || afterCredentials + delimiter >= cut)) {
+      protectedStart = urlMatch.index;
+      break;
+    }
+  }
+  for (const pattern of STREAM_SENSITIVE_STARTS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      if (match.index >= cut) break;
+      let valueIndex = match.index + match[0].length;
+      while (/\s/u.test(text[valueIndex] || "") && valueIndex < text.length) valueIndex += 1;
+      if (valueIndex >= cut) {
+        protectedStart = protectedStart < 0 ? match.index : Math.min(protectedStart, match.index);
+        continue;
+      }
+      const quote = text[valueIndex] === "'" || text[valueIndex] === '"' ? text[valueIndex] : null;
+      if (quote) {
+        const close = text.indexOf(quote, valueIndex + 1);
+        if (close < 0 || close >= cut) protectedStart = protectedStart < 0 ? match.index : Math.min(protectedStart, match.index);
+        continue;
+      }
+      const delimiter = text.slice(valueIndex).search(/[\s;&|]/u);
+      if (delimiter < 0 || valueIndex + delimiter >= cut) {
+        protectedStart = protectedStart < 0 ? match.index : Math.min(protectedStart, match.index);
+      }
+    }
+  }
+  return protectedStart;
+}
+
+function findPartialSensitiveMarkerStart(text) {
+  const privateKeyStart = text.lastIndexOf("-----BEGIN");
+  if (privateKeyStart >= 0 && /^-----BEGIN(?: [A-Z0-9 ]*)?$/iu.test(text.slice(privateKeyStart))) return privateKeyStart;
+  const trailingWord = text.match(/\S+$/u)?.[0]?.toLowerCase();
+  if (trailingWord) {
+    for (const marker of STREAM_SENSITIVE_MARKER_NAMES) {
+      if (trailingWord.length <= marker.length && marker.startsWith(trailingWord)) {
+        return text.length - trailingWord.length;
+      }
+    }
+  }
+  const partialToken = STREAM_PARTIAL_TOKEN_SUFFIX.exec(text);
+  if (partialToken) return partialToken.index;
+  return -1;
 }
 
 function isFileActivityIdentity(activity) {
@@ -674,4 +898,5 @@ module.exports = {
   MAX_FILE_ACTIVITY_ITEMS,
   MAX_FILE_ACTIVITY_OUTPUT_LENGTH,
   MAX_TURN_DIFF_RENDERED_LENGTH,
+  MAX_STREAMED_TURN_OUTPUT,
 };

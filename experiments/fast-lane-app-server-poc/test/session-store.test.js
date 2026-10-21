@@ -80,6 +80,22 @@ test("project lookup restores the most recently used exact canonical project ses
   assert.equal(store.load(first.sessionId).threadId, null);
 });
 
+test("touch updates session ordering without changing the saved Codex thread", (t) => {
+  const root = temporaryRoot(t);
+  let now = new Date("2026-10-19T12:00:00.000Z");
+  const store = new SessionStore({ directory: path.join(root, "sessions"), now: () => now });
+  const first = store.create("/workspace/project");
+  const second = store.create("/workspace/project");
+  const saved = store.update(first.sessionId, { threadId: "codex-saved-thread" });
+  now = new Date("2026-10-19T12:02:00.000Z");
+
+  const touched = store.touch(saved.sessionId);
+  assert.equal(touched.updatedAt, now.toISOString());
+  assert.equal(touched.threadId, "codex-saved-thread");
+  assert.equal(store.findLatestByCwd("/workspace/project").sessionId, first.sessionId);
+  assert.equal(store.load(second.sessionId).threadId, null);
+});
+
 test("project session listing is isolated, newest first, deterministic on ties, and bounded", (t) => {
   const root = temporaryRoot(t);
   let now = new Date("2026-10-19T12:00:00.000Z");

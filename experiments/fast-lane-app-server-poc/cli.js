@@ -26,7 +26,9 @@ Usage:
 Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
 or creates one when no session exists. The default project is the current working directory.
 Session listings are project-scoped and show at most ${MAX_SESSION_LIST_ENTRIES} recent metadata records.
-Enter :quit to exit. Ctrl+C interrupts an active Codex turn.
+Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID to resume one,
+:new to start another session, and :quit to exit. Ctrl+C interrupts an active turn and returns
+to the prompt when the turn ends.
 
 Discovery commands are read-only. They show local sources and report unknown state when Codex does not
 expose it. Vesper does not install or change integrations.
@@ -256,14 +258,81 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
 
     let terminal;
     const clientFactory = dependencies.clientFactory || ((clientOptions) => new AppServerClient(clientOptions));
-    appServer = clientFactory({
-      initialThreadId: session.threadId,
+    const createClient = (selectedSession) => clientFactory({
+      ...(dependencies.clientOptions || {}),
+      initialThreadId: selectedSession.threadId,
       onThreadId: async (threadId) => {
-        session = store.update(session.sessionId, { threadId });
+        const updated = store.update(selectedSession.sessionId, { threadId });
+        if (session.sessionId === selectedSession.sessionId) session = updated;
       },
       onApproval: (method, params, context) => terminal.requestApproval(method, params, context),
-      ...(dependencies.clientOptions || {}),
     });
+    appServer = createClient(session);
+
+    const activateSession = async (selectedSession, action) => {
+      const nextClient = createClient(selectedSession);
+      const previousClient = appServer;
+      try {
+        terminal.replaceAppServer(nextClient, {
+          sessionId: selectedSession.sessionId,
+          savedThreadId: selectedSession.threadId,
+        });
+      } catch (error) {
+        nextClient.dispose?.();
+        throw error;
+      }
+      session = selectedSession;
+      appServer = nextClient;
+      previousClient?.dispose?.();
+      output.write(`\n[Vesper] ${action}: ${safeCliField(session.sessionId)} · ${session.threadId ? "saved Codex thread" : "no Codex thread yet"}\n`);
+      output.write(`Project: ${safeCliField(cwd)}\n`);
+      if (session.threadId) {
+        try {
+          await terminal.restoreSavedHistory();
+        } catch (error) {
+          output.write(`[Vesper reconnect error] ${safeTerminalText(error?.message || error)}. The session remains selected; retry with another prompt.\n`);
+        }
+      }
+    };
+
+    const handleWorkspaceCommand = async (command) => {
+      const [name, ...args] = command.trim().split(/\s+/u);
+      if (name === ":help" && args.length === 0) {
+        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :quit\n");
+        return true;
+      }
+      if (name === ":sessions" && args.length === 0) {
+        const sessions = store.listByCwd(cwd, MAX_SESSION_LIST_ENTRIES);
+        output.write(`\n[Vesper sessions · ${safeCliField(cwd)} · newest first · maximum ${MAX_SESSION_LIST_ENTRIES}]\n`);
+        if (!sessions.length) output.write("No Vesper sessions found for this project.\n");
+        for (const item of sessions) {
+          const current = item.sessionId === session.sessionId ? " · current" : "";
+          const thread = item.threadId ? "saved Codex thread" : "no Codex thread";
+          output.write(`${safeCliField(item.sessionId)}  ${safeCliField(item.updatedAt)}  ${thread}${current}\n`);
+        }
+        output.write("Use :switch SESSION_ID to resume one.\n");
+        return true;
+      }
+      if (name === ":new" && args.length === 0) {
+        await activateSession(store.create(cwd), "New session");
+        return true;
+      }
+      if (name === ":switch" && args.length === 1) {
+        const selected = store.load(args[0]);
+        const savedCwd = resolveProjectDirectory(selected.cwd);
+        if (savedCwd !== cwd) {
+          throw new Error(`Vesper session ${selected.sessionId} belongs to ${savedCwd}; Vesper is running in ${cwd}. Choose a session listed by :sessions.`);
+        }
+        if (selected.sessionId === session.sessionId) {
+          output.write(`[Vesper] ${safeCliField(selected.sessionId)} is already the current session.\n`);
+          return true;
+        }
+        await activateSession(selected, "Session switched");
+        return true;
+      }
+      output.write("Usage: :sessions | :switch SESSION_ID | :new | :help | :quit\n");
+      return true;
+    };
 
     const handlers = dependencies.handlers || createLocalHandlers({ runGit: dependencies.runGit || runGitCommand });
     terminal = new TerminalFrontend({
@@ -275,6 +344,11 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       lineIO: dependencies.lineIO,
       metrics: dependencies.metrics,
       savedThreadId: session.threadId,
+      sessionId: session.sessionId,
+      onWorkspaceCommand: handleWorkspaceCommand,
+      onTask: () => {
+        session = store.touch(session.sessionId);
+      },
     });
     await terminal.run();
     return 0;
@@ -302,7 +376,7 @@ function runGitCommand(args, cwd) {
 }
 
 function safeCliField(value) {
-  return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/gu, " ").slice(0, 4_000);
+  return safeTerminalText(value);
 }
 
 module.exports = {
