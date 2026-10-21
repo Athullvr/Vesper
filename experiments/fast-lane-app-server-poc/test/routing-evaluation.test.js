@@ -83,12 +83,16 @@ test("original offline routing baseline remains unchanged", async (t) => {
   assertReportDoesNotExposePromptsOrEvidence(report, BASELINE_CASES, metricsSnapshot);
 });
 
-test("held-out routing evaluation reports generalization without tuning or changing labels", async (t) => {
+test("the previously evaluated held-out set remains a routing regression diagnostic", async (t) => {
   assertFixtureFingerprints();
   const { metricsSnapshot, report } = await evaluateFixtureSet(HELDOUT_CASES);
-  writeEvaluationDiagnostic(t, report, "held-out", EXPECTED_FINGERPRINTS.heldout);
+  writeEvaluationDiagnostic(t, report, "previously evaluated held-out regression", EXPECTED_FINGERPRINTS.heldout);
 
   assert.equal(report.casesEvaluated, 40);
+  assert.equal(report.correctRouteDecisions, 40);
+  assert.equal(report.incorrectRouteDecisions, 0);
+  assert.equal(report.expectedBehaviorMatches, 40);
+  assert.equal(report.unnecessaryDelegations, 0);
   assert.equal(report.correctRouteDecisions + report.incorrectRouteDecisions, 40);
   assert.equal(report.expectedBehaviorMatches + report.expectedBehaviorMismatches, 40);
   assert.equal(metricsSnapshot.routingDecisionCount, 40);

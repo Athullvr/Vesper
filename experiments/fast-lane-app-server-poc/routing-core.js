@@ -92,12 +92,23 @@ const INTENT_PATTERNS = new Map([
   [LOCAL_INTENTS.CURRENT_GIT_BRANCH, [
     /^(?:name|tell me the name of|give me the name of|what is the name of) (?:the )?(?:checked out|current|active) (?:git )?branch$/u,
     /^(?:which|what) branch is (?:currently )?(?:active|checked out)(?: in this checkout)?$/u,
+    /^(?:which|what) (?:git )?branch am i (?:currently )?on(?: right now)?$/u,
+    /^(?:im|i am) on which branch$/u,
   ]],
   [LOCAL_INTENTS.WORKING_TREE_STATUS, [
     /^(?:do i have|are there) (?:any )?(?:uncommitted (?:file )?(?:changes|edits)|(?:local|working tree|worktree) edits|edits in (?:my )?(?:working tree|worktree))$/u,
   ]],
   [LOCAL_INTENTS.MOST_RECENT_TEST_RESULT, [
     /^(?:did|has|have|was|were) (?:the|my) (?:latest|most recent|last) (?:test run|test results|tests?) (?:pass|passed|succeed|succeeded|successful)$/u,
+  ]],
+  [LOCAL_INTENTS.BRANCH_UPSTREAM, [
+    /^(?:what|which) remote branch is (?:this|my) checkout tracking$/u,
+    /^(?:what|which) remote tracking branch is configured for (?:this|my) checkout$/u,
+    /^(?:which|what) branch is configured as this branch upstream$/u,
+  ]],
+  [LOCAL_INTENTS.AHEAD_OF_UPSTREAM, [
+    /^how many commits ahead of (?:(?:its|the) )?(?:configured )?upstream is (?:the )?current branch$/u,
+    /^how many commits is the current branch ahead of (?:its )?(?:configured )?upstream$/u,
   ]],
 ]);
 
@@ -122,6 +133,7 @@ function normalizeRequest(request) {
   return String(request ?? "")
     .normalize("NFKC")
     .toLowerCase()
+    .replace(/\b(this branch)['’]s(?=\s+(?:configured )?upstream\b)/gu, "$1")
     .replace(/[’'`]/gu, "")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()

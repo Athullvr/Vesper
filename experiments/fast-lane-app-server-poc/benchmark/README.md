@@ -45,6 +45,14 @@ The original baseline remains **12/12 expected behavior matches (100%)**, with 0
 
 The held-out reason-code group `local_ambiguous` had 12 expected delegations and the five local-intent misses above; `codex_fallback` delegated all five cases as expected. Its 22 mock fallback requests show dispatch only. No real Codex turn or answer was evaluated.
 
+The case-by-case Phase 2E diagnosis and proposed narrowly scoped repair are in [`phase-2e-paraphrase-diagnosis.md`](phase-2e-paraphrase-diagnosis.md). No repair was implemented in that review.
+
+### Phase 2F targeted Git-intent repair regression
+
+The baseline remains **12/12 expected behavior matches**. After adding the narrowly scoped Git-intent rules, the same pinned 40-case Phase 2D set was rerun as a **previously evaluated regression diagnostic**, not as a fresh holdout: **40/40 expected behavior matches**, 0 incorrect routes, 11 appropriate abstentions, 0 unsafe confirmed local-answer decisions, and 0 unnecessary delegations. The five Phase 2D paraphrase misses now reach their expected local handlers using synthetic Git evidence. Mock fallback counts show dispatch only; no live Codex turns were started. This repeated set does not establish generalization from the five repairs; a new, independently reviewed evaluation set is still needed.
+
+The repair-specific routing, handler, evidence-state, fail-closed, metrics-deduplication, and diagnostic-privacy tests are in `test/git-paraphrase-routing.test.js`. The original fixture labels and fingerprints remain unchanged.
+
 For the direct baseline, run:
 
 ```sh
