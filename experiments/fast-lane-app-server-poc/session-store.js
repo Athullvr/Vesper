@@ -8,6 +8,7 @@ const path = require("node:path");
 const SESSION_SCHEMA_VERSION = 1;
 const MAX_SESSION_FILE_BYTES = 16_384;
 const MAX_PROJECT_SESSION_SCAN = 10_000;
+const MAX_SESSION_LIST_ENTRIES = 50;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SESSION_KEYS = new Set(["schemaVersion", "sessionId", "cwd", "threadId", "createdAt", "updatedAt"]);
 
@@ -62,8 +63,15 @@ class SessionStore {
   }
 
   findLatestByCwd(cwd) {
+    return this.listByCwd(cwd, 1)[0] || null;
+  }
+
+  listByCwd(cwd, limit = MAX_SESSION_LIST_ENTRIES) {
     if (typeof cwd !== "string" || !path.isAbsolute(cwd) || /[\u0000-\u001f\u007f]/u.test(cwd)) {
       throw new TypeError("Session project directory must be an absolute path.");
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SESSION_LIST_ENTRIES) {
+      throw new TypeError(`Session list limit must be an integer from 1 to ${MAX_SESSION_LIST_ENTRIES}.`);
     }
     this.ensureDirectory();
     const files = fs.readdirSync(this.directory)
@@ -72,17 +80,20 @@ class SessionStore {
       throw new Error("Too many Vesper sessions to safely find this project conversation.");
     }
 
-    let latest;
+    const sessions = [];
     for (const name of files) {
       const sessionId = name.slice(0, -5);
       const session = this.load(sessionId);
       if (path.resolve(session.cwd) !== path.resolve(cwd)) continue;
-      if (!latest || Date.parse(session.updatedAt) > Date.parse(latest.updatedAt) ||
-          (session.updatedAt === latest.updatedAt && session.sessionId > latest.sessionId)) {
-        latest = session;
-      }
+      sessions.push(session);
     }
-    return latest || null;
+    sessions.sort((left, right) => {
+      const updatedOrder = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+      if (updatedOrder) return updatedOrder;
+      if (right.sessionId === left.sessionId) return 0;
+      return right.sessionId > left.sessionId ? 1 : -1;
+    });
+    return sessions.slice(0, limit);
   }
 
   update(sessionId, changes) {
@@ -172,6 +183,7 @@ function isValidSession(session) {
 }
 
 module.exports = {
+  MAX_SESSION_LIST_ENTRIES,
   SESSION_SCHEMA_VERSION,
   SessionStore,
   defaultSessionDirectory,

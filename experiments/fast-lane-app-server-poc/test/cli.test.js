@@ -63,15 +63,26 @@ function clientFactoryFor(calls, historyTurns = []) {
 
 test("CLI parsing supports explicit new sessions and resume without silently accepting unknown flags", () => {
   assert.deepEqual(parseArgs(["--new", "/workspace"]), {
-    newSession: true, resumeId: null, help: false, projectDirectory: "/workspace",
+    command: "run", newSession: true, resumeId: null, help: false, projectDirectory: "/workspace",
   });
   assert.deepEqual(parseArgs(["--resume", "00000000-0000-4000-8000-000000000000"]), {
-    newSession: false, resumeId: "00000000-0000-4000-8000-000000000000", help: false, projectDirectory: null,
+    command: "run", newSession: false, resumeId: "00000000-0000-4000-8000-000000000000", help: false, projectDirectory: null,
   });
   assert.throws(() => parseArgs(["--new", "--resume", "00000000-0000-4000-8000-000000000000"]), /either --new or --resume/u);
   assert.throws(() => parseArgs(["--skip-approval"]), /Unknown option/u);
   assert.equal(parseArgs(["run", "--help"]).help, true);
-  assert.throws(() => parseArgs(["plugins"]), /command is not available/u);
+  assert.deepEqual(parseArgs(["sessions", "list", "/workspace"]), {
+    command: "sessions", action: "list", projectDirectory: "/workspace", help: false,
+  });
+  assert.deepEqual(parseArgs(["sessions", "resume", "session-id", "/workspace"]), {
+    command: "sessions", action: "resume", sessionId: "session-id", projectDirectory: "/workspace", help: false,
+  });
+  assert.deepEqual(parseArgs(["plugins"]), { command: "plugins", projectDirectory: null, help: false });
+  assert.deepEqual(parseArgs(["mcp", "/workspace"]), { command: "mcp", projectDirectory: "/workspace", help: false });
+  assert.throws(() => parseArgs(["sessions", "resume"]), /requires a Vesper session id/u);
+  assert.throws(() => parseArgs(["sessions", "list", "--all"]), /Unexpected option/u);
+  assert.throws(() => parseArgs(["skills", "--all"]), /Unknown option/u);
+  assert.throws(() => parseArgs(["modules"]), /not implemented/u);
 });
 
 test("the package exposes a vesper entry point and help does not create a session", async (t) => {
@@ -89,7 +100,164 @@ test("the package exposes a vesper entry point and help does not create a sessio
   assert.equal(errors.text(), "");
   assert.match(output.text(), /Usage:[\s\S]*vesper \[run\]/u);
   assert.match(output.text(), /most recently updated session/u);
-  assert.match(output.text(), /no Vesper plugins, MCP, skills, or modules/u);
+  assert.match(output.text(), /vesper sessions list/u);
+  assert.match(output.text(), /read-only/u);
+  assert.equal(fs.existsSync(store.directory), false);
+});
+
+test("sessions list resolves project aliases, isolates sessions, orders by update time, and omits thread ids", async (t) => {
+  const root = fixture(t);
+  const project = path.join(root, "project");
+  const otherProject = path.join(root, "other-project");
+  fs.mkdirSync(project);
+  fs.mkdirSync(otherProject);
+  const alias = path.join(root, "project-alias");
+  fs.symlinkSync(project, alias, "dir");
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  const older = store.create(fs.realpathSync(project));
+  store.update(older.sessionId, { threadId: "codex-private-thread-old" });
+  const other = store.create(fs.realpathSync(otherProject));
+  const newer = store.create(fs.realpathSync(project));
+  store.update(newer.sessionId, { threadId: "codex-private-thread-new" });
+  const output = capture();
+  const errors = capture();
+
+  const status = await runVesper(["sessions", "list", alias], {
+    store,
+    output: output.stream,
+    errorOutput: errors.stream,
+  });
+
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.ok(output.text().indexOf(newer.sessionId) < output.text().indexOf(older.sessionId));
+  assert.match(output.text(), new RegExp(newer.sessionId));
+  assert.match(output.text(), new RegExp(older.sessionId));
+  assert.doesNotMatch(output.text(), new RegExp(other.sessionId));
+  assert.doesNotMatch(output.text(), /codex-private-thread/u);
+  assert.match(output.text(), /UPDATED \(UTC\)/u);
+});
+
+test("sessions new starts a separate local-first session and preserves the prior session", async (t) => {
+  const root = fixture(t);
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  const previous = store.create(fs.realpathSync(project));
+  store.update(previous.sessionId, { threadId: "codex-existing-thread" });
+  const output = capture();
+  const errors = capture();
+
+  const status = await runVesper(["sessions", "new", project], {
+    store,
+    output: output.stream,
+    errorOutput: errors.stream,
+    lineIO: new FakeLineIO(["What Git branch am I on?", ":quit"]),
+    runGit: async () => "feature/session-new\n",
+    clientOptions: { spawnProcess: () => assert.fail("A local request must not start Codex.") },
+  });
+
+  const createdId = output.text().match(/Vesper session: ([0-9a-f-]+)/u)?.[1];
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.notEqual(createdId, previous.sessionId);
+  assert.equal(store.load(previous.sessionId).threadId, "codex-existing-thread");
+  assert.equal(store.load(createdId).cwd, fs.realpathSync(project));
+  assert.equal(store.listByCwd(fs.realpathSync(project)).length, 2);
+  assert.match(output.text(), /Current Git branch: feature\/session-new/u);
+});
+
+test("sessions resume uses the saved id only after the existing Codex reconnect verification", async (t) => {
+  const root = fixture(t);
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  const saved = store.create(fs.realpathSync(root));
+  store.update(saved.sessionId, { threadId: "codex-saved-thread" });
+  const clients = [];
+  const output = capture();
+  const errors = capture();
+
+  const status = await runVesper(["sessions", "resume", saved.sessionId, root], {
+    store,
+    output: output.stream,
+    errorOutput: errors.stream,
+    lineIO: new FakeLineIO(["Continue this task", ":quit"]),
+    clientFactory: clientFactoryFor(clients),
+  });
+
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.equal(clients[0].initialThreadId, "codex-saved-thread");
+  assert.deepEqual(clients[0].events.slice(0, 3), [
+    ["resume", fs.realpathSync(root)], ["history"], ["turn"],
+  ]);
+  assert.equal(store.load(saved.sessionId).threadId, "codex-saved-thread");
+});
+
+test("sessions resume rejects unknown ids and a different project before starting Codex", async (t) => {
+  const root = fixture(t);
+  const firstProject = path.join(root, "first");
+  const secondProject = path.join(root, "second");
+  fs.mkdirSync(firstProject);
+  fs.mkdirSync(secondProject);
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  const saved = store.create(fs.realpathSync(firstProject));
+  const errors = capture();
+  let clientsCreated = 0;
+
+  const unknownStatus = await runVesper(["sessions", "resume", "00000000-0000-4000-8000-000000000000", firstProject], {
+    store,
+    output: capture().stream,
+    errorOutput: errors.stream,
+    clientFactory: () => { clientsCreated += 1; return assert.fail("Unknown ids must not start Codex."); },
+  });
+  assert.equal(unknownStatus, 1);
+  assert.match(errors.text(), /was not found/u);
+
+  const mismatchErrors = capture();
+  const mismatchStatus = await runVesper(["sessions", "resume", saved.sessionId, secondProject], {
+    store,
+    output: capture().stream,
+    errorOutput: mismatchErrors.stream,
+    clientFactory: () => { clientsCreated += 1; return assert.fail("Project mismatches must not start Codex."); },
+  });
+  assert.equal(mismatchStatus, 1);
+  assert.match(mismatchErrors.text(), /belongs to .* selected project/u);
+  assert.equal(clientsCreated, 0);
+});
+
+test("read-only discovery commands dispatch from the selected project without creating a session", async (t) => {
+  const root = fixture(t);
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  fs.mkdirSync(path.join(root, ".agents", "plugins"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".agents", "plugins", "marketplace.json"), JSON.stringify({
+    name: "local",
+    plugins: [{ name: "read-only-plugin", policy: { installation: "AVAILABLE" } }],
+  }));
+  const pluginOutput = capture();
+  const status = await runVesper(["plugins", root], {
+    store,
+    output: pluginOutput.stream,
+    errorOutput: capture().stream,
+    discoveryOptions: { codexHome: path.join(root, "codex-home"), home: root },
+  });
+  assert.equal(status, 0);
+  assert.match(pluginOutput.text(), /read-only-plugin · available/u);
+  assert.equal(fs.existsSync(store.directory), false);
+
+  let commandCwd;
+  const mcpOutput = capture();
+  const mcpStatus = await runVesper(["mcp", root], {
+    store,
+    output: mcpOutput.stream,
+    errorOutput: capture().stream,
+    codexCommandRunner: async (_command, _args, options) => {
+      commandCwd = options.cwd;
+      return JSON.stringify([{ name: "configured-mcp", enabled: true }]);
+    },
+  });
+  assert.equal(mcpStatus, 0);
+  assert.equal(commandCwd, fs.realpathSync(root));
+  assert.match(mcpOutput.text(), /configured-mcp · installed/u);
   assert.equal(fs.existsSync(store.directory), false);
 });
 

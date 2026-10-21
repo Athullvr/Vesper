@@ -119,6 +119,19 @@ test("initializes with the installed protocol, starts one thread, streams two tu
   assert.equal(Object.hasOwn(server.requests.find((request) => request.method === "thread/start").params, "approvalPolicy"), false);
 });
 
+test("a missing Codex executable produces an actionable runtime error", async () => {
+  const client = new AppServerClient({
+    spawnProcess: () => {
+      const error = new Error("spawn codex ENOENT");
+      error.code = "ENOENT";
+      throw error;
+    },
+  });
+
+  await assert.rejects(client.connect("/workspace/project"), /Codex CLI executable .* was not found on PATH.*correct PATH/u);
+  client.dispose();
+});
+
 test("an initialization RPC failure closes the unusable process and a later fallback can recover", async (t) => {
   const server = new FakeAppServerProcess();
   const recoveryServer = new FakeAppServerProcess();

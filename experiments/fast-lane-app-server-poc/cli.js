@@ -5,34 +5,55 @@ const { execFile } = require("node:child_process");
 const path = require("node:path");
 const { AppServerClient } = require("./app-server-client");
 const { createLocalHandlers } = require("./local-handlers");
-const { SessionStore } = require("./session-store");
+const { MAX_SESSION_LIST_ENTRIES, SessionStore } = require("./session-store");
+const { discoverMcp, discoverPlugins, discoverSkills, renderDiscovery } = require("./integration-discovery");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
-
-const FUTURE_COMMANDS = new Set(["plugins", "mcp", "skills", "modules"]);
 
 const USAGE = `Vesper terminal frontend
 
 Usage:
-  vesper [run] [--new] [PROJECT_DIRECTORY]
-  vesper --resume SESSION_ID [PROJECT_DIRECTORY]
+  vesper [run] [PROJECT_DIRECTORY]
+  vesper [run] --new [PROJECT_DIRECTORY]
+  vesper [run] --resume SESSION_ID [PROJECT_DIRECTORY]
+  vesper sessions list [PROJECT_DIRECTORY]
+  vesper sessions resume SESSION_ID [PROJECT_DIRECTORY]
+  vesper sessions new [PROJECT_DIRECTORY]
+  vesper plugins [PROJECT_DIRECTORY]
+  vesper mcp [PROJECT_DIRECTORY]
+  vesper skills [PROJECT_DIRECTORY]
   vesper --help
 
 Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
-or creates one when no session exists. Use --new to always start a separate Vesper session.
-The default project is the current working directory.
-The optional project directory must match the saved directory when resuming.
-Inside Vesper, enter :quit to exit. Session ids are printed at startup.
+or creates one when no session exists. The default project is the current working directory.
+Session listings are project-scoped and show at most ${MAX_SESSION_LIST_ENTRIES} recent metadata records.
+Enter :quit to exit. Ctrl+C interrupts an active Codex turn.
 
-This build provides terminal sessions only; it has no Vesper plugins, MCP, skills, or modules
-management commands. Run vesper --help for supported usage.
+Discovery commands are read-only. They show local sources and report unknown state when Codex does not
+expose it. Vesper does not install or change integrations.
+`;
+
+const SESSIONS_USAGE = `Vesper session management
+
+Usage:
+  vesper sessions list [PROJECT_DIRECTORY]
+  vesper sessions resume SESSION_ID [PROJECT_DIRECTORY]
+  vesper sessions new [PROJECT_DIRECTORY]
+
+The default project is the current working directory. Session resume requires the selected project to
+match the saved session's canonical project path.
 `;
 
 function parseArgs(argv) {
   const args = [...argv];
+  if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
+  if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
+  if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
+  return parseRunArgs(args);
+}
+
+function parseRunArgs(argv) {
+  const args = [...argv];
   if (args[0] === "run") args.shift();
-  else if (FUTURE_COMMANDS.has(args[0])) {
-    throw new Error(`The "vesper ${args[0]}" command is not available in this build; Vesper currently supports terminal sessions only.`);
-  }
 
   let newSession = false;
   let resumeId = null;
@@ -46,7 +67,7 @@ function parseArgs(argv) {
     else if (arg === "--resume") {
       if (resumeId !== null) throw new Error("Use --resume only once.");
       const value = args[index + 1];
-      if (!value || value.startsWith("--")) throw new Error("--resume requires a Vesper session id.");
+      if (!value || value.startsWith("-")) throw new Error("--resume requires a Vesper session id.");
       resumeId = value;
       index += 1;
     } else if (arg.startsWith("-")) {
@@ -58,7 +79,37 @@ function parseArgs(argv) {
 
   if (newSession && resumeId) throw new Error("Use either --new or --resume, not both.");
   if (positional.length > 1) throw new Error("Provide at most one project directory.");
-  return { newSession, resumeId, help, projectDirectory: positional[0] || null };
+  return { command: "run", newSession, resumeId, help, projectDirectory: positional[0] || null };
+}
+
+function parseSessionsArgs(args) {
+  if (!args.length || args[0] === "--help" || args[0] === "-h") {
+    return { command: "sessions", action: null, help: true };
+  }
+  const [action, ...rest] = args;
+  if (!["list", "resume", "new"].includes(action)) {
+    throw new Error(`Unknown sessions command: ${safeTerminalText(action)}. Run vesper sessions --help.`);
+  }
+  if (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h")) {
+    return { command: "sessions", action, help: true };
+  }
+  if (rest.some((arg) => arg.startsWith("-"))) throw new Error(`Unexpected option for sessions ${action}.`);
+  if (action === "resume") {
+    if (rest.length < 1) throw new Error("vesper sessions resume requires a Vesper session id.");
+    if (rest.length > 2) throw new Error("Usage: vesper sessions resume SESSION_ID [PROJECT_DIRECTORY].");
+    return { command: "sessions", action, sessionId: rest[0], projectDirectory: rest[1] || null, help: false };
+  }
+  if (rest.length > 1) throw new Error(`Usage: vesper sessions ${action} [PROJECT_DIRECTORY].`);
+  return { command: "sessions", action, projectDirectory: rest[0] || null, help: false };
+}
+
+function parseDiscoveryArgs(command, args) {
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
+    return { command, help: true };
+  }
+  if (args.some((arg) => arg.startsWith("-"))) throw new Error(`Unknown option for vesper ${command}.`);
+  if (args.length > 1) throw new Error(`Usage: vesper ${command} [PROJECT_DIRECTORY].`);
+  return { command, projectDirectory: args[0] || null, help: false };
 }
 
 function resolveProjectDirectory(directory) {
@@ -89,11 +140,94 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
     errorOutput.write(`[Vesper error] ${safeTerminalText(error.message)}\n\n${USAGE}`);
     return 2;
   }
+
   if (options.help) {
-    output.write(USAGE);
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
+  if (options.command === "sessions") {
+    if (options.action === "list") return runSessionsList(options, dependencies, output, errorOutput);
+    if (options.action === "new") {
+      const projectDirectory = options.projectDirectory || process.cwd();
+      return runInteractiveVesper({ command: "run", newSession: true, resumeId: null, projectDirectory }, dependencies, output, errorOutput);
+    }
+    if (options.action === "resume") {
+      try {
+        const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+        const store = dependencies.store || new SessionStore();
+        const saved = store.load(options.sessionId);
+        const savedCwd = resolveProjectDirectory(saved.cwd);
+        if (cwd !== savedCwd) {
+          throw new Error(`Vesper session ${saved.sessionId} belongs to ${savedCwd}; selected project is ${cwd}. Run the command from the saved project or pass its path.`);
+        }
+        return runInteractiveVesper({ command: "run", newSession: false, resumeId: saved.sessionId, projectDirectory: cwd }, { ...dependencies, store }, output, errorOutput);
+      } catch (error) {
+        errorOutput.write(`[Vesper error] ${safeTerminalText(error?.message || error)}\n`);
+        return 1;
+      }
+    }
+  }
+
+  if (["plugins", "mcp", "skills"].includes(options.command)) {
+    return runDiscovery(options, dependencies, output, errorOutput);
+  }
+
+  return runInteractiveVesper(options, dependencies, output, errorOutput);
+}
+
+function discoveryUsage(command) {
+  return `Vesper ${command} discovery (read-only)\n\nUsage:\n  vesper ${command} [PROJECT_DIRECTORY]\n\nNo integration is installed, enabled, disabled, downloaded, or modified.\n`;
+}
+
+async function runSessionsList(options, dependencies, output, errorOutput) {
+  try {
+    const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    const store = dependencies.store || new SessionStore();
+    const sessions = store.listByCwd(cwd, MAX_SESSION_LIST_ENTRIES);
+    output.write(`Vesper sessions for ${safeCliField(cwd)} (updated, newest first; maximum ${MAX_SESSION_LIST_ENTRIES})\n`);
+    if (!sessions.length) {
+      output.write("No Vesper sessions found for this project.\n");
+      return 0;
+    }
+    output.write("SESSION ID                               UPDATED (UTC)\n");
+    for (const session of sessions) {
+      output.write(`${session.sessionId}  ${safeCliField(session.updatedAt)}\n`);
+    }
+    return 0;
+  } catch (error) {
+    errorOutput.write(`[Vesper error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
+async function runDiscovery(options, dependencies, output, errorOutput) {
+  try {
+    const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    let result;
+    if (options.command === "plugins") {
+      result = discoverPlugins({ cwd, ...(dependencies.discoveryOptions || {}) });
+    } else if (options.command === "skills") {
+      result = discoverSkills({ cwd, ...(dependencies.discoveryOptions || {}) });
+    } else {
+      result = await discoverMcp({
+        cwd,
+        commandRunner: dependencies.codexCommandRunner,
+      });
+    }
+    output.write(renderDiscovery(result));
+    if (result.failed) {
+      errorOutput.write("[Vesper error] MCP discovery status is unknown. Check the Codex CLI installation and retry.\n");
+      return 1;
+    }
+    return 0;
+  } catch (error) {
+    errorOutput.write(`[Vesper error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
+async function runInteractiveVesper(options, dependencies, output, errorOutput) {
   let appServer;
   try {
     const store = dependencies.store || new SessionStore();
@@ -118,7 +252,7 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
     const sessionStatus = resumed ? "resumed" : "new";
     const threadStatus = session.threadId ? "saved Codex thread" : "no Codex thread yet";
     output.write(`Session status: ${sessionStatus} · ${threadStatus}\n`);
-    output.write(`Project: ${cwd}\n`);
+    output.write(`Project: ${safeCliField(cwd)}\n`);
 
     let terminal;
     const clientFactory = dependencies.clientFactory || ((clientOptions) => new AppServerClient(clientOptions));
@@ -167,7 +301,12 @@ function runGitCommand(args, cwd) {
   });
 }
 
+function safeCliField(value) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/gu, " ").slice(0, 4_000);
+}
+
 module.exports = {
+  SESSIONS_USAGE,
   USAGE,
   parseArgs,
   resolveProjectDirectory,

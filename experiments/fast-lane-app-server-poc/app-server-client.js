@@ -66,7 +66,10 @@ class AppServerClient extends EventEmitter {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
-      return Promise.reject(new Error(`Could not start Codex app-server: ${safeErrorMessage(error)}`));
+      const message = error?.code === "ENOENT"
+        ? `Codex CLI executable "${safeErrorMessage(this.command)}" was not found on PATH. Install Codex CLI or correct PATH, then retry.`
+        : safeErrorMessage(error);
+      return Promise.reject(new Error(`Could not start Codex app-server: ${message}`));
     }
 
     this.child = child;

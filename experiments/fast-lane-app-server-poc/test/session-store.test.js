@@ -80,6 +80,31 @@ test("project lookup restores the most recently used exact canonical project ses
   assert.equal(store.load(first.sessionId).threadId, null);
 });
 
+test("project session listing is isolated, newest first, deterministic on ties, and bounded", (t) => {
+  const root = temporaryRoot(t);
+  let now = new Date("2026-10-19T12:00:00.000Z");
+  const store = new SessionStore({ directory: path.join(root, "sessions"), now: () => now });
+  const first = store.create("/workspace/project");
+  const other = store.create("/workspace/other");
+  const tied = store.create("/workspace/project");
+  now = new Date("2026-10-19T12:01:00.000Z");
+  const newest = store.create("/workspace/project");
+  store.update(newest.sessionId, { threadId: "saved-codex-thread" });
+
+  const listed = store.listByCwd("/workspace/project", 2);
+  const tiedSessionsById = [first.sessionId, tied.sessionId].sort().reverse();
+  assert.deepEqual(listed.map((session) => session.sessionId), [newest.sessionId, tiedSessionsById[0]]);
+  assert.deepEqual(store.listByCwd("/workspace/project").map((session) => session.sessionId), [
+    newest.sessionId,
+    ...tiedSessionsById,
+  ]);
+  assert.equal(listed.some((session) => session.sessionId === other.sessionId), false);
+  assert.equal(store.findLatestByCwd("/workspace/project").sessionId, newest.sessionId);
+  assert.equal(JSON.stringify(listed).includes("saved-codex-thread"), true);
+  assert.throws(() => store.listByCwd("relative/project"), /absolute path/u);
+  assert.throws(() => store.listByCwd("/workspace/project", 10_000), /list limit/u);
+});
+
 test("project lookup refuses malformed session metadata instead of silently creating a replacement", (t) => {
   const root = temporaryRoot(t);
   const directory = path.join(root, "sessions");
