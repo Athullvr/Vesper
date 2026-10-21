@@ -30,6 +30,8 @@ const SOURCE_FILES = Object.freeze([
   "test/session-store.test.js",
   "test/terminal-frontend.test.js",
   "test/fixtures/routing-quality-cases.json",
+  "test/fixtures/routing-quality-heldout-cases.json",
+  "test/fixtures/routing-quality-fingerprints.json",
 ]);
 
 function currentSourceDigest(root) {

@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -7,48 +8,37 @@ const assert = require("node:assert/strict");
 const { createLocalHandlers } = require("../local-handlers");
 const { ROUTING_OUTCOMES, ROUTING_REASON_COUNT_CODES, RouteMetrics, routeRequest } = require("../routing-core");
 
-const CASES = JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", "routing-quality-cases.json"), "utf8"));
+const FIXTURE_DIRECTORY = path.join(__dirname, "fixtures");
+const BASELINE_FIXTURE_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-cases.json");
+const HELDOUT_FIXTURE_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-heldout-cases.json");
+const FINGERPRINT_PATH = path.join(FIXTURE_DIRECTORY, "routing-quality-fingerprints.json");
+const BASELINE_CASES = JSON.parse(fs.readFileSync(BASELINE_FIXTURE_PATH, "utf8"));
+const HELDOUT_CASES = JSON.parse(fs.readFileSync(HELDOUT_FIXTURE_PATH, "utf8"));
+const FINGERPRINTS = JSON.parse(fs.readFileSync(FINGERPRINT_PATH, "utf8"));
+const EXPECTED_FINGERPRINTS = Object.freeze({
+  baseline: "00d9ec3db031dfc54fb1325fd649163a86d54d10cab02f936ac3c6988720b22a",
+  heldout: "14e4df137fd8e4306f5989c2cc1d23cb770956d112d7bae0df447a646c522970",
+});
 const EVALUATION_CWD = "/offline-routing-evaluation/project";
 const FIXED_NOW = new Date("2026-10-21T12:00:00.000Z");
 const STALE_UPSTREAM_EPOCH = Math.floor(Date.parse("2026-10-01T12:00:00.000Z") / 1_000);
 const EXPECTED_LOCAL_STATUSES = new Set(["confirmed", "unknown", "stale", "unavailable"]);
 const ABSTENTION_STATUSES = new Set(["unknown", "stale", "unavailable"]);
 
-test("controlled offline evaluation matches route and evidence expectations", async (t) => {
-  validateFixtures(CASES);
-  const metrics = new RouteMetrics();
-  const evaluations = [];
+test("baseline and held-out fixture labels are static and fingerprint-pinned", () => {
+  assertFixtureFingerprints();
+  validateFixtures(BASELINE_CASES);
+  validateFixtures(HELDOUT_CASES, { requireExpectedOutcome: true });
+  assert.equal(BASELINE_CASES.length, 12);
+  assert.equal(HELDOUT_CASES.length, 40);
+  const allIds = [...BASELINE_CASES, ...HELDOUT_CASES].map(({ id }) => id);
+  assert.equal(new Set(allIds).size, allIds.length);
+});
 
-  for (const entry of CASES) {
-    const handlers = makeFixtureHandlers(entry.handlerFixture);
-    let fallbackCalls = 0;
-    const routed = await routeRequest(entry.prompt, {
-      handlers,
-      context: { cwd: EVALUATION_CWD },
-      fallback: async () => {
-        fallbackCalls += 1;
-        return { kind: "mock_fallback_request", taskCompleted: false };
-      },
-    });
-    const actual = {
-      actualRoute: routed.decision.route,
-      actualIntent: routed.decision.intent,
-      actualEvidenceStatus: routed.result?.status ?? null,
-      routingOutcome: routed.routingDecision.outcome,
-      reasonCode: routed.routingDecision.reasonCode,
-      fallbackCalls,
-    };
-    const score = scoreEvaluationCase(entry, actual);
-    evaluations.push({ entry, actual, score });
-    metrics.record(routed.decision, 0, {
-      handlerFailed: routed.result?.status === "unavailable",
-      routingDecision: routed.routingDecision,
-    });
-  }
-
-  const metricsSnapshot = metrics.snapshot();
-  const report = buildReport(evaluations, metricsSnapshot);
-  writeEvaluationDiagnostic(t, report);
+test("original offline routing baseline remains unchanged", async (t) => {
+  assertFixtureFingerprints();
+  const { evaluations, metricsSnapshot, report } = await evaluateFixtureSet(BASELINE_CASES);
+  writeEvaluationDiagnostic(t, report, "baseline", EXPECTED_FINGERPRINTS.baseline);
 
   assert.equal(report.casesEvaluated, 12);
   assert.equal(report.correctRouteDecisions, 12);
@@ -90,10 +80,32 @@ test("controlled offline evaluation matches route and evidence expectations", as
     unknown_route_reason: 0,
   });
   assert.deepEqual(report.failures, []);
-  assert.equal(JSON.stringify(report).includes("prompt"), false);
-  for (const entry of CASES) assert.equal(JSON.stringify(report).includes(entry.prompt), false);
-  assert.doesNotMatch(JSON.stringify(report), /offline evaluation Git failure sentinel|evaluation-branch/u);
-  assert.equal(JSON.stringify(metricsSnapshot).includes("evidence"), false);
+  assertReportDoesNotExposePromptsOrEvidence(report, BASELINE_CASES, metricsSnapshot);
+});
+
+test("held-out routing evaluation reports generalization without tuning or changing labels", async (t) => {
+  assertFixtureFingerprints();
+  const { metricsSnapshot, report } = await evaluateFixtureSet(HELDOUT_CASES);
+  writeEvaluationDiagnostic(t, report, "held-out", EXPECTED_FINGERPRINTS.heldout);
+
+  assert.equal(report.casesEvaluated, 40);
+  assert.equal(report.correctRouteDecisions + report.incorrectRouteDecisions, 40);
+  assert.equal(report.expectedBehaviorMatches + report.expectedBehaviorMismatches, 40);
+  assert.equal(metricsSnapshot.routingDecisionCount, 40);
+  assert.equal(report.mockFallbackRequests, metricsSnapshot.routingOutcomes.codex_delegated);
+  assert.equal(report.liveCodexTurns, 0);
+  assert.deepEqual(Object.fromEntries(Object.entries(report.byCategory).map(([category, value]) => [category, value.cases])), {
+    ambiguous_request: 5,
+    complex_task: 3,
+    informal_underspecified: 4,
+    local_handler_failure: 4,
+    missing_evidence: 3,
+    stale_evidence: 2,
+    supported_local_paraphrase: 12,
+    unavailable_evidence: 2,
+    unsupported_local_intent: 5,
+  });
+  assertReportDoesNotExposePromptsOrEvidence(report, HELDOUT_CASES, metricsSnapshot);
 });
 
 test("evaluation scoring rejects mismatched abstentions and flags unsafe answers and unnecessary delegation", () => {
@@ -128,6 +140,62 @@ test("evaluation scoring rejects mismatched abstentions and flags unsafe answers
   assert.equal(unnecessaryDelegation.unnecessaryDelegation, true);
 });
 
+async function evaluateFixtureSet(fixtures) {
+  validateFixtures(fixtures, { requireExpectedOutcome: fixtures.some((entry) => Object.hasOwn(entry, "expectedOutcome")) });
+  const metrics = new RouteMetrics();
+  const evaluations = [];
+
+  for (const entry of fixtures) {
+    const handlers = makeFixtureHandlers(entry.handlerFixture);
+    let fallbackCalls = 0;
+    const routed = await routeRequest(entry.prompt, {
+      handlers,
+      context: { cwd: EVALUATION_CWD },
+      fallback: async () => {
+        fallbackCalls += 1;
+        return { kind: "mock_fallback_request", taskCompleted: false };
+      },
+    });
+    const actual = {
+      actualRoute: routed.decision.route,
+      actualIntent: routed.decision.intent,
+      actualEvidenceStatus: routed.result?.status ?? null,
+      routingOutcome: routed.routingDecision.outcome,
+      reasonCode: routed.routingDecision.reasonCode,
+      fallbackCalls,
+    };
+    const score = scoreEvaluationCase(entry, actual);
+    evaluations.push({ entry, actual, score });
+    metrics.record(routed.decision, 0, {
+      handlerFailed: entry.handlerFixture === "git_command_failure",
+      routingDecision: routed.routingDecision,
+    });
+  }
+
+  const metricsSnapshot = metrics.snapshot();
+  return { evaluations, metricsSnapshot, report: buildReport(evaluations, metricsSnapshot) };
+}
+
+function assertFixtureFingerprints() {
+  assert.equal(FINGERPRINTS.baseline.file, path.basename(BASELINE_FIXTURE_PATH));
+  assert.equal(FINGERPRINTS.heldout.file, path.basename(HELDOUT_FIXTURE_PATH));
+  assert.equal(FINGERPRINTS.baseline.sha256, EXPECTED_FINGERPRINTS.baseline);
+  assert.equal(FINGERPRINTS.heldout.sha256, EXPECTED_FINGERPRINTS.heldout);
+  assert.match(FINGERPRINTS.heldoutLabelingProvenance, /^Developer-authored held-out set;/u);
+  for (const [name, fixturePath] of [["baseline", BASELINE_FIXTURE_PATH], ["heldout", HELDOUT_FIXTURE_PATH]]) {
+    const actual = crypto.createHash("sha256").update(fs.readFileSync(fixturePath)).digest("hex");
+    assert.equal(actual, EXPECTED_FINGERPRINTS[name], `${name} routing fixture fingerprint changed`);
+  }
+}
+
+function assertReportDoesNotExposePromptsOrEvidence(report, fixtures, metricsSnapshot) {
+  const reportText = JSON.stringify(report);
+  assert.equal(reportText.includes("prompt"), false);
+  for (const entry of fixtures) assert.equal(reportText.includes(entry.prompt), false);
+  assert.doesNotMatch(reportText, /offline evaluation Git failure sentinel|evaluation-branch|origin\/main/u);
+  assert.equal(JSON.stringify(metricsSnapshot).includes("evidence"), false);
+}
+
 function makeFixtureHandlers(fixtureName) {
   const runGit = async (args) => {
     if (fixtureName === "git_command_failure") {
@@ -135,32 +203,49 @@ function makeFixtureHandlers(fixtureName) {
       error.code = "EIO";
       throw error;
     }
-    if (args[0] === "branch" && args[1] === "--show-current") return "evaluation-branch\n";
-    if (args[0] === "status" && args[1] === "--porcelain=v1") return "";
-    if (fixtureName === "stale_upstream") {
-      if (args[0] === "symbolic-ref") return "main\n";
-      if (args[0] === "for-each-ref") return "origin/main\n";
-      if (args[0] === "rev-list") return "2\n";
-      if (args[0] === "reflog") return `refs/remotes/origin/main@{${STALE_UPSTREAM_EPOCH} +0000}\n`;
+    if (args[0] === "branch" && args[1] === "--show-current") {
+      return fixtureName === "branch_detached" ? "\n" : "evaluation-branch\n";
+    }
+    if (args[0] === "status" && args[1] === "--porcelain=v1" && args[2] === "-z") {
+      return fixtureName === "working_tree_dirty" ? " M src/example.js\0?? new-file.txt\0" : "";
+    }
+    if (args[0] === "symbolic-ref") {
+      return fixtureName === "upstream_detached" ? "\n" : "main\n";
+    }
+    if (args[0] === "for-each-ref") {
+      return fixtureName === "ahead_no_upstream" ? "\n" : "origin/main\n";
+    }
+    if (args[0] === "rev-list") return "2\n";
+    if (args[0] === "reflog") {
+      const epoch = fixtureName === "stale_upstream" || fixtureName === "ahead_stale"
+        ? STALE_UPSTREAM_EPOCH
+        : Math.floor(FIXED_NOW.getTime() / 1_000);
+      return `refs/remotes/origin/main@{${epoch} +0000}\n`;
     }
     throw new Error("Unexpected Git call in the offline routing fixture.");
   };
-  const testResultReader = fixtureName === "test_record_missing"
-    ? () => ({ state: "missing" })
-    : () => ({ state: "unavailable" });
+  const testResultReader = () => {
+    if (fixtureName === "test_record_missing") return { state: "missing" };
+    if (fixtureName === "test_record_current" || fixtureName === "test_record_stale") {
+      return {
+        state: "valid",
+        record: {
+          exitCode: 0,
+          summary: { tests: 20, passed: 20, failed: 0, skipped: 0, cancelled: 0 },
+          completedAt: FIXED_NOW.toISOString(),
+        },
+        sourceMatches: fixtureName === "test_record_current",
+      };
+    }
+    return { state: "unavailable" };
+  };
   return createLocalHandlers({ runGit, testResultReader, now: () => new Date(FIXED_NOW) });
 }
 
 function scoreEvaluationCase(entry, actual) {
   const routeDecisionCorrect = actual.actualRoute === entry.expectedRoute &&
     (entry.expectedIntent === null || actual.actualIntent === entry.expectedIntent);
-  const expectedRoutingOutcome = entry.expectedRoute === "codex"
-    ? "codex_delegated"
-    : entry.expectedEvidenceStatus === "confirmed"
-      ? "local_handled"
-      : ["unknown", "stale"].includes(entry.expectedEvidenceStatus)
-        ? "local_insufficient"
-        : "local_unavailable";
+  const expectedRoutingOutcome = expectedOutcomeFor(entry);
   const evidenceStatusMatches = entry.expectedEvidenceStatus === null ||
     actual.actualEvidenceStatus === entry.expectedEvidenceStatus;
   const dispatchBehaviorMatches = entry.expectedRoute === "codex"
@@ -178,6 +263,7 @@ function scoreEvaluationCase(entry, actual) {
 
   return {
     routeDecisionCorrect,
+    expectedOutcomeMatch: actual.routingOutcome === expectedRoutingOutcome && dispatchBehaviorMatches,
     expectedBehaviorMatch,
     appropriateAbstention,
     unsafeLocalAnswerDecision,
@@ -185,19 +271,24 @@ function scoreEvaluationCase(entry, actual) {
   };
 }
 
-function writeEvaluationDiagnostic(t, report) {
-  t.diagnostic(`Offline routing evaluation: ${report.casesEvaluated} cases; ${report.correctRouteDecisions} correct routes; ${report.incorrectRouteDecisions} incorrect routes; ${report.expectedBehaviorMatches} expected behavior matches; ${report.expectedBehaviorMismatches} mismatches.`);
+function writeEvaluationDiagnostic(t, report, setName, fingerprint) {
+  t.diagnostic(`Routing evaluation (${setName}, sha256 ${fingerprint}): ${report.casesEvaluated} cases.`);
+  t.diagnostic(`Correct route decisions: ${report.correctRouteDecisions}/${report.casesEvaluated}; incorrect routes: ${report.incorrectRouteDecisions}. Expected behavior matches: ${report.expectedBehaviorMatches}/${report.casesEvaluated} (${formatPercent(report.expectedBehaviorMatchRate)}); mismatches: ${report.expectedBehaviorMismatches}.`);
   t.diagnostic(`Appropriate abstentions: ${report.appropriateAbstentions}; unsafe local answers: ${report.unsafeLocalAnswerDecisions}; unnecessary delegations: ${report.unnecessaryDelegations}; mock fallback requests: ${report.mockFallbackRequests}; live Codex turns: ${report.liveCodexTurns}.`);
   t.diagnostic(`RouteMetrics outcomes: ${JSON.stringify(report.routeMetrics.routingOutcomes)}`);
   t.diagnostic("By category:");
   for (const [key, value] of Object.entries(report.byCategory)) {
-    t.diagnostic(`  ${key}: ${value.cases} ${value.cases === 1 ? "case" : "cases"}; routes ${value.correctRouteDecisions} correct/${value.incorrectRouteDecisions} incorrect; expected behavior ${value.expectedBehaviorMatches}/${value.cases}; abstentions ${value.appropriateAbstentions}; unsafe ${value.unsafeLocalAnswerDecisions}; unnecessary delegations ${value.unnecessaryDelegations}; outcomes ${JSON.stringify(value.routingOutcomes)}`);
+    t.diagnostic(`  ${key}: ${value.cases} ${value.cases === 1 ? "case" : "cases"}; routes ${value.correctRouteDecisions} correct/${value.incorrectRouteDecisions} incorrect; expected behavior ${value.expectedBehaviorMatches}/${value.cases}; abstentions ${value.appropriateAbstentions}; unsafe ${value.unsafeLocalAnswerDecisions}; unnecessary delegations ${value.unnecessaryDelegations}; outcomes ${JSON.stringify(value.routingOutcomes)}; failed IDs ${value.failureCaseIds.length ? value.failureCaseIds.join(", ") : "none"}`);
   }
   t.diagnostic("By reason code:");
   for (const [key, value] of Object.entries(report.byReasonCode)) {
-    t.diagnostic(`  ${key}: ${value.cases} ${value.cases === 1 ? "case" : "cases"}; routes ${value.correctRouteDecisions} correct/${value.incorrectRouteDecisions} incorrect; expected behavior ${value.expectedBehaviorMatches}/${value.cases}; abstentions ${value.appropriateAbstentions}; unsafe ${value.unsafeLocalAnswerDecisions}; unnecessary delegations ${value.unnecessaryDelegations}; outcomes ${JSON.stringify(value.routingOutcomes)}`);
+    t.diagnostic(`  ${key}: ${value.cases} cases; routes ${value.correctRouteDecisions} correct/${value.incorrectRouteDecisions} incorrect; expected behavior ${value.expectedBehaviorMatches}/${value.cases}; abstentions ${value.appropriateAbstentions}; unsafe ${value.unsafeLocalAnswerDecisions}; unnecessary delegations ${value.unnecessaryDelegations}; outcomes ${JSON.stringify(value.routingOutcomes)}`);
   }
   t.diagnostic(`Failure examples: ${report.failures.length ? JSON.stringify(report.failures) : "none"}`);
+}
+
+function formatPercent(value) {
+  return `${(value * 100).toFixed(1)}%`;
 }
 
 function buildReport(evaluations, metrics) {
@@ -211,9 +302,11 @@ function buildReport(evaluations, metrics) {
         correctRouteDecisions: group.filter(({ score }) => score.routeDecisionCorrect).length,
         incorrectRouteDecisions: group.filter(({ score }) => !score.routeDecisionCorrect).length,
         expectedBehaviorMatches: group.filter(({ score }) => score.expectedBehaviorMatch).length,
+        expectedBehaviorMismatches: group.filter(({ score }) => !score.expectedBehaviorMatch).length,
         appropriateAbstentions: group.filter(({ score }) => score.appropriateAbstention).length,
         unsafeLocalAnswerDecisions: group.filter(({ score }) => score.unsafeLocalAnswerDecision).length,
         unnecessaryDelegations: group.filter(({ score }) => score.unnecessaryDelegation).length,
+        failureCaseIds: group.filter(({ score }) => !score.expectedBehaviorMatch).map(({ entry }) => entry.id),
         routingOutcomes: Object.fromEntries(ROUTING_OUTCOMES.map((outcome) => [
           outcome,
           group.filter(({ actual }) => actual.routingOutcome === outcome).length,
@@ -228,6 +321,7 @@ function buildReport(evaluations, metrics) {
       correctRouteDecisions: group.filter(({ score }) => score.routeDecisionCorrect).length,
       incorrectRouteDecisions: group.filter(({ score }) => !score.routeDecisionCorrect).length,
       expectedBehaviorMatches: group.filter(({ score }) => score.expectedBehaviorMatch).length,
+      expectedBehaviorMismatches: group.filter(({ score }) => !score.expectedBehaviorMatch).length,
       appropriateAbstentions: group.filter(({ score }) => score.appropriateAbstention).length,
       unsafeLocalAnswerDecisions: group.filter(({ score }) => score.unsafeLocalAnswerDecision).length,
       unnecessaryDelegations: group.filter(({ score }) => score.unnecessaryDelegation).length,
@@ -244,6 +338,7 @@ function buildReport(evaluations, metrics) {
     incorrectRouteDecisions: count(({ score }) => !score.routeDecisionCorrect),
     expectedBehaviorMatches: count(({ score }) => score.expectedBehaviorMatch),
     expectedBehaviorMismatches: count(({ score }) => !score.expectedBehaviorMatch),
+    expectedBehaviorMatchRate: evaluations.length ? count(({ score }) => score.expectedBehaviorMatch) / evaluations.length : 0,
     appropriateAbstentions: count(({ score }) => score.appropriateAbstention),
     unsafeLocalAnswerDecisions: count(({ score }) => score.unsafeLocalAnswerDecision),
     unnecessaryDelegations: count(({ score }) => score.unnecessaryDelegation),
@@ -260,6 +355,7 @@ function buildReport(evaluations, metrics) {
         route: entry.expectedRoute,
         intent: entry.expectedIntent,
         evidenceStatus: entry.expectedEvidenceStatus,
+        outcome: expectedOutcomeFor(entry),
       },
       actual: {
         route: actual.actualRoute,
@@ -272,7 +368,15 @@ function buildReport(evaluations, metrics) {
   };
 }
 
-function validateFixtures(fixtures) {
+function expectedOutcomeFor(entry) {
+  if (typeof entry.expectedOutcome === "string") return entry.expectedOutcome;
+  if (entry.expectedRoute === "codex") return "codex_delegated";
+  if (entry.expectedEvidenceStatus === "confirmed") return "local_handled";
+  if (["unknown", "stale"].includes(entry.expectedEvidenceStatus)) return "local_insufficient";
+  return "local_unavailable";
+}
+
+function validateFixtures(fixtures, { requireExpectedOutcome = false } = {}) {
   const ids = new Set();
   for (const entry of fixtures) {
     assert.equal(typeof entry.id, "string");
@@ -285,5 +389,10 @@ function validateFixtures(fixtures) {
     assert.ok(entry.expectedEvidenceStatus === null || EXPECTED_LOCAL_STATUSES.has(entry.expectedEvidenceStatus));
     assert.equal(entry.expectedRoute === "local", entry.expectedEvidenceStatus !== null);
     assert.equal(typeof entry.rationale, "string");
+    assert.equal(typeof entry.handlerFixture, "string");
+    if (requireExpectedOutcome || Object.hasOwn(entry, "expectedOutcome")) {
+      assert.ok(ROUTING_OUTCOMES.includes(entry.expectedOutcome));
+      assert.equal(entry.expectedOutcome, expectedOutcomeFor(entry), `inconsistent expected outcome for ${entry.id}`);
+    }
   }
 }

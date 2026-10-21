@@ -12,7 +12,9 @@ The runner repeats every case, measures routing plus local-handler latency, chec
 
 ## Controlled offline routing-quality evaluation
 
-`test/fixtures/routing-quality-cases.json` is a separate, deterministic labeled fixture set for route and evidence-status expectations. Run it directly with `node test/routing-evaluation.test.js`, or as part of `npm test`. It uses the production `routeRequest`, `createLocalHandlers`, and `RouteMetrics` with fixed dates, synthetic Git/test evidence, and a mock fallback. It does not inspect the project checkout or start Codex. Prompts and rationales remain in this test fixture; the report contains case IDs, categories, reason codes, statuses, and aggregate counts only.
+`test/fixtures/routing-quality-cases.json` is the original 12-case baseline. `test/fixtures/routing-quality-heldout-cases.json` is a separate 40-case developer-authored held-out set covering paraphrases, underspecified and ambiguous requests, evidence states, unsupported intents, complex tasks, and local-handler failures. No independent reviewer inspected the labels before evaluation. The labels and rationales are static; the runner never derives or rewrites them from observed routing behavior.
+
+Run both sets directly with `node test/routing-evaluation.test.js`, or as part of `npm test`. The evaluator uses the production `routeRequest`, `createLocalHandlers`, and `RouteMetrics` with fixed dates, synthetic Git/test evidence, and a mock fallback. It does not inspect the project checkout or start Codex. The baseline and held-out SHA-256 fingerprints are recorded in `test/fixtures/routing-quality-fingerprints.json` and checked before either set is evaluated. The expected held-out fingerprint is `14e4df137fd8e4306f5989c2cc1d23cb770956d112d7bae0df447a646c522970`. Prompts and rationales remain in fixtures; reports contain case IDs, categories, reason codes, statuses, expected/actual behavior for failures, and aggregate counts only.
 
 Metric definitions:
 
@@ -24,6 +26,24 @@ Metric definitions:
 - **Unnecessary delegation:** the actual route is Codex when the fixture expects a local route.
 
 The report groups route correctness, expected behavior matches, abstentions, unsafe local answers, unnecessary delegations, and routing outcomes by fixture category and actual reason code. Any behavior mismatch lists only the fixture ID and expected/actual route, intent, status, outcome, and mock-fallback count. The evaluation is regression evidence for this hand-written sample, not a population estimate or a test of Codex answer quality.
+
+### Phase 2D snapshot
+
+The original baseline remains **12/12 expected behavior matches (100%)**, with 0 incorrect routes, 3 appropriate abstentions, 0 unsafe confirmed local-answer decisions, and 0 unnecessary delegations. The held-out set produced **35/40 expected behavior matches (87.5%)**, 5 incorrect route decisions, 11 appropriate abstentions, 0 unsafe confirmed local-answer decisions, and 5 unnecessary delegations. All five held-out mismatches are unnecessary delegations in `supported_local_paraphrase`; the router selected `local_ambiguous` and delegated each to the mock fallback.
+
+| Held-out category | Cases | Expected behavior matches | Failure IDs |
+| --- | ---: | ---: | --- |
+| `ambiguous_request` | 5 | 5 | — |
+| `complex_task` | 3 | 3 | — |
+| `informal_underspecified` | 4 | 4 | — |
+| `local_handler_failure` | 4 | 4 | — |
+| `missing_evidence` | 3 | 3 | — |
+| `stale_evidence` | 2 | 2 | — |
+| `supported_local_paraphrase` | 12 | 7 | `heldout_branch_right_now`, `heldout_branch_conversational`, `heldout_upstream_remote_branch_paraphrase`, `heldout_upstream_configured_branch_paraphrase`, `heldout_ahead_count_current_branch_paraphrase` |
+| `unavailable_evidence` | 2 | 2 | — |
+| `unsupported_local_intent` | 5 | 5 | — |
+
+The held-out reason-code group `local_ambiguous` had 12 expected delegations and the five local-intent misses above; `codex_fallback` delegated all five cases as expected. Its 22 mock fallback requests show dispatch only. No real Codex turn or answer was evaluated.
 
 For the direct baseline, run:
 
