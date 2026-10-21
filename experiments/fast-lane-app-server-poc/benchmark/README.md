@@ -10,6 +10,21 @@ node benchmark/run-local.js 5
 
 The runner repeats every case, measures routing plus local-handler latency, checks local answers against current read-only Git/test evidence, records evidence/freshness labels, and calls a mock fallback for Codex-routed cases. It reports development and held-out metrics separately, including bounded routing outcome and reason-code counts. It does not start real Codex turns. `realCodexTurnStarted` is therefore false for every row; `codexTurnRequestedTrials` records whether Vesper reached its fallback callback. The current prototype's terminal frontend passes that callback to `appServer.runTurn`.
 
+## Controlled offline routing-quality evaluation
+
+`test/fixtures/routing-quality-cases.json` is a separate, deterministic labeled fixture set for route and evidence-status expectations. Run it directly with `node test/routing-evaluation.test.js`, or as part of `npm test`. It uses the production `routeRequest`, `createLocalHandlers`, and `RouteMetrics` with fixed dates, synthetic Git/test evidence, and a mock fallback. It does not inspect the project checkout or start Codex. Prompts and rationales remain in this test fixture; the report contains case IDs, categories, reason codes, statuses, and aggregate counts only.
+
+Metric definitions:
+
+- **Correct route decision:** actual route matches the fixture route and, for local cases, the selected intent matches.
+- **Incorrect route decision:** the complement of correct route decision. This is separate from evidence-status matching.
+- **Expected behavior match:** correct route decision plus the expected local evidence status, matching routing outcome, and no fallback request for a local case; or a Codex delegation with one mock fallback request for a Codex case. Delegation does not mean the task completed successfully.
+- **Appropriate abstention:** a local case expected to return `unknown`, `stale`, or `unavailable` returns exactly that status through the expected local intent.
+- **Unsafe local-answer decision:** a `confirmed` local result is returned when the fixture expects Codex, a different local intent, or a non-confirmed evidence status. This measures route/status safety only; it does not validate the factual content of confirmed local answers.
+- **Unnecessary delegation:** the actual route is Codex when the fixture expects a local route.
+
+The report groups route correctness, expected behavior matches, abstentions, unsafe local answers, unnecessary delegations, and routing outcomes by fixture category and actual reason code. Any behavior mismatch lists only the fixture ID and expected/actual route, intent, status, outcome, and mock-fallback count. The evaluation is regression evidence for this hand-written sample, not a population estimate or a test of Codex answer quality.
+
 For the direct baseline, run:
 
 ```sh

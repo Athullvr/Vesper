@@ -1,0 +1,122 @@
+[
+  {
+    "id": "branch_exact_match",
+    "category": "exact_local_match",
+    "prompt": "What Git branch am I on?",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "expectedEvidenceStatus": "confirmed",
+    "handlerFixture": "workspace_evidence",
+    "rationale": "An explicit supported branch question should use the local branch handler."
+  },
+  {
+    "id": "working_tree_exact_match",
+    "category": "exact_local_match",
+    "prompt": "Show Git status.",
+    "expectedRoute": "local",
+    "expectedIntent": "working_tree_status",
+    "expectedEvidenceStatus": "confirmed",
+    "handlerFixture": "workspace_evidence",
+    "rationale": "An explicit status request should use the deterministic local Git status handler."
+  },
+  {
+    "id": "branch_supported_rule",
+    "category": "supported_local_rule",
+    "prompt": "What branch is active?",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "expectedEvidenceStatus": "confirmed",
+    "handlerFixture": "workspace_evidence",
+    "rationale": "The anchored active-branch rule is a supported local paraphrase."
+  },
+  {
+    "id": "working_tree_supported_rule",
+    "category": "supported_local_rule",
+    "prompt": "Are there edits in my working tree?",
+    "expectedRoute": "local",
+    "expectedIntent": "working_tree_status",
+    "expectedEvidenceStatus": "confirmed",
+    "handlerFixture": "workspace_evidence",
+    "rationale": "The anchored working-tree rule should inspect local status without delegation."
+  },
+  {
+    "id": "test_record_missing",
+    "category": "missing_evidence",
+    "prompt": "Did the last test run pass?",
+    "expectedRoute": "local",
+    "expectedIntent": "most_recent_test_result",
+    "expectedEvidenceStatus": "unknown",
+    "handlerFixture": "test_record_missing",
+    "rationale": "The local intent is supported, while absent test evidence must remain unknown."
+  },
+  {
+    "id": "upstream_evidence_stale",
+    "category": "stale_evidence",
+    "prompt": "How many commits am I ahead of upstream?",
+    "expectedRoute": "local",
+    "expectedIntent": "ahead_of_upstream",
+    "expectedEvidenceStatus": "stale",
+    "handlerFixture": "stale_upstream",
+    "rationale": "The local count is available, but its tracking reference is older than the freshness window."
+  },
+  {
+    "id": "pushed_state_ambiguous",
+    "category": "ambiguous_question",
+    "prompt": "Is this branch pushed?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "expectedEvidenceStatus": null,
+    "handlerFixture": "not_used",
+    "rationale": "Local refs cannot establish live remote push state, so this ambiguous question should be delegated."
+  },
+  {
+    "id": "test_scope_ambiguous",
+    "category": "ambiguous_question",
+    "prompt": "Did the tests pass?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "expectedEvidenceStatus": null,
+    "handlerFixture": "not_used",
+    "rationale": "The request does not identify the supported recent recorded test run."
+  },
+  {
+    "id": "unsupported_local_commits",
+    "category": "unsupported_local_intent",
+    "prompt": "Have I made any local commits?",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "expectedEvidenceStatus": null,
+    "handlerFixture": "not_used",
+    "rationale": "Vesper has no deterministic local handler for commit-history questions."
+  },
+  {
+    "id": "complex_retry_implementation",
+    "category": "complex_task",
+    "prompt": "Implement retry with exponential backoff for API calls in this project.",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "expectedEvidenceStatus": null,
+    "handlerFixture": "not_used",
+    "rationale": "Implementation work requires project reasoning and should be delegated."
+  },
+  {
+    "id": "complex_repository_review",
+    "category": "complex_task",
+    "prompt": "Inspect the repository and explain its architecture.",
+    "expectedRoute": "codex",
+    "expectedIntent": null,
+    "expectedEvidenceStatus": null,
+    "handlerFixture": "not_used",
+    "rationale": "Repository analysis is outside the deterministic local fact handlers."
+  },
+  {
+    "id": "local_handler_failure",
+    "category": "local_handler_failure",
+    "prompt": "What Git branch am I on?",
+    "expectedRoute": "local",
+    "expectedIntent": "current_git_branch",
+    "expectedEvidenceStatus": "unavailable",
+    "handlerFixture": "git_command_failure",
+    "rationale": "A supported local route whose Git command fails must return unavailable and remain fail-closed."
+  }
+]

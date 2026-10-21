@@ -24,10 +24,12 @@ const SOURCE_FILES = Object.freeze([
   "test/routing-core.test.js",
   "test/local-handlers.test.js",
   "test/test-evidence.test.js",
+  "test/routing-evaluation.test.js",
   "test/app-server-client.test.js",
   "test/cli.test.js",
   "test/session-store.test.js",
   "test/terminal-frontend.test.js",
+  "test/fixtures/routing-quality-cases.json",
 ]);
 
 function currentSourceDigest(root) {
