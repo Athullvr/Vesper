@@ -102,6 +102,16 @@ const INTENT_PATTERNS = new Map([
 ]);
 
 const RESULT_STATUSES = new Set(["confirmed", "unknown", "stale", "unavailable"]);
+const ROUTING_REASON_CODES = new Set(["local_exact_match", "local_rule_match", "local_ambiguous", "codex_fallback"]);
+const ROUTING_OUTCOMES = Object.freeze([
+  "local_selected",
+  "local_handled",
+  "local_insufficient",
+  "local_unavailable",
+  "codex_delegated",
+  "codex_not_dispatched",
+]);
+const MAX_ROUTING_EXPLANATION_LENGTH = 220;
 
 function normalizeRequest(request) {
   return String(request ?? "")
@@ -193,31 +203,115 @@ function isLocalResult(result, intent) {
   );
 }
 
-async function routeRequest(request, { decision: suppliedDecision, handlers = {}, context = {}, fallback } = {}) {
+function createRoutingDecisionRecord(decision, result, { fallbackAvailable = false } = {}) {
+  const route = decision?.route === "codex" ? "codex" : "local";
+  const reasonCode = ROUTING_REASON_CODES.has(decision?.reason) ? decision.reason : "unknown_route_reason";
+  const intent = route === "local" && Object.values(LOCAL_INTENTS).includes(decision?.intent)
+    ? decision.intent
+    : null;
+  let outcome;
+  let outcomeReasonCode;
+  let handlerStatus = null;
+  let fallbackStatus = "not_attempted";
+  let explanation;
+
+  if (route === "codex") {
+    outcome = fallbackAvailable ? "codex_delegated" : "codex_not_dispatched";
+    outcomeReasonCode = fallbackAvailable ? "fallback_requested" : "fallback_not_configured";
+    fallbackStatus = fallbackAvailable ? "requested" : "not_configured";
+    const fallbackNote = fallbackAvailable ? "the Codex fallback was requested." : "no fallback callback was configured.";
+    explanation = reasonCode === "local_ambiguous"
+      ? `A local topic was detected, but no single supported intent matched; ${fallbackNote}`
+      : reasonCode === "codex_fallback"
+        ? `No supported local intent matched; ${fallbackNote}`
+        : "The router selected its Codex path.";
+  } else if (!result) {
+    outcome = "local_selected";
+    outcomeReasonCode = "local_handler_pending";
+    const match = reasonCode === "local_rule_match" ? "A constrained local intent rule matched." : "An explicit local intent phrase matched.";
+    explanation = `${match} The local handler has not returned a result yet.`;
+  } else {
+    handlerStatus = isLocalResult(result, intent) ? result.status : "unavailable";
+    const match = reasonCode === "local_rule_match" ? "A constrained local intent rule matched." : "An explicit local intent phrase matched.";
+    if (handlerStatus === "unknown" || handlerStatus === "stale") {
+      outcome = "local_insufficient";
+      outcomeReasonCode = handlerStatus === "unknown" ? "local_evidence_unknown" : "local_evidence_stale";
+      explanation = handlerStatus === "unknown"
+        ? `${match} The handler returned unknown; available evidence did not establish a result.`
+        : `${match} The handler returned stale; its evidence may not reflect current state.`;
+    } else if (handlerStatus === "unavailable") {
+      outcome = "local_unavailable";
+      outcomeReasonCode = "local_handler_unavailable";
+      explanation = `${match} The handler was unavailable; no Codex fallback was attempted.`;
+    } else {
+      outcome = "local_handled";
+      outcomeReasonCode = "local_handler_returned";
+      explanation = `${match} The handler returned confirmed status; this record does not independently validate its answer.`;
+    }
+  }
+
+  return {
+    version: 1,
+    route,
+    outcome,
+    reasonCode,
+    outcomeReasonCode,
+    intent,
+    handlerStatus,
+    fallbackStatus,
+    explanation: String(explanation).slice(0, MAX_ROUTING_EXPLANATION_LENGTH),
+  };
+}
+
+async function routeRequest(request, {
+  decision: suppliedDecision,
+  handlers = {},
+  context = {},
+  fallback,
+  onRoutingDecision,
+} = {}) {
   const decision = suppliedDecision || classifyRequest(request);
+  const report = (routingDecision) => {
+    try {
+      onRoutingDecision?.(routingDecision);
+    } catch {
+      // Observability callbacks must not change the router's existing behavior.
+    }
+  };
+
   if (decision.route === "codex") {
+    const routingDecision = createRoutingDecisionRecord(decision, null, {
+      fallbackAvailable: typeof fallback === "function",
+    });
+    report(routingDecision);
     return {
       decision,
+      routingDecision,
       ...(typeof fallback === "function" ? { fallbackResult: await fallback(decision) } : {}),
     };
   }
 
   const handler = handlers[decision.intent];
   if (typeof handler !== "function") {
-    return { decision, result: createUnavailableResult(decision.intent, "No local handler is registered; no answer was produced.") };
+    const result = createUnavailableResult(decision.intent, "No local handler is registered; no answer was produced.");
+    const routingDecision = createRoutingDecisionRecord(decision, result);
+    report(routingDecision);
+    return { decision, result, routingDecision };
   }
 
+  let result;
   try {
-    const result = await handler(context);
-    return {
-      decision,
-      result: isLocalResult(result, decision.intent)
-        ? result
-        : createUnavailableResult(decision.intent, "The local handler returned no trustworthy result."),
-    };
+    const handlerResult = await handler(context);
+    result = isLocalResult(handlerResult, decision.intent)
+      ? handlerResult
+      : createUnavailableResult(decision.intent, "The local handler returned no trustworthy result.");
   } catch {
-    return { decision, result: createUnavailableResult(decision.intent) };
+    result = createUnavailableResult(decision.intent);
   }
+
+  const routingDecision = createRoutingDecisionRecord(decision, result);
+  report(routingDecision);
+  return { decision, result, routingDecision };
 }
 
 class RouteMetrics {
@@ -226,12 +320,16 @@ class RouteMetrics {
     this.fallbackCount = 0;
     this.handlerFailureCount = 0;
     this.lastRouteLatencyMs = 0;
+    this.routingOutcomes = Object.fromEntries(ROUTING_OUTCOMES.map((outcome) => [outcome, 0]));
   }
 
-  record(decision, latencyMs, { handlerFailed = false } = {}) {
+  record(decision, latencyMs, { handlerFailed = false, routingDecision } = {}) {
     if (decision.route === "local") this.localRouteCount += 1;
     else this.fallbackCount += 1;
     if (handlerFailed) this.handlerFailureCount += 1;
+    if (routingDecision && Object.hasOwn(this.routingOutcomes, routingDecision.outcome)) {
+      this.routingOutcomes[routingDecision.outcome] += 1;
+    }
     this.lastRouteLatencyMs = Math.max(0, Math.round(latencyMs));
     return this.snapshot();
   }
@@ -242,15 +340,19 @@ class RouteMetrics {
       fallbackCount: this.fallbackCount,
       routeLatencyMs: this.lastRouteLatencyMs,
       handlerFailureCount: this.handlerFailureCount,
+      routingOutcomes: { ...this.routingOutcomes },
     };
   }
 }
 
 module.exports = {
   LOCAL_INTENTS,
+  MAX_ROUTING_EXPLANATION_LENGTH,
+  ROUTING_OUTCOMES,
   RouteMetrics,
   classifyRequest,
   createLocalResult,
+  createRoutingDecisionRecord,
   createUnavailableResult,
   normalizeRequest,
   routeRequest,

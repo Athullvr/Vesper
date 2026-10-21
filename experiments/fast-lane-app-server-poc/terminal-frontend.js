@@ -1,7 +1,7 @@
 "use strict";
 
 const readline = require("node:readline");
-const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
+const { RouteMetrics, classifyRequest, createRoutingDecisionRecord, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
@@ -35,7 +35,7 @@ const STREAM_SENSITIVE_MARKER_NAMES = [
 ];
 
 class TerminalFrontend {
-  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask } = {}) {
+  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (!handlers || typeof handlers !== "object") throw new TypeError("Local handlers are required.");
     if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
@@ -47,6 +47,7 @@ class TerminalFrontend {
     this.sessionId = sessionId;
     this.onWorkspaceCommand = onWorkspaceCommand;
     this.onTask = onTask;
+    this.routingDiagnostics = Boolean(routingDiagnostics);
     this.output = output;
     this.lineIO = lineIO || createLineIO(input, output);
     this.metrics = metrics;
@@ -133,18 +134,16 @@ class TerminalFrontend {
         decision,
         handlers: this.handlers,
         context: { cwd: this.cwd },
+        onRoutingDecision: (routingDecision) => this.writeRoutingDecision(routingDecision),
       });
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       const failed = routed.result?.status === "unavailable";
-      this.metrics.record(decision, elapsedMs, { handlerFailed: failed });
-      const routeDiagnostic = `${decision.reason}/${decision.intent}`;
-      const label = failed
-        ? `Vesper local · unavailable · ${routeDiagnostic}`
-        : `Vesper local · ${routed.result.status} · no Codex turn · ${routeDiagnostic}`;
-      this.write(`\n[${label}] ${safeTerminalText(routed.result.summary)}\n`);
+      this.metrics.record(decision, elapsedMs, { handlerFailed: failed, routingDecision: routed.routingDecision });
+      this.write(`${safeTerminalText(routed.result.summary)}\n`);
       return;
     }
 
+    let routingDecision;
     this.activeRequest = true;
     this.interruptPending = false;
     this.commandActivity = new CommandActivityStore();
@@ -160,12 +159,16 @@ class TerminalFrontend {
     this.fileActivityIdentities.clear();
     this.fileActivityOutputLength = 0;
     this.fileActivityLimitReported = false;
-    this.write(`\n[Codex · ${decision.reason} · connecting]\n`);
     try {
       const routed = await routeRequest(prompt, {
         decision,
         handlers: this.handlers,
         context: { cwd: this.cwd },
+        onRoutingDecision: (record) => {
+          routingDecision = record;
+          this.writeRoutingDecision(record);
+          this.write("[Codex · connecting]\n");
+        },
         fallback: async () => {
           await this.restoreSavedHistory();
           return this.appServer.runTurn({
@@ -177,7 +180,7 @@ class TerminalFrontend {
       });
       const result = routed.fallbackResult;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
-      this.metrics.record(decision, elapsedMs);
+      this.metrics.record(decision, elapsedMs, { routingDecision: routed.routingDecision });
       this.finishStream();
       if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
@@ -185,7 +188,7 @@ class TerminalFrontend {
       else this.write(`\n\n[Codex · ended with status ${safeTerminalText(result?.status || "unknown")}]\n`);
     } catch (error) {
       const elapsedMs = Math.max(0, Date.now() - startedAt);
-      this.metrics.record(decision, elapsedMs);
+      this.metrics.record(decision, elapsedMs, { routingDecision });
       this.finishStream();
       this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
@@ -523,6 +526,27 @@ class TerminalFrontend {
       this.turnDiffView.afterExternalWrite();
     }
   }
+
+  writeRoutingDecision(routingDecision) {
+    this.write(`\n[${formatRoutingIndicator(routingDecision)}]\n`);
+    if (this.routingDiagnostics) {
+      this.write(`[Routing diagnostic] ${safeTerminalText(JSON.stringify(routingDecision))}\n`);
+    }
+  }
+}
+
+function formatRoutingIndicator(record) {
+  const intent = record.intent || "local intent";
+  if (record.outcome === "codex_delegated") {
+    return record.reasonCode === "local_ambiguous"
+      ? "Route · Codex · local topic ambiguous"
+      : "Route · Codex · no local intent matched";
+  }
+  if (record.outcome === "codex_not_dispatched") return "Route · Codex · fallback not configured";
+  if (record.outcome === "local_insufficient") return `Route · local · ${intent} · evidence ${record.handlerStatus}`;
+  if (record.outcome === "local_unavailable") return `Route · local · ${intent} · unavailable; no Codex fallback`;
+  if (record.outcome === "local_selected") return `Route · local · ${intent} · selected`;
+  return `Route · local · ${intent} · handler status ${record.handlerStatus || "unknown"}`;
 }
 
 function createLineIO(input, output) {

@@ -127,7 +127,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
     const routed = await routeRequest(prompt, { decision, handlers: localHandlers, context: { cwd } });
     const result = routed.result;
     const elapsedMs = Math.round(performance.now() - startedAt);
-    recordRouteMetrics(requestId, decision, elapsedMs, result.status === "unavailable");
+    recordRouteMetrics(requestId, decision, elapsedMs, result.status === "unavailable", routed.routingDecision);
     if (result.status === "unavailable") {
       postToPanel(targetPanel, {
         type: "error", label: "Local check unavailable", text: result.summary, result, elapsedMs,
@@ -209,16 +209,18 @@ async function handlePrompt(prompt, targetPanel = panel) {
       postToPanel(targetPanel, { type: "assistant-delta", requestId, text: delta });
     }
   };
+  let routingDecision;
   try {
     const routed = await routeRequest(prompt, {
       decision,
       handlers: localHandlers,
       context: { cwd },
+      onRoutingDecision: (record) => { routingDecision = record; },
       fallback: () => client.runTurn({ prompt, cwd, onDelta }),
     });
     const result = routed.fallbackResult;
     const elapsedMs = Math.round(performance.now() - startedAt);
-    recordRouteMetrics(requestId, decision, elapsedMs);
+    recordRouteMetrics(requestId, decision, elapsedMs, false, routed.routingDecision);
     writeLog(`request=${requestId} fallback=completed elapsed_ms=${elapsedMs} status=${result.status}`);
     if (result.status === "interrupted" || result.status === "timeout") {
       postToPanel(targetPanel, {
@@ -233,7 +235,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
     }
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
-    recordRouteMetrics(requestId, decision, elapsedMs);
+    recordRouteMetrics(requestId, decision, elapsedMs, false, routingDecision);
     writeLog(`request=${requestId} fallback=failed elapsed_ms=${elapsedMs} reason=${safeMessage(error)}`);
     const interrupted = error.turnStatus === "interrupted";
     const terminalTurnState = ["failed", "interrupted"].includes(error.turnStatus);
@@ -721,9 +723,9 @@ function postToPanel(targetPanel, message) {
   }
 }
 
-function recordRouteMetrics(requestId, decision, elapsedMs, handlerFailed = false) {
-  const metrics = routeMetrics.record(decision, elapsedMs, { handlerFailed });
-  writeLog(`request=${requestId} event=route_metric route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"} route_latency_ms=${metrics.routeLatencyMs} local_routes=${metrics.localRouteCount} fallback_routes=${metrics.fallbackCount} handler_failures=${metrics.handlerFailureCount}`);
+function recordRouteMetrics(requestId, decision, elapsedMs, handlerFailed = false, routingDecision) {
+  const metrics = routeMetrics.record(decision, elapsedMs, { handlerFailed, routingDecision });
+  writeLog(`request=${requestId} event=route_metric outcome=${routingDecision?.outcome || "unknown"} outcome_reason=${routingDecision?.outcomeReasonCode || "unknown"} route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"} route_latency_ms=${metrics.routeLatencyMs} local_routes=${metrics.localRouteCount} fallback_routes=${metrics.fallbackCount} handler_failures=${metrics.handlerFailureCount}`);
 }
 
 function runGitCommand(args, cwd) {

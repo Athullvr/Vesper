@@ -289,7 +289,7 @@ test("local request returns without invoking Codex or creating a Codex thread", 
   assert.equal(status, 0);
   assert.equal(errors.text(), "");
   assert.match(output.text(), /Current Git branch: feature\/local/u);
-  assert.match(output.text(), /no Codex turn/u);
+  assert.match(output.text(), /\[Route · local · current_git_branch · handler status confirmed\]/u);
   assert.match(output.text(), /Session status: new · no Codex thread yet/u);
   assert.equal(appServerSpawnCount, 0);
   assert.equal(store.load(sessionId).threadId, null);

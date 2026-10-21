@@ -132,7 +132,7 @@ test("CLI local Git matrix answers from real evidence without spawning Codex or 
   });
   assert.equal(code, 0);
   assert.equal(spawns, 0);
-  assert.equal((text.match(/no Codex turn · local_exact_match/g) || []).length, 4);
+  assert.equal((text.match(/\[Route · local · [a-z_]+ · handler status confirmed\]/g) || []).length, 4);
   assert.match(text, /Current Git branch: main/u);
   assert.match(text, /working tree has .* untracked/u);
   assert.match(text, /configured to track origin\/main locally/u);

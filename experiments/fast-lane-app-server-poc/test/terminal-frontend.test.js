@@ -101,7 +101,7 @@ class FakeCodexProcess extends EventEmitter {
   }
 }
 
-function makeFrontend({ answers, appServer, handlers, lineIO, onWrite } = {}) {
+function makeFrontend({ answers, appServer, handlers, lineIO, onWrite, routingDiagnostics = false } = {}) {
   const io = lineIO || new FakeLineIO(answers);
   let outputText = "";
   const output = { write: (text) => { outputText += String(text); onWrite?.(String(text)); } };
@@ -124,6 +124,7 @@ function makeFrontend({ answers, appServer, handlers, lineIO, onWrite } = {}) {
     }),
     output,
     lineIO: io,
+    routingDiagnostics,
   });
   return { frontend, io, output: () => outputText };
 }
@@ -142,9 +143,10 @@ test("local question is labeled local, uses no app-server turn, and Codex fallba
 
   await frontend.run();
   const text = output();
-  assert.match(text, /Vesper local · confirmed · no Codex turn/u);
-  assert.match(text, /local_exact_match\/current_git_branch/u);
+  assert.match(text, /\[Route · local · current_git_branch · handler status confirmed\]/u);
   assert.match(text, /Current Git branch: feature\/phase-two/u);
+  assert.match(text, /\[Route · Codex · no local intent matched\]/u);
+  assert.match(text, /\[Codex · connecting\]/u);
   assert.match(text, /A rebase replays commits\./u);
   assert.match(text, /Codex · completed/u);
   assert.equal(appServer.turns.length, 1);
@@ -182,9 +184,30 @@ test("insufficient evidence and handler failure remain local uncertainty without
   });
   await frontend.run();
   assert.equal(appServer.turns.length, 0);
-  assert.match(output(), /Vesper local · unknown/u);
-  assert.match(output(), /Vesper local · unavailable/u);
+  assert.match(output(), /\[Route · local · current_git_branch · evidence unknown\]/u);
+  assert.match(output(), /\[Route · local · working_tree_status · unavailable; no Codex fallback\]/u);
   assert.doesNotMatch(output(), /confirmed|private failure|Codex · completed/u);
+});
+
+test("optional routing diagnostics are sanitized and omit the submitted prompt", async () => {
+  const prompt = "Build a website with API_KEY=diagnostic-secret";
+  const { frontend, output } = makeFrontend({ answers: [prompt, ":quit"], routingDiagnostics: true });
+  await frontend.run();
+  assert.match(output(), /\[Routing diagnostic\]/u);
+  assert.match(output(), /"reasonCode":"codex_fallback"/u);
+  assert.match(output(), /"outcome":"codex_delegated"/u);
+  assert.doesNotMatch(output(), /diagnostic-secret|API_KEY=|Build a website/u);
+});
+
+test("non-TTY route indicators stay concise across repeated local requests", async () => {
+  const answers = [...Array(100).fill("What Git branch am I on?"), ":quit"];
+  const appServer = new FakeAppServer(async () => assert.fail("Local requests must not call Codex."));
+  const { frontend, output } = makeFrontend({ answers, appServer });
+  await frontend.run();
+  const text = output();
+  assert.equal((text.match(/\[Route · local · current_git_branch · handler status confirmed\]/gu) || []).length, 100);
+  assert.ok(text.length < 16_000, `non-TTY output was ${text.length} characters`);
+  assert.doesNotMatch(text, /\u001b|\[Routing diagnostic\]/u);
 });
 
 test("failed and interrupted fallback turns never print a completed or confirmed local answer", async () => {

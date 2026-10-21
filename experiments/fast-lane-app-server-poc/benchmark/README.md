@@ -8,7 +8,7 @@ Run the local routing evaluation from this directory or the prototype root:
 node benchmark/run-local.js 5
 ```
 
-The runner repeats every case, measures routing plus local-handler latency, checks local answers against current read-only Git/test evidence, records evidence/freshness labels, and calls a mock fallback for Codex-routed cases. It reports development and held-out metrics separately. It does not start real Codex turns. `realCodexTurnStarted` is therefore false for every row; `codexTurnRequestedTrials` records whether Vesper reached its fallback callback. The current prototype's terminal frontend passes that callback to `appServer.runTurn`.
+The runner repeats every case, measures routing plus local-handler latency, checks local answers against current read-only Git/test evidence, records evidence/freshness labels, and calls a mock fallback for Codex-routed cases. It reports development and held-out metrics separately, including bounded routing outcome and reason-code counts. It does not start real Codex turns. `realCodexTurnStarted` is therefore false for every row; `codexTurnRequestedTrials` records whether Vesper reached its fallback callback. The current prototype's terminal frontend passes that callback to `appServer.runTurn`.
 
 For the direct baseline, run:
 

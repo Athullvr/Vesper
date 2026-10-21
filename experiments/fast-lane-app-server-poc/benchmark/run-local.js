@@ -6,7 +6,7 @@ const { execFileSync } = require("node:child_process");
 const { performance } = require("node:perf_hooks");
 const { createLocalHandlers } = require("../local-handlers");
 const { readLatestTestRecord } = require("../test-evidence");
-const { routeRequest } = require("../routing-core");
+const { ROUTING_OUTCOMES, routeRequest } = require("../routing-core");
 
 const prototypeRoot = path.resolve(__dirname, "..");
 const projectRoot = path.resolve(prototypeRoot, "../..");
@@ -181,6 +181,9 @@ async function run(trialCount) {
         actualRoute: routed.decision.route,
         routeReason: routed.decision.reason,
         actualIntent: routed.decision.intent,
+        routingOutcome: routed.routingDecision.outcome,
+        routingReasonCode: routed.routingDecision.reasonCode,
+        routingOutcomeReasonCode: routed.routingDecision.outcomeReasonCode,
         routeCorrect,
         localAnswerProduced: hasLocalAnswer,
         answerCorrect,
@@ -206,6 +209,9 @@ async function run(trialCount) {
       expectedIntent: row.expectedIntent,
       actualRoute: trials[0].actualRoute,
       routeReason: trials[0].routeReason,
+      routingOutcome: trials[0].routingOutcome,
+      routingReasonCode: trials[0].routingReasonCode,
+      routingOutcomeReasonCode: trials[0].routingOutcomeReasonCode,
       routeCorrectTrials: trials.filter((trial) => trial.routeCorrect).length,
       falseLocalRouteTrials: row.expectedRoute === "codex"
         ? trials.filter((trial) => trial.actualRoute === "local").length
@@ -232,6 +238,10 @@ async function run(trialCount) {
   const fallbackRequests = summary.reduce((total, row) => total + row.codexTurnRequestedTrials, 0);
   const falseLocalRouteCount = summary.reduce((total, row) => total + row.falseLocalRouteTrials, 0);
   const allTrials = [...rows.values()].flatMap((row) => row.trials);
+  const routingOutcomeCounts = Object.fromEntries(ROUTING_OUTCOMES.map((outcome) => [
+    outcome,
+    allTrials.filter((trial) => trial.routingOutcome === outcome).length,
+  ]));
   const latencySamples = allTrials.map((trial) => trial.localLatencyMs);
   const localAnswerLatencySamples = allTrials
     .filter((trial) => trial.localAnswerProduced)
@@ -276,6 +286,7 @@ async function run(trialCount) {
     incorrectLocalAnswerCount,
     fallbackTurnRequests: fallbackRequests,
     liveCodexTurnsStarted: 0,
+    routingOutcomeCounts,
     splitMetrics,
     cases: summary,
   };
