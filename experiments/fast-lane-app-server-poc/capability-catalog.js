@@ -226,15 +226,17 @@ function createCapabilityProvider(options) {
   };
   return Object.freeze({
     async getCatalog({ refresh = false, refreshRuntime = false } = {}) {
+      const hadSnapshot = Boolean(snapshotPromise);
       if (refresh) snapshotPromise = null;
       const catalog = await load();
-      return refreshRuntime && options?.runtimeStatusAdapter
+      return refreshRuntime && hadSnapshot && !refresh && options?.runtimeStatusAdapter
         ? refreshRuntimeCatalog(catalog, options.runtimeStatusAdapter)
         : catalog;
     },
     async getRouterContext() {
+      const hadSnapshot = Boolean(snapshotPromise);
       const baseCatalog = await load();
-      const catalog = options?.runtimeStatusAdapter
+      const catalog = hadSnapshot && options?.runtimeStatusAdapter
         ? await refreshRuntimeCatalog(baseCatalog, options.runtimeStatusAdapter)
         : baseCatalog;
       return {

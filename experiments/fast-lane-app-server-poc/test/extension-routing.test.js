@@ -793,7 +793,7 @@ function mountWebview(html) {
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/u)?.[1];
   assert.equal(typeof script, "string", "the panel HTML contains its nonce-bound script");
   const ids = [
-    "messages", "status", "form", "prompt", "send", "stop", "choose-project", "project-name",
+    "messages", "status", "form", "prompt", "preview-plan", "send", "stop", "choose-project", "project-name",
     "project-path", "session-state", "history-state", "recovery-actions", "retry-resume", "start-new-session",
   ];
   const elements = new Map(ids.map((id) => [id, new MockElement(id)]));

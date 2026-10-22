@@ -356,7 +356,7 @@ async function runPlan(options, dependencies, output, errorOutput) {
       });
     }
     const decision = classifyRequest(options.task);
-    const plan = createCapabilityPlan({ task: options.task, catalog, routeDecision: decision, now: dependencies.planningNow });
+    const plan = createCapabilityPlan({ task: options.task, catalog, routeDecision: decision, projectContext: { cwd }, now: dependencies.planningNow });
     output.write(renderCapabilityPlan(plan));
     return 0;
   } catch (error) {
@@ -609,7 +609,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         }
         const catalog = await capabilityProvider.getCatalog({ refresh: true });
         const decision = classifyRequest(task);
-        output.write(renderCapabilityPlan(createCapabilityPlan({ task, catalog, routeDecision: decision })));
+        output.write(renderCapabilityPlan(createCapabilityPlan({ task, catalog, routeDecision: decision, projectContext: { cwd } })));
         return true;
       }
       if (name === ":sessions" && args.length === 0) {

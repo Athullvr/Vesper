@@ -2,6 +2,7 @@
 
 const MAX_TASK_LENGTH = 32_768;
 const MAX_CAPABILITY_CANDIDATES = 8;
+const MAX_CATALOG_ENTRIES = 500;
 const MAX_CAPABILITY_ID_LENGTH = 240;
 const MAX_EXPLANATION_LENGTH = 240;
 const MAX_RENDERED_PLAN_LENGTH = 12_000;
@@ -52,6 +53,7 @@ const REASON_TEXT = Object.freeze({
   runtime_evidence_stale: "The runtime observation is older than the freshness window; current availability is uncertain.",
   runtime_evidence_missing: "No timestamped runtime observation confirms current availability.",
   configuration_unknown: "Configuration state is unknown.",
+  installation_unknown: "Installation state is unknown.",
   enabled_unknown: "The catalog does not establish that this capability is enabled.",
   availability_unknown: "The catalog does not establish that this capability is available for use.",
   runtime_loaded_unknown: "The runtime has not confirmed that this capability is loaded.",
@@ -60,27 +62,33 @@ const REASON_TEXT = Object.freeze({
   runtime_startup_in_progress: "Codex reported that MCP startup is still in progress.",
   operational_unverified: "No supported health check or tool call confirms operation; this plan does not claim operational status.",
   eligibility_confirmed: "Fresh runtime evidence confirms the capability is enabled, loaded, and available to try.",
+  local_route_sufficient: "The deterministic local handler already covers this request, so no capability is recommended.",
 });
 
-function createCapabilityPlan({ task, catalog, routeDecision, now = Date.now(), maxRuntimeAgeMs = MAX_RUNTIME_AGE_MS } = {}) {
+function createCapabilityPlan({ task, catalog, routeDecision, projectContext, now = Date.now(), maxRuntimeAgeMs = MAX_RUNTIME_AGE_MS } = {}) {
   const taskText = typeof task === "string" ? task.slice(0, MAX_TASK_LENGTH) : "";
   const decision = normalizeRouteDecision(routeDecision);
   const category = classifyTaskCategory(taskText, decision);
-  // A selected local handler already answers its narrow request from local
-  // evidence; capability discovery must not turn it into a plugin suggestion.
-  const matches = decision.route === "local" ? [] : matchCapabilities(taskText, catalog, category);
+  const matches = matchCapabilities(taskText, catalog, category);
   const candidates = matches.slice(0, MAX_CAPABILITY_CANDIDATES).map((match) => {
     const evaluation = evaluateCapabilityState(match.capability, { catalog, now, maxRuntimeAgeMs });
+    const recommendationReasonCode = decision.route === "local"
+      ? "local_route_sufficient"
+      : evaluation.eligibility === "usable" ? "eligible_to_try" : evaluation.reasonCode;
     return {
       id: match.id,
       type: match.type,
       name: safeLabel(match.capability.displayName || match.capability.name || match.id, 120),
+      discoverySource: safeLabel(match.capability.source?.name || "local capability catalog", 120),
       relevance: match.relevance,
       matchReasonCode: match.reasonCode,
       matchReason: match.reason,
       eligibility: evaluation.eligibility,
       reasonCode: evaluation.reasonCode,
       reason: REASON_TEXT[evaluation.reasonCode] || REASON_TEXT.capability_state_uncertain,
+      recommendationStatus: decision.route === "local" ? "declined" : evaluation.eligibility === "usable" ? "eligible_to_try" : "declined",
+      recommendationReasonCode,
+      recommendationReason: REASON_TEXT[recommendationReasonCode] || REASON_TEXT.capability_state_uncertain,
       state: evaluation.state,
       evidence: evaluation.evidence,
       missingPrerequisites: evaluation.missingPrerequisites,
@@ -91,11 +99,11 @@ function createCapabilityPlan({ task, catalog, routeDecision, now = Date.now(), 
     };
   });
   const omittedCandidates = Math.max(0, matches.length - candidates.length);
-  const recommendedCapabilityIds = candidates.filter((candidate) => candidate.eligibility === "usable").slice(0, 4).map((candidate) => candidate.id);
-  const declinedCapabilities = candidates.filter((candidate) => candidate.eligibility !== "usable").map((candidate) => ({
+  const recommendedCapabilityIds = candidates.filter((candidate) => candidate.recommendationStatus === "eligible_to_try").slice(0, 4).map((candidate) => candidate.id);
+  const declinedCapabilities = candidates.filter((candidate) => candidate.recommendationStatus === "declined").map((candidate) => ({
     id: candidate.id,
-    reasonCode: candidate.reasonCode,
-    reason: candidate.reason,
+    reasonCode: candidate.recommendationReasonCode,
+    reason: candidate.recommendationReason,
   }));
   const hasUncertainty = candidates.some((candidate) => candidate.eligibility === "uncertain");
   const routeName = decision.route === "local" ? "local_handler" : decision.route === "codex" ? "codex_fallback" : "route_unavailable";
@@ -110,10 +118,14 @@ function createCapabilityPlan({ task, catalog, routeDecision, now = Date.now(), 
       intent: decision.intent,
       reason: decision.reason,
     },
+    catalogScope: typeof projectContext?.cwd === "string" && projectContext.cwd || typeof catalog?.projectDirectory === "string" && catalog.projectDirectory
+      ? "selected_project"
+      : "project_scope_unknown",
     relevantCapabilities: candidates,
     recommendedCapabilityIds,
     declinedCapabilities,
     omittedCandidates,
+    omittedCatalogEntries: Array.isArray(catalog?.capabilities) ? Math.max(0, catalog.capabilities.length - MAX_CATALOG_ENTRIES) : 0,
     malformedCatalogEntries: matches.malformedCount || 0,
     hasUncertainty,
     advisoryOnly: true,
@@ -143,7 +155,7 @@ function classifyTaskCategory(task, routeDecision = {}) {
 function matchCapabilities(task, catalog, category = classifyTaskCategory(task)) {
   const result = [];
   let malformedCount = 0;
-  const capabilities = Array.isArray(catalog?.capabilities) ? catalog.capabilities.slice(0, 2_000) : [];
+  const capabilities = Array.isArray(catalog?.capabilities) ? catalog.capabilities.slice(0, MAX_CATALOG_ENTRIES) : [];
   const taskTokens = tokenize(task);
   const taskTopics = topicsFromTokens(taskTokens);
   for (const capability of capabilities) {
@@ -187,6 +199,7 @@ function evaluateCapabilityState(capability, { catalog, now = Date.now(), maxRun
   const states = normalizeStates(capability);
   const freshness = getFreshness(capability?.runtimeEvidence, now, maxRuntimeAgeMs);
   const evidence = ["Discovered: yes (entry found in the normalized local catalog)."];
+  if (typeof capability?.source?.name === "string") evidence.push(`Discovery source: ${safeLabel(capability.source.name, 120)}.`);
   if (states.installed !== "unknown") evidence.push(`Installed: ${states.installed}.`);
   if (states.configured !== "unknown") evidence.push(`Configured: ${states.configured}.`);
   if (states.enabled !== "unknown") evidence.push(`Enabled: ${states.enabled}.`);
@@ -335,7 +348,15 @@ function capabilityMetadataFields(capability) {
     if (Array.isArray(capability[key])) values.push(...capability[key].slice(0, 30));
     else if (typeof capability[key] === "string") values.push(capability[key]);
   }
-  return values.filter((value) => typeof value === "string" && value.trim()).slice(0, 70);
+  let budget = 6_000;
+  const bounded = [];
+  for (const value of values) {
+    if (typeof value !== "string" || !value.trim() || budget <= 0 || bounded.length >= 40) continue;
+    const selected = sanitizeCapabilityText(value.slice(0, Math.min(1_200, budget)));
+    bounded.push(selected);
+    budget -= selected.length;
+  }
+  return bounded;
 }
 
 function tokenize(value) {
@@ -375,6 +396,7 @@ function makePlanExplanation(routeName, category, candidates, recommendedIds, ha
   const ready = recommendedIds.length;
   const unknown = candidates.filter((candidate) => candidate.eligibility === "uncertain").length;
   const capabilityNoun = candidates.length === 1 ? "capability" : "capabilities";
+  if (routeName === "local_handler") return `${candidates.length} relevant ${capabilityNoun} found, but the local handler already covers this request. The plan preserves ${route} and recommends no capability.`;
   return `${candidates.length} relevant ${capabilityNoun} found; ${ready} eligible to try and ${unknown} uncertain. The plan preserves ${route}; no capability is activated or executed.`;
 }
 
@@ -389,10 +411,13 @@ function createRoutingMetadata(plan) {
       status: candidate.eligibility,
       reasonCode: safeIdentifier(candidate.reasonCode),
       matchReasonCode: safeIdentifier(candidate.matchReasonCode),
+      recommendation: safeIdentifier(candidate.recommendationStatus),
+      recommendationReasonCode: safeIdentifier(candidate.recommendationReasonCode),
     })),
     reasonCodes: unique(plan.relevantCapabilities.flatMap((candidate) => [
       safeIdentifier(candidate.matchReasonCode),
       safeIdentifier(candidate.reasonCode),
+      safeIdentifier(candidate.recommendationReasonCode),
     ])).slice(0, 12),
     hasUncertainty: Boolean(plan.hasUncertainty),
     advisoryOnly: true,
@@ -405,6 +430,7 @@ function renderCapabilityPlan(plan) {
     `Task category: ${safeLabel(plan?.categoryLabel || TOPIC_LABELS.unknown, 100)}`,
     `Existing route: ${safeLabel(plan?.routeDecision?.route || "unknown", 40)} · ${safeLabel(plan?.routeDecision?.reason || "unknown", 64)}`,
     `Execution path: ${safeLabel(plan?.executionPath?.kind || "route_unavailable", 40)}${plan?.executionPath?.intent ? ` · ${safeLabel(plan.executionPath.intent, 64)}` : ""}`,
+    `Catalog scope: ${plan?.catalogScope === "selected_project" ? "selected project" : "unknown"}`,
     `Plan: ${safeLabel(plan?.explanation || "No plan explanation is available.", MAX_EXPLANATION_LENGTH)}`,
   ];
   const candidates = Array.isArray(plan?.relevantCapabilities) ? plan.relevantCapabilities.slice(0, MAX_CAPABILITY_CANDIDATES) : [];
@@ -414,16 +440,18 @@ function renderCapabilityPlan(plan) {
     for (const candidate of candidates) {
       lines.push(`- ${safeLabel(candidate.id, MAX_CAPABILITY_ID_LENGTH)} · ${safeLabel(candidate.type, 40)} · ${safeLabel(candidate.name, 120)} · ${safeLabel(candidate.eligibility, 20)}`);
       lines.push(`  Match: ${safeLabel(candidate.matchReason, MAX_EXPLANATION_LENGTH)}`);
+      lines.push(`  Discovery source: ${safeLabel(candidate.discoverySource || "local capability catalog", 120)}`);
       const state = candidate.state || {};
       lines.push(`  State: discovered ${state.discovered || "unknown"}; installed ${state.installed || "unknown"}; configured ${state.configured || "unknown"} (${state.configurationStatus || "unknown"}); enabled ${state.enabled || "unknown"}; available ${state.availableForUse || "unknown"}; loaded ${state.runtimeLoaded || "unknown"}; operational ${state.operational || "unknown"}; requirements ${state.requirements || "unknown"}; runtime evidence ${candidate.freshness || "unknown"}`);
       if (candidate.startupStatus) lines.push(`  Codex-reported MCP startup: ${safeLabel(candidate.startupStatus, 20)}; this is not a tool health check.`);
       for (const item of (Array.isArray(candidate.evidence) ? candidate.evidence : []).slice(0, 4)) lines.push(`  Evidence: ${safeLabel(item, 220)}`);
       if (candidate.observedAt) lines.push(`  Runtime observation: ${safeLabel(candidate.observedAt, 40)}${candidate.runtimeSource ? ` via ${safeLabel(candidate.runtimeSource, 120)}` : ""} · ${safeLabel(candidate.freshness, 20)}`);
       for (const item of (Array.isArray(candidate.missingPrerequisites) ? candidate.missingPrerequisites : []).slice(0, 4)) lines.push(`  Missing or unverified: ${safeLabel(item, 220)}`);
-      if (candidate.eligibility !== "usable") lines.push(`  Recommendation declined: ${safeLabel(candidate.reason, MAX_EXPLANATION_LENGTH)}`);
+      if (candidate.recommendationStatus === "declined") lines.push(`  Recommendation declined: ${safeLabel(candidate.recommendationReason, MAX_EXPLANATION_LENGTH)} Capability state: ${safeLabel(candidate.reason, MAX_EXPLANATION_LENGTH)}`);
     }
   }
   if ((plan?.omittedCandidates || 0) > 0) lines.push(`Additional relevant capabilities omitted: ${Math.min(10_000, plan.omittedCandidates)}.`);
+  if ((plan?.omittedCatalogEntries || 0) > 0) lines.push(`Catalog entries beyond the planning scan limit: ${Math.min(10_000, plan.omittedCatalogEntries)}.`);
   if ((plan?.malformedCatalogEntries || 0) > 0) lines.push(`Malformed catalog entries skipped: ${Math.min(10_000, plan.malformedCatalogEntries)}.`);
   lines.push(`Eligible to try: ${Array.isArray(plan?.recommendedCapabilityIds) && plan.recommendedCapabilityIds.length ? plan.recommendedCapabilityIds.map((id) => safeLabel(id, MAX_CAPABILITY_ID_LENGTH)).join(", ") : "none"}`);
   lines.push("Vesper does not automatically select or execute capabilities from this advisory plan.");
@@ -432,18 +460,23 @@ function renderCapabilityPlan(plan) {
   return rendered;
 }
 
-async function getPlanningMetadata({ task, capabilityProvider, routeDecision, now } = {}) {
+async function getPlanningMetadata({ task, capabilityProvider, routeDecision, projectContext, now } = {}) {
   if (!capabilityProvider || typeof capabilityProvider.getCatalog !== "function") return null;
   try {
     const catalog = await capabilityProvider.getCatalog({ refreshRuntime: true });
-    return createCapabilityPlan({ task, catalog, routeDecision, now }).routingMetadata;
+    return createCapabilityPlan({ task, catalog, routeDecision, projectContext, now }).routingMetadata;
   } catch {
     return null;
   }
 }
 
 function validId(value) {
-  return typeof value === "string" && value.length > 0 && value.length <= MAX_CAPABILITY_ID_LENGTH && !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value);
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_CAPABILITY_ID_LENGTH &&
+    !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value) && safeLabel(value, MAX_CAPABILITY_ID_LENGTH) === value;
+}
+
+function sanitizeCapabilityText(value) {
+  return safeLabel(value, 6_000).replace(/\[redacted[^\]]*\]/giu, " ");
 }
 
 function enumValue(value, options) {
@@ -461,6 +494,8 @@ function preferredBlockReason(reasons) {
 
 function chooseUnknownReason(states, capability) {
   if (capability?.runtimeEvidence?.status === "unsupported") return "runtime_inspection_unsupported";
+  if (states.configurationStatus === "unknown" || states.configured === "unknown") return "configuration_unknown";
+  if (states.installationStatus === "unknown") return "installation_unknown";
   if (states.enabled === "unknown") return "enabled_unknown";
   if (states.availableForUse !== "yes") return "availability_unknown";
   if (states.runtimeLoaded !== "yes") return "runtime_loaded_unknown";
@@ -486,6 +521,7 @@ function unique(values) {
 
 module.exports = {
   MAX_CAPABILITY_CANDIDATES,
+  MAX_CATALOG_ENTRIES,
   MAX_RENDERED_PLAN_LENGTH,
   MAX_RUNTIME_AGE_MS,
   classifyTaskCategory,

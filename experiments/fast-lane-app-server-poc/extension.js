@@ -228,6 +228,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       task: prompt,
       capabilityProvider: capabilityProviderFor(cwd),
       routeDecision: decision,
+      projectContext: { cwd },
     });
     const routed = await routeRequest(prompt, {
       decision,
@@ -308,7 +309,7 @@ async function previewPlan(task, targetPanel = panel) {
     const provider = capabilityProviderFor(project.path);
     const catalog = await provider.getCatalog({ refresh: true });
     const decision = classifyRequest(task);
-    const plan = createCapabilityPlan({ task, catalog, routeDecision: decision });
+    const plan = createCapabilityPlan({ task, catalog, routeDecision: decision, projectContext: { cwd: project.path } });
     postToPanel(targetPanel, { type: "plan-preview", text: renderCapabilityPlan(plan), error: false });
   } catch {
     postToPanel(targetPanel, { type: "plan-preview", text: "Capability discovery did not complete; Vesper could not build a plan. No task was executed.", error: true });

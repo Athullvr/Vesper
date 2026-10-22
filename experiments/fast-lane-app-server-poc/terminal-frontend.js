@@ -157,6 +157,7 @@ class TerminalFrontend {
       task: prompt,
       capabilityProvider: this.capabilityProvider,
       routeDecision: decision,
+      projectContext: { cwd: this.cwd },
     });
 
     let routingDecision;

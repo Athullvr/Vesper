@@ -105,7 +105,36 @@ test("failed and cancelled MCP startup states are not recommended as available",
     assert.equal(evaluated.reasonCode, startupStatus === "failed" ? "capability_startup_failed" : "capability_startup_cancelled");
     assert.deepEqual(plan.recommendedCapabilityIds, []);
     assert.equal(plan.declinedCapabilities[0].reasonCode, evaluated.reasonCode);
+
+    const contradictory = mcp({
+      runtimeEvidence: { status: "observed", source: SOURCE, observedAt: new Date(NOW - 1_000).toISOString(), startupStatus },
+    });
+    const contradictoryResult = evaluateCapabilityState(contradictory, { catalog: catalog([contradictory]), now: NOW });
+    assert.equal(contradictoryResult.eligibility, "unavailable");
+    assert.equal(contradictoryResult.reasonCode, evaluated.reasonCode);
   }
+});
+
+test("in-progress startup and explicit disablement remain distinct from availability", () => {
+  const starting = mcp({
+    availabilityStatus: "unknown",
+    runtimeLoadedStatus: "unknown",
+    runtimeEvidence: { status: "observed", source: SOURCE, observedAt: new Date(NOW - 1_000).toISOString(), startupStatus: "starting" },
+  });
+  const startingResult = evaluateCapabilityState(starting, { catalog: catalog([starting]), now: NOW });
+  assert.equal(startingResult.eligibility, "uncertain");
+  assert.equal(startingResult.reasonCode, "runtime_startup_in_progress");
+
+  const disabled = mcp({
+    configurationStatus: "disabled",
+    enabledStatus: "no",
+    availabilityStatus: "unavailable",
+    runtimeLoadedStatus: "no",
+    runtimeEvidence: { status: "observed", source: SOURCE, observedAt: new Date(NOW - 1_000).toISOString(), startupStatus: "ready" },
+  });
+  const disabledResult = evaluateCapabilityState(disabled, { catalog: catalog([disabled]), now: NOW });
+  assert.equal(disabledResult.eligibility, "unavailable");
+  assert.equal(disabledResult.reasonCode, "capability_disabled");
 });
 
 test("stale runtime observations remain uncertain and report their original timestamp", () => {
@@ -189,11 +218,14 @@ test("matching uses supported command metadata, skips malformed entries, and all
 
 test("a deterministic local route remains local and does not attract capability suggestions", () => {
   const decision = classifyRequest("What Git branch am I on?");
-  const plan = createCapabilityPlan({ task: "What Git branch am I on?", catalog: catalog([mcp()]), routeDecision: decision, now: NOW });
+  const gitCapability = mcp({ id: "mcp:git-helper", name: "git-helper", displayName: "Git branch helper", description: "Check Git branch and repository status." });
+  const plan = createCapabilityPlan({ task: "What Git branch am I on?", catalog: catalog([gitCapability]), routeDecision: decision, now: NOW });
   assert.equal(decision.route, "local");
   assert.equal(plan.executionPath.kind, "local_handler");
-  assert.equal(plan.relevantCapabilities.length, 0);
+  assert.equal(plan.relevantCapabilities.length, 1);
+  assert.equal(plan.relevantCapabilities[0].eligibility, "usable");
   assert.deepEqual(plan.recommendedCapabilityIds, []);
+  assert.equal(plan.declinedCapabilities[0].reasonCode, "local_route_sufficient");
 });
 
 test("bounded routing metadata contains only categories, ids, states, and reason codes", async () => {
@@ -215,6 +247,23 @@ test("bounded routing metadata contains only categories, ids, states, and reason
   assert.equal(routed.fallbackResult.route, "codex");
   assert.deepEqual(routed.fallbackResult.planning, metadata);
   assert.doesNotMatch(JSON.stringify(routed.fallbackResult.planning), /sk-proj-1234567890abcdef/u);
+});
+
+test("secret-like capability metadata is neither matched on nor copied into plan metadata", () => {
+  const capability = mcp({
+    name: "postgres sk-proj-1234567890abcdef",
+    displayName: "PostgreSQL",
+    description: "password=local-only-secret database access",
+  });
+  const plan = createCapabilityPlan({
+    task: "Query the database using password=local-only-secret",
+    catalog: catalog([capability]),
+    routeDecision: { route: "codex", reason: "codex_fallback" },
+    now: NOW,
+  });
+  const serializedPlan = JSON.stringify(plan);
+  assert.doesNotMatch(serializedPlan, /sk-proj-1234567890abcdef|local-only-secret/u);
+  assert.doesNotMatch(JSON.stringify(plan.routingMetadata), /postgres sk-proj|password/u);
 });
 
 test("planning can refresh only passive runtime evidence while retaining the cached catalog", async () => {
