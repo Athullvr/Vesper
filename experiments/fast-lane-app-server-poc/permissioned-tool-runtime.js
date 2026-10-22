@@ -3,10 +3,11 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
-const { execFile, spawn } = require("node:child_process");
+const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { escapeTerminalOutput, redactSensitiveText } = require("./command-activity");
 const workspaceFiles = require("./tool-workspace-files");
+const { createLinuxCommandBackend } = require("./linux-command-backend");
 
 const execFileAsync = promisify(execFile);
 const MAX_FILE_BYTES = 1024 * 1024;
@@ -49,9 +50,10 @@ const TOOL_DEFINITIONS = Object.freeze([
     objectSchema({}), { timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT }),
   definition("git_diff", "Inspect a bounded, read-only Git diff for this project.", "project-git-read", false,
     objectSchema({ path: projectPathSchema() }), { timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT }),
-  definition("run_command", "Run one explicitly approved executable with an argv array and no shell.", "command-execution", true,
-    objectSchema({ argv: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1, maxLength: MAX_COMMAND_LENGTH }, "x-maxAggregateUtf8Bytes": MAX_COMMAND_LENGTH } }, ["argv"]), { enabledByDefault: false, shell: false, timeoutMs: MAX_COMMAND_TIMEOUT_MS,
-      maximumArgumentCharacters: MAX_COMMAND_LENGTH, maximumStdoutCharacters: MAX_TOOL_OUTPUT, maximumStderrCharacters: MAX_TOOL_OUTPUT }),
+  definition("run_command", "Run one explicitly approved argv inside a rootless Linux container with network disabled.", "command-execution", true,
+    objectSchema({ argv: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1, maxLength: MAX_COMMAND_LENGTH }, "x-maxAggregateUtf8Bytes": MAX_COMMAND_LENGTH },
+      workspaceAccess: { type: "string", enum: ["read-only", "read-write"] } }, ["argv"]), { enabledByDefault: false, shell: false, isolation: "rootless-podman-required",
+      timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumArgumentCharacters: MAX_COMMAND_LENGTH, maximumStdoutCharacters: MAX_TOOL_OUTPUT, maximumStderrCharacters: MAX_TOOL_OUTPUT }),
   definition("propose_file_change", "Create an in-memory, reviewable whole-file replacement proposal; never writes a file.", "file-change-proposal", false,
     objectSchema({ path: projectPathSchema(), content: { type: "string", maxLength: MAX_REVIEW_FIELD_LENGTH, "x-maxUtf8Bytes": MAX_REVIEW_FIELD_LENGTH } }, ["path", "content"]), { maximumOriginalBytes: MAX_REVIEW_FIELD_LENGTH,
       maximumProposedBytes: MAX_REVIEW_FIELD_LENGTH, proposalLifetime: "runtime instance" }),
@@ -66,6 +68,7 @@ class PermissionedToolRuntime {
     sessionId,
     approvalHandler,
     commandExecutionEnabled = false,
+    commandWorkspaceWriteEnabled = false,
     commandTimeoutMs = MAX_COMMAND_TIMEOUT_MS,
     auditSink,
     fileOperations = workspaceFiles,
@@ -74,7 +77,7 @@ class PermissionedToolRuntime {
     removeFile = fs.unlinkSync,
     syncDirectory = fs.fsyncSync,
     execFileImpl = execFileAsync,
-    spawnImpl = spawn,
+    commandBackend = createLinuxCommandBackend(),
     now = () => new Date(),
     createId = () => crypto.randomUUID(),
   } = {}) {
@@ -89,6 +92,7 @@ class PermissionedToolRuntime {
     this.sessionId = sessionId;
     this.approvalHandler = typeof approvalHandler === "function" ? approvalHandler : null;
     this.commandExecutionEnabled = commandExecutionEnabled === true;
+    this.commandWorkspaceWriteEnabled = commandWorkspaceWriteEnabled === true;
     this.commandTimeoutMs = Number.isInteger(commandTimeoutMs) && commandTimeoutMs > 0
       ? Math.min(MAX_COMMAND_TIMEOUT_MS, commandTimeoutMs) : MAX_COMMAND_TIMEOUT_MS;
     this.auditSink = typeof auditSink === "function" ? auditSink : null;
@@ -98,29 +102,40 @@ class PermissionedToolRuntime {
     this.removeFile = removeFile;
     this.syncDirectory = syncDirectory;
     this.execFileImpl = execFileImpl;
-    this.spawnImpl = spawnImpl;
-    this.killProcessGroup = spawnImpl === spawn && process.platform !== "win32";
+    this.commandBackend = commandBackend;
     this.now = now;
     this.createId = createId;
     this.busy = false;
     this.disposed = false;
+    this.interruptionRequested = false;
     this.audit = [];
     this.seenRequests = new Set();
     this.proposals = new Map();
     this.proposalStates = new Map();
-    this.children = new Set();
+    this.commandAbortController = null;
   }
 
   getDefinitions() {
     return TOOL_DEFINITIONS.map((entry) => ({
       ...entry,
       limits: { ...entry.limits },
-      enabled: entry.id !== "run_command" || this.commandExecutionEnabled,
+      enabled: entry.id !== "run_command" || this.commandExecutionEnabled && Boolean(this.approvalHandler),
     }));
   }
 
   getAuditEvents() {
     return this.audit.map((event) => ({ ...event }));
+  }
+
+  async getCommandExecutionStatus() {
+    const backend = await this.commandBackend.inspect();
+    const { policy, ...safeBackend } = backend;
+    return Object.freeze({ ...safeBackend,
+      enabled: this.commandExecutionEnabled && Boolean(this.approvalHandler) && backend.available,
+      hostEnabled: this.commandExecutionEnabled,
+      workspaceWritesEnabled: this.commandWorkspaceWriteEnabled && this.commandExecutionEnabled,
+      approvalHandlerAvailable: Boolean(this.approvalHandler),
+    });
   }
 
   async preview(request) {
@@ -134,7 +149,22 @@ class PermissionedToolRuntime {
       requiresApproval: entry.requiresApproval,
       enabled: normalized.toolId !== "run_command" || this.commandExecutionEnabled,
       summary: this.describeRequest(normalized),
+      ...(normalized.toolId === "run_command" ? { isolation: await this.previewCommandPolicy(normalized) } : {}),
     });
+  }
+
+  async previewCommandPolicy(request) {
+    if (!this.commandExecutionEnabled) return Object.freeze({ available: false, enabled: false,
+      reasonCode: "UNSUPPORTED_OPERATION", message: "Command execution is disabled in this Vesper runtime." });
+    if (request.input.workspaceAccess === "read-write" && !this.commandWorkspaceWriteEnabled) return Object.freeze({ available: false, enabled: false,
+      reasonCode: "UNSUPPORTED_OPERATION", message: "Writable sandbox workspaces are disabled by the host." });
+    try {
+      const plan = await this.prepareCommandPlan(request);
+      return Object.freeze({ available: true, enabled: Boolean(this.approvalHandler), policy: plan.display });
+    } catch (error) {
+      return Object.freeze({ available: false, enabled: false, reasonCode: stableErrorCode(error?.code || "ISOLATION_UNAVAILABLE"),
+        message: typeof error?.message === "string" ? redactSensitiveText(error.message).slice(0, 300) : "Isolation unavailable." });
+    }
   }
 
   async invoke(request) {
@@ -144,6 +174,7 @@ class PermissionedToolRuntime {
     let normalized;
     let approvalId = null;
     let state = "requested";
+    let commandPlan = null;
     try {
       normalized = this.validateRequest(request, { reserveRequestId: true });
       const entry = this.definitionFor(normalized.toolId);
@@ -153,27 +184,42 @@ class PermissionedToolRuntime {
       if (normalized.toolId === "run_command" && !this.commandExecutionEnabled) {
         return this.finishRejected(normalized, "UNSUPPORTED_OPERATION", "Command execution is disabled in this Vesper runtime.");
       }
+      if (normalized.toolId === "run_command") {
+        if (!this.approvalHandler) return this.finishRejected(normalized, "APPROVAL_REQUIRED", "Isolated command execution requires a one-time approval handler.");
+        if (normalized.input.workspaceAccess === "read-write" && !this.commandWorkspaceWriteEnabled) {
+          return this.finishRejected(normalized, "UNSUPPORTED_OPERATION", "Writable sandbox workspaces are disabled by the host.");
+        }
+        commandPlan = await this.prepareCommandPlan(normalized);
+      }
       if (entry.requiresApproval && normalized.toolId !== "apply_file_change") {
         approvalId = this.createId();
         if (!UUID_PATTERN.test(approvalId)) throw toolError("RUNTIME_ERROR", "Vesper could not create a safe approval identity.", false);
-        const snapshot = this.createApprovalSnapshot(normalized, approvalId);
+        const snapshot = this.createApprovalSnapshot(normalized, approvalId, commandPlan);
         ensureApprovalReviewFits(snapshot);
         state = "awaiting-approval";
         this.recordAudit(normalized.toolId, state, normalized.requestId, approvalId);
         if (!this.approvalHandler) return this.finishRejected(normalized, "APPROVAL_REQUIRED", "This operation requires a one-time approval handler.", approvalId);
         const decision = await this.approvalHandler(snapshot);
+        if (this.interruptionRequested && normalized.toolId === "run_command") throw toolError("COMMAND_INTERRUPTED", "The isolated command was cancelled before it started.", true);
         this.assertLive();
-        if (!this.isSnapshotCurrent(snapshot, normalized)) return this.finishRejected(normalized, "STALE_APPROVAL", "The reviewed operation changed before approval.", approvalId);
+        if (!this.isSnapshotCurrent(snapshot, normalized, commandPlan)) return this.finishRejected(normalized, "STALE_APPROVAL", "The reviewed operation changed before approval.", approvalId);
         if (decision !== "approve-once") {
           const declined = decision === "decline" || decision === "cancel" ? decision : "cancel";
           return this.finishRejected(normalized, declined === "decline" ? "APPROVAL_DECLINED" : "APPROVAL_CANCELLED",
             declined === "decline" ? "The operation was declined; nothing was executed." : "The operation was cancelled; nothing was executed.", approvalId);
         }
+        if (normalized.toolId === "run_command") {
+          const renewedPlan = await this.prepareCommandPlan(normalized);
+          if (!this.isSnapshotCurrent(snapshot, normalized, renewedPlan)) {
+            return this.finishRejected(normalized, "ISOLATION_POLICY_CHANGED", "The sandbox policy or reviewed command changed after approval. Nothing was run; review the operation again.", approvalId);
+          }
+          commandPlan = renewedPlan;
+        }
         state = "approved";
         this.recordAudit(normalized.toolId, state, normalized.requestId, approvalId);
       }
 
-      const result = await this.execute(normalized);
+      const result = await this.execute(normalized, commandPlan);
       if (result.approvalId) approvalId = result.approvalId;
       if (result.proposal) {
         state = "proposed";
@@ -208,12 +254,12 @@ class PermissionedToolRuntime {
       const toolError = normalizeToolError(error);
       const safeRequestId = normalized?.requestId || safeOwnString(request, "requestId", (value) => UUID_PATTERN.test(value));
       const safeToolId = normalized?.toolId || safeOwnString(request, "toolId", (value) => TOOL_IDS.includes(value));
+      const failureState = operationFailureState(toolError);
       if (safeToolId && safeRequestId) {
-        const failedState = toolError.rejected ? "rejected" : "failed";
-        this.recordAudit(safeToolId, failedState, safeRequestId, approvalId, toolError.code);
+        this.recordAudit(safeToolId, failureState, safeRequestId, approvalId, toolError.code);
       }
       return Object.freeze({ requestId: safeRequestId, toolId: safeToolId,
-        state: toolError.rejected ? "rejected" : "failed",
+        state: failureState,
         approved: Boolean(approvalId && this.audit.some((event) => event.requestId === safeRequestId && event.approvalId === approvalId && event.state === "approved")),
         ...(normalized?.toolId === "apply_file_change" && this.proposalStates.has(normalized.input.proposalId)
           ? { proposalState: this.proposalStates.get(normalized.input.proposalId) } : {}),
@@ -222,17 +268,18 @@ class PermissionedToolRuntime {
       });
     } finally {
       this.busy = false;
+      this.interruptionRequested = false;
     }
   }
 
-  async execute(request) {
+  async execute(request, commandPlan = null) {
     switch (request.toolId) {
       case "read_file": return this.readFile(request.input.path);
       case "list_files": return this.listFiles(request.input.path || ".");
       case "search_files": return this.searchFiles(request.input.query, request.input.path || ".");
       case "git_status": return this.gitRead(["status", "--short", "--branch", "--untracked-files=no"]);
       case "git_diff": return this.gitDiff(request.input.path);
-      case "run_command": return this.runCommand(request.input.argv);
+      case "run_command": return this.runCommand(request, commandPlan);
       case "propose_file_change": return this.proposeFileChange(request);
       case "apply_file_change": return this.applyFileChange(request);
       default: throw toolError("INVALID_TOOL", "The requested tool is not registered.", true);
@@ -425,11 +472,16 @@ class PermissionedToolRuntime {
     if (canonicalTop !== root.path) throw toolError("GIT_SCOPE_REJECTED", "The Git repository extends outside the selected project root.", true);
   }
 
-  async runCommand(argv) {
-    if (typeof process.getuid === "function" && process.getuid() === 0) {
-      throw toolError("UNSUPPORTED_OPERATION", "Command execution is unavailable when Vesper runs as root.", true);
-    }
-    const command = validateArgv(argv);
+  async prepareCommandPlan(request) {
+    const expectedRoot = this.openRoot();
+    expectedRoot.close();
+    return this.commandBackend.prepare({ workspaceRoot: this.projectRoot, argv: request.input.argv,
+      workspaceAccess: request.input.workspaceAccess || "read-only", timeoutMs: this.commandTimeoutMs });
+  }
+
+  async runCommand(request, plan) {
+    if (!plan) throw toolError("ISOLATION_UNAVAILABLE", "No approved OS-isolation policy is available for this command.", true);
+    const command = validateArgv(request.input.argv);
     let rootStat;
     try { rootStat = fs.statSync(this.projectRoot); } catch { throw toolError("INVALID_PROJECT", "The selected project root changed or disappeared.", true); }
     const expectedRoot = this.openRoot();
@@ -440,84 +492,25 @@ class PermissionedToolRuntime {
       }
     } finally { expectedRoot.close(); }
 
-    const environment = {};
-    if (typeof process.env.PATH === "string") environment.PATH = process.env.PATH;
-    if (typeof process.env.SystemRoot === "string") environment.SystemRoot = process.env.SystemRoot;
-    const result = await this.spawnCommand(command, environment);
-    const successfulExit = result.exitCode === 0 && result.signal === null;
-    return { value: result, verified: false, executed: true, truncated: result.truncated,
+    this.commandAbortController = new AbortController();
+    if (this.interruptionRequested) this.commandAbortController.abort();
+    let result;
+    try {
+      result = await this.commandBackend.run({ plan, argv: command, workspaceRoot: this.projectRoot,
+        workspaceAccess: request.input.workspaceAccess || "read-only", timeoutMs: this.commandTimeoutMs,
+        signal: this.commandAbortController.signal });
+    } finally { this.commandAbortController = null; }
+    const safeResult = Object.freeze({ ...result, stdout: redactSensitiveText(String(result.stdout || "")).slice(0, MAX_TOOL_OUTPUT),
+      stderr: redactSensitiveText(String(result.stderr || "")).slice(0, MAX_TOOL_OUTPUT) });
+    const successfulExit = safeResult.exitCode === 0 && safeResult.signal === null;
+    return { value: safeResult, verified: false, executed: true, truncated: safeResult.truncated,
       ...(successfulExit ? {} : { failure: { code: "COMMAND_FAILED",
-        message: result.exitCode === null
+        message: safeResult.exitCode === null
           ? "The approved command ended without a confirmed exit status."
-          : result.signal
-            ? `The approved command was terminated by ${result.signal}.`
-            : `The approved command exited with status ${result.exitCode}.` } }),
+          : safeResult.signal
+            ? `The approved command was terminated by ${safeResult.signal}.`
+            : `The approved command exited with status ${safeResult.exitCode}.` } }),
     };
-  }
-
-  spawnCommand(argv, environment) {
-    return new Promise((resolve, reject) => {
-      let child;
-      try {
-        child = this.spawnImpl(argv[0], argv.slice(1), {
-          cwd: this.projectRoot,
-          env: environment,
-          shell: false,
-          detached: process.platform !== "win32",
-          windowsHide: true,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-      } catch {
-        reject(toolError("COMMAND_FAILED", "The approved command could not be started.", false));
-        return;
-      }
-      this.children.add(child);
-      let stdout = Buffer.alloc(0);
-      let stderr = Buffer.alloc(0);
-      let truncated = false;
-      let settled = false;
-      let timedOut = false;
-      let outputExceeded = false;
-      const append = (target, chunk) => {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-        const remaining = Math.max(0, MAX_TOOL_OUTPUT - target.length);
-        if (buffer.length > remaining) { truncated = true; outputExceeded = true; }
-        if (remaining) target = Buffer.concat([target, buffer.subarray(0, remaining)]);
-        return target;
-      };
-      child.stdout?.on("data", (chunk) => { stdout = append(stdout, chunk); if (outputExceeded) terminateChild(child, this.killProcessGroup); });
-      child.stderr?.on("data", (chunk) => { stderr = append(stderr, chunk); if (outputExceeded) terminateChild(child, this.killProcessGroup); });
-      const timer = setTimeout(() => { timedOut = true; terminateChild(child, this.killProcessGroup); }, this.commandTimeoutMs);
-      timer.unref?.();
-      const finish = (error, code, signal) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        this.children.delete(child);
-        if (error && !timedOut && !outputExceeded) {
-          reject(toolError("COMMAND_FAILED", "The approved command failed to start or could not be observed safely.", false));
-          return;
-        }
-        if (timedOut) {
-          const timeout = toolError("COMMAND_TIMEOUT", `The approved command exceeded its ${this.commandTimeoutMs} ms limit and was terminated.`, false);
-          timeout.executed = true;
-          reject(timeout);
-          return;
-        }
-        if (outputExceeded) {
-          const limited = toolError("OUTPUT_LIMIT", "The approved command exceeded its captured output limit and was terminated.", false);
-          limited.executed = true;
-          reject(limited);
-          return;
-        }
-        const stdoutText = redactSensitiveText(stdout.toString("utf8"));
-        const stderrText = redactSensitiveText(stderr.toString("utf8"));
-        resolve(Object.freeze({ argv: Object.freeze([...argv]), exitCode: Number.isInteger(code) ? code : null,
-          signal: typeof signal === "string" ? signal : null, stdout: stdoutText, stderr: stderrText, truncated }));
-      };
-      child.once("error", (error) => finish(error, null, null));
-      child.once("close", (code, signal) => finish(null, code, signal));
-    });
   }
 
   proposeFileChange(request) {
@@ -717,30 +710,34 @@ class PermissionedToolRuntime {
       sessionId: this.sessionId, projectFingerprint: this.projectFingerprint() }));
   }
 
-  createApprovalSnapshot(request, approvalId) {
-    const operation = this.describeRequest(request);
+  createApprovalSnapshot(request, approvalId, commandPlan = null) {
+    const operation = this.describeRequest(request, commandPlan);
     if (redactSensitiveText(stableStringify(operation)) !== stableStringify(operation)) {
       throw toolError("SENSITIVE_REVIEW_CONTENT", "The operation contains secret-like text that Vesper cannot safely display for approval.", true);
     }
+    const policyBinding = request.toolId === "run_command" ? commandPlan?.binding || null : null;
     const digest = sha256(stableStringify({ requestId: request.requestId, toolId: request.toolId,
-      input: request.input, sessionId: this.sessionId, projectFingerprint: this.projectFingerprint() }));
+      input: request.input, sessionId: this.sessionId, projectFingerprint: this.projectFingerprint(), policyBinding }));
     return deepFreeze({ approvalId, requestId: request.requestId, toolId: request.toolId,
       projectRoot: this.projectRoot, projectFingerprint: this.projectFingerprint(), sessionId: this.sessionId,
-      requestDigest: digest, operation });
+      requestDigest: digest, policyBinding, operation });
   }
 
-  isSnapshotCurrent(snapshot, request) {
+  isSnapshotCurrent(snapshot, request, commandPlan = null) {
     if (!snapshot || snapshot.toolId !== request.toolId || snapshot.requestId !== request.requestId ||
         snapshot.sessionId !== this.sessionId || snapshot.projectFingerprint !== this.projectFingerprint()) return false;
+    const policyBinding = request.toolId === "run_command" ? commandPlan?.binding || null : null;
+    if (snapshot.policyBinding !== policyBinding) return false;
     const expected = sha256(stableStringify({ requestId: request.requestId, toolId: request.toolId,
-      input: request.input, sessionId: this.sessionId, projectFingerprint: this.projectFingerprint() }));
+      input: request.input, sessionId: this.sessionId, projectFingerprint: this.projectFingerprint(), policyBinding }));
     return expected === snapshot.requestDigest;
   }
 
-  describeRequest(request) {
+  describeRequest(request, commandPlan = null) {
     switch (request.toolId) {
       case "run_command": return Object.freeze({ executable: request.input.argv[0], argv: Object.freeze([...request.input.argv]),
-        cwd: this.projectRoot, shell: false, timeoutMs: this.commandTimeoutMs });
+        cwd: this.projectRoot, shell: false, workspaceAccess: request.input.workspaceAccess || "read-only",
+        timeoutMs: this.commandTimeoutMs, ...(commandPlan ? { isolation: commandPlan.display, policyBinding: commandPlan.binding } : {}) });
       case "apply_file_change": return Object.freeze({ proposalId: request.input.proposalId });
       default: return Object.freeze({ ...request.input });
     }
@@ -824,16 +821,24 @@ class PermissionedToolRuntime {
   assertLive() { if (this.disposed) throw toolError("RUNTIME_DISPOSED", "This tool runtime has been disposed.", true); }
 
   dispose() {
-    if (this.disposed) return;
+    if (this.disposed) return Promise.resolve();
     this.disposed = true;
-    for (const child of this.children) terminateChild(child, this.killProcessGroup);
-    this.children.clear();
+    this.commandAbortController?.abort();
     this.proposals.clear();
     this.proposalStates.clear();
+    return Promise.resolve(this.commandBackend?.dispose?.()).catch(() => {});
+  }
+
+  interrupt() {
+    if (!this.busy) return false;
+    this.interruptionRequested = true;
+    this.commandAbortController?.abort();
+    return true;
   }
 }
 
-const AUDIT_STATES = new Set(["requested", "validated", "awaiting-approval", "approved", "executed", "verified", "proposed", "rejected", "failed"]);
+const AUDIT_STATES = new Set(["requested", "validated", "awaiting-approval", "approved", "executed", "verified", "proposed", "rejected", "failed",
+  "timed-out", "interrupted", "isolation-unavailable", "uncertain"]);
 
 function createPermissionedToolRuntime(options) {
   const runtime = new PermissionedToolRuntime(options);
@@ -841,8 +846,10 @@ function createPermissionedToolRuntime(options) {
     sessionId: runtime.sessionId,
     getDefinitions: () => runtime.getDefinitions(),
     getAuditEvents: () => runtime.getAuditEvents(),
+    getCommandExecutionStatus: () => runtime.getCommandExecutionStatus(),
     preview: (request) => runtime.preview(request),
     invoke: (request) => runtime.invoke(request),
+    interrupt: () => runtime.interrupt(),
     dispose: () => runtime.dispose(),
   });
 }
@@ -870,8 +877,19 @@ function renderToolApproval(snapshot) {
     `Session: ${safeReviewText(snapshot.sessionId)}`, `Project: ${safeReviewText(snapshot.projectRoot)}`];
   if (snapshot.toolId === "run_command") {
     const displayArgv = Array.isArray(operation.argv) ? operation.argv.map((argument) => safeReviewText(argument)) : [];
-    lines.push(`Working directory: ${safeReviewText(operation.cwd)}`, `Shell: disabled`, `Timeout: ${operation.timeoutMs} ms`,
+    lines.push(`Working directory: ${safeReviewText(operation.cwd)}`, `Workspace mount: ${safeReviewText(operation.workspaceAccess || "read-only")}`,
+      `Shell parsing: disabled; executable and argv are explicit`, `Timeout: ${operation.timeoutMs} ms`,
       `Command argv (escaped for display): ${JSON.stringify(displayArgv)}`);
+    const isolation = operation.isolation;
+    if (isolation) {
+      lines.push(`Isolation backend: ${safeReviewText(isolation.backend)}`, `Local image id: ${safeReviewText(isolation.imageId)}`,
+        `Network: ${safeReviewText(isolation.network)}`, `Root filesystem read-only: ${isolation.readOnlyRootFilesystem ? "yes" : "no"}`,
+        `Seccomp: ${safeReviewText(isolation.seccomp)}`, `No new privileges: ${isolation.noNewPrivileges ? "yes" : "no"}`,
+        `Capabilities: ${safeReviewText(isolation.capabilities)}`, `Private namespaces: ${safeReviewText(isolation.privateNamespaces)}`,
+        `Host sockets: ${safeReviewText(isolation.hostSockets)}`, `Host /proc: ${safeReviewText(isolation.hostProc)}`,
+        `CPU limit: ${isolation.cpuCount}`, `Memory limit: ${isolation.memoryMiB} MiB`,
+        `Process limit: ${isolation.processLimit}`, `Output limit: ${isolation.outputLimitBytesPerStream} bytes per stream`);
+    }
   } else if (snapshot.toolId === "apply_file_change") {
     lines.push(`Proposal: ${safeReviewText(operation.proposalId)}`, `Target: ${safeReviewText(operation.path)}`,
       `Original exists: ${operation.originalExists}`, `Original SHA-256: ${operation.originalHash || "(new file)"}`,
@@ -896,9 +914,9 @@ function ensureApprovalReviewFits(snapshot) {
 
 function validateInput(toolId, input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw toolError("INVALID_ARGUMENT", "Tool input must be a JSON object.", true);
-  const exactKeys = (expected) => {
+  const exactKeys = (expected, optional = ["path"]) => {
     if (Object.keys(input).some((key) => !expected.includes(key))) throw toolError("INVALID_ARGUMENT", "Tool input contains unsupported fields.", true);
-    if (expected.some((key) => !Object.hasOwn(input, key) && !["path"].includes(key))) throw toolError("INVALID_ARGUMENT", "Tool input is missing a required field.", true);
+    if (expected.some((key) => !Object.hasOwn(input, key) && !optional.includes(key))) throw toolError("INVALID_ARGUMENT", "Tool input is missing a required field.", true);
   };
   switch (toolId) {
     case "read_file": exactKeys(["path"]); return { path: validPathValue(input.path, false) };
@@ -909,7 +927,12 @@ function validateInput(toolId, input) {
       return { query: input.query, ...(input.path === undefined ? {} : { path: validPathValue(input.path, true) }) };
     case "git_status": exactKeys([]); return {};
     case "git_diff": exactKeys(["path"]); return input.path === undefined ? {} : { path: validPathValue(input.path, false) };
-    case "run_command": exactKeys(["argv"]); return { argv: validateArgv(input.argv) };
+    case "run_command":
+      exactKeys(["argv", "workspaceAccess"], ["workspaceAccess"]);
+      if (input.workspaceAccess !== undefined && !["read-only", "read-write"].includes(input.workspaceAccess)) {
+        throw toolError("INVALID_ARGUMENT", "workspaceAccess must be read-only or read-write.", true);
+      }
+      return { argv: validateArgv(input.argv), ...(input.workspaceAccess === undefined ? {} : { workspaceAccess: input.workspaceAccess }) };
     case "propose_file_change":
       exactKeys(["path", "content"]);
       if (typeof input.content !== "string") throw toolError("INVALID_ARGUMENT", "propose_file_change content must be a string.", true);
@@ -1055,26 +1078,6 @@ function boundedBuffer(buffer, maximum) {
   return { buffer: buffer.subarray(0, maximum), truncated: buffer.length > maximum };
 }
 
-function terminateChild(child, killProcessGroup = false) {
-  if (!child || !child.pid) return;
-  try {
-    if (killProcessGroup) process.kill(-child.pid, "SIGTERM");
-    else child.kill("SIGTERM");
-  } catch {
-    try { child.kill("SIGTERM"); } catch { /* The process may have already exited. */ }
-  }
-  const timer = setTimeout(() => {
-    try {
-      if (killProcessGroup) process.kill(-child.pid, "SIGKILL");
-      else child.kill("SIGKILL");
-    } catch {
-      try { child.kill("SIGKILL"); } catch { /* The process may have already exited. */ }
-    }
-  }, 250);
-  timer.unref?.();
-  child.once?.("close", () => clearTimeout(timer));
-}
-
 function toolError(code, message, rejected = false) {
   const error = new Error(message);
   error.code = code;
@@ -1089,7 +1092,11 @@ function normalizeToolError(error) {
     "TIMEOUT", "COMMAND_TIMEOUT", "COMMAND_FAILED", "GIT_FAILED", "APPROVAL_REQUIRED", "APPROVAL_DECLINED",
     "APPROVAL_CANCELLED", "STALE_APPROVAL", "STALE_PROPOSAL", "PROPOSAL_NOT_FOUND", "WRITE_VERIFICATION_FAILED",
     "DUPLICATE_REQUEST", "BUSY", "INVALID_PROJECT", "UNSUPPORTED_OPERATION", "UNSUPPORTED_PLATFORM",
-    "SENSITIVE_REVIEW_CONTENT", "GIT_SCOPE_REJECTED", "STALE_FILE", "UNSUPPORTED_FILE_METADATA", "APPROVAL_REVIEW_TOO_LARGE", "RUNTIME_ERROR", "RUNTIME_DISPOSED"]);
+    "SENSITIVE_REVIEW_CONTENT", "GIT_SCOPE_REJECTED", "STALE_FILE", "UNSUPPORTED_FILE_METADATA", "APPROVAL_REVIEW_TOO_LARGE", "RUNTIME_ERROR", "RUNTIME_DISPOSED",
+    "ISOLATION_UNAVAILABLE", "ISOLATION_RUNTIME_MISSING", "ISOLATION_RUNTIME_UNAVAILABLE", "ISOLATION_RUNTIME_TIMEOUT", "ISOLATION_REQUIREMENTS_UNAVAILABLE",
+    "ISOLATION_IMAGE_UNCONFIGURED", "ISOLATION_IMAGE_INVALID", "ISOLATION_IMAGE_UNAVAILABLE", "ISOLATION_IMAGE_UNVERIFIABLE", "ISOLATION_IMAGE_UNSUPPORTED",
+    "ISOLATION_STATUS_UNVERIFIABLE", "ISOLATION_POLICY_CHANGED", "ISOLATION_VERIFY_FAILED", "COMMAND_OUTCOME_UNCERTAIN", "COMMAND_INTERRUPTED",
+    "SANDBOX_CLEANUP_FAILED", "BACKEND_DISPOSED"]);
   const code = known.has(error?.code) ? error.code : "TOOL_FAILED";
   const messages = {
     NOT_FOUND: "The requested project resource was not found.",
@@ -1098,7 +1105,15 @@ function normalizeToolError(error) {
   };
   return { code, message: messages[code] || (typeof error?.message === "string" ? redactSensitiveText(error.message).slice(0, 500) : "Tool operation failed."),
     retryable: Boolean(error?.retryable), executed: error?.executed === true,
-    rejected: Boolean(error?.rejected) || ["INVALID_REQUEST", "INVALID_TOOL", "INVALID_ARGUMENT", "INVALID_PATH", "CONTEXT_MISMATCH", "INPUT_TOO_LARGE", "PATH_REJECTED", "APPROVAL_REQUIRED", "APPROVAL_DECLINED", "APPROVAL_CANCELLED", "STALE_APPROVAL", "STALE_PROPOSAL", "DUPLICATE_REQUEST", "PROPOSAL_NOT_FOUND", "SENSITIVE_REVIEW_CONTENT", "GIT_SCOPE_REJECTED", "STALE_FILE", "UNSUPPORTED_FILE_METADATA", "APPROVAL_REVIEW_TOO_LARGE", "UNSUPPORTED_PLATFORM", "RUNTIME_DISPOSED"].includes(code) };
+    rejected: Boolean(error?.rejected) || ["INVALID_REQUEST", "INVALID_TOOL", "INVALID_ARGUMENT", "INVALID_PATH", "CONTEXT_MISMATCH", "INPUT_TOO_LARGE", "PATH_REJECTED", "APPROVAL_REQUIRED", "APPROVAL_DECLINED", "APPROVAL_CANCELLED", "STALE_APPROVAL", "STALE_PROPOSAL", "DUPLICATE_REQUEST", "PROPOSAL_NOT_FOUND", "SENSITIVE_REVIEW_CONTENT", "GIT_SCOPE_REJECTED", "STALE_FILE", "UNSUPPORTED_FILE_METADATA", "APPROVAL_REVIEW_TOO_LARGE", "UNSUPPORTED_PLATFORM", "RUNTIME_DISPOSED", "ISOLATION_UNAVAILABLE", "ISOLATION_RUNTIME_MISSING", "ISOLATION_REQUIREMENTS_UNAVAILABLE", "ISOLATION_IMAGE_UNCONFIGURED", "ISOLATION_IMAGE_INVALID", "ISOLATION_IMAGE_UNAVAILABLE", "ISOLATION_IMAGE_UNVERIFIABLE", "ISOLATION_IMAGE_UNSUPPORTED", "ISOLATION_STATUS_UNVERIFIABLE", "ISOLATION_POLICY_CHANGED", "ISOLATION_VERIFY_FAILED", "BACKEND_DISPOSED"].includes(code) };
+}
+
+function operationFailureState(error) {
+  if (error.code === "COMMAND_TIMEOUT") return "timed-out";
+  if (error.code === "COMMAND_INTERRUPTED") return "interrupted";
+  if (["COMMAND_OUTCOME_UNCERTAIN", "SANDBOX_CLEANUP_FAILED"].includes(error.code)) return "uncertain";
+  if (error.code.startsWith("ISOLATION_") && error.code !== "ISOLATION_POLICY_CHANGED") return "isolation-unavailable";
+  return error.rejected ? "rejected" : "failed";
 }
 
 function validUuidOrNull(value) { return typeof value === "string" && UUID_PATTERN.test(value) ? value : null; }

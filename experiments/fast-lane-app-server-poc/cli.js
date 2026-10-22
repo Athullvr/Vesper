@@ -58,6 +58,7 @@ Usage:
   vesper capabilities enable|disable <ID> [PROJECT_DIRECTORY]
   vesper plan <TASK> [--project PROJECT_DIRECTORY]
   vesper tools [list]
+  vesper tools status
   vesper tools preview <TOOL_ID> '<JSON>' [--project PROJECT_DIRECTORY]
   vesper tools run <TOOL_ID> '<JSON>' [--project PROJECT_DIRECTORY] [--apply]
   vesper --help
@@ -71,8 +72,10 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
 The tools command inspects or manually invokes the permissioned Vesper tool runtime. It never reads
-provider output as a tool request. Shell execution is disabled by default; tool file changes are
-proposed first and require a separate one-time approval before application.
+provider output as a tool request. Command execution is disabled by default; when enabled by the host,
+it requires rootless Podman, a local image, fresh approval, and verified container restrictions.
+Vesper never falls back to host execution. Tool file changes are proposed first and require a separate
+one-time approval before application.
 
 Codex remains the default provider. OpenAI Chat Completions sends task text and its locally stored
 conversation only; it does not read project files, run commands, apply code, or verify changes.
@@ -120,13 +123,17 @@ const TOOLS_USAGE = `Vesper permissioned tool runtime
 
 Usage:
   vesper tools [list]
+  vesper tools status
   vesper tools preview TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY]
   vesper tools run TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY] [--apply]
 
 Preview validates a request without executing it. Manual run executes only the named registered tool.
 The request JSON must match that tool's schema. Paths are project-relative. File changes are
 proposals first; --apply requests one fresh approval and applies the proposal in this process only.
-Command execution is disabled by default. No provider output is interpreted as a tool call.
+Command execution is disabled by default. When enabled by the host, run_command requires a local
+rootless Podman image and verified isolation controls. Configure it with VESPER_SANDBOX_IMAGE and
+VESPER_ENABLE_ISOLATED_COMMANDS=1. Writable mounts also require VESPER_ENABLE_SANDBOX_WRITES=1.
+No provider output is interpreted as a tool call.
 `;
 
 function parseArgs(argv) {
@@ -150,6 +157,10 @@ function parseToolsArgs(args) {
   if (args[0] === "list") {
     if (args.length !== 1) throw new Error("Usage: vesper tools [list].");
     return { command: "tools", action: "list", help: false };
+  }
+  if (args[0] === "status") {
+    if (args.length !== 1) throw new Error("Usage: vesper tools status.");
+    return { command: "tools", action: "status", help: false };
   }
   const action = args[0];
   if (!(["preview", "run"].includes(action))) throw new Error("Usage: vesper tools [list] | tools preview|run TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY] [--apply].");
@@ -543,13 +554,18 @@ async function runTools(options, dependencies, output, errorOutput) {
     } catch (error) {
       errorOutput.write(`[Vesper tools error] ${safeTerminalText(error?.message || error)}\n`);
       return 1;
-    } finally { runtime?.dispose?.(); }
+    } finally { await runtime?.dispose?.(); }
   }
 
   let runtime;
   try {
     const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
     runtime = await makeToolRuntime(cwd, { ...dependencies, output });
+    if (options.action === "status") {
+      const status = await runtime.getCommandExecutionStatus();
+      output.write(renderCommandExecutionStatus(status));
+      return status.available ? 0 : 1;
+    }
     const context = Object.freeze({ projectRoot: cwd, sessionId: runtime.sessionId || crypto.randomUUID() });
     const request = Object.freeze({ toolId: options.toolId, input: options.input, context, requestId: crypto.randomUUID() });
     if (options.action === "preview") {
@@ -558,9 +574,13 @@ async function runTools(options, dependencies, output, errorOutput) {
       return 0;
     }
 
-    const result = await runtime.invoke(request);
+    const interruptHandler = options.toolId === "run_command" ? () => runtime.interrupt() : null;
+    if (interruptHandler) process.on("SIGINT", interruptHandler);
+    let result;
+    try { result = await runtime.invoke(request); }
+    finally { if (interruptHandler) process.removeListener("SIGINT", interruptHandler); }
     output.write(`Tool operation · ${renderToolState(result)}\n${renderBoundedToolJson(result)}\n`);
-    if (result.state === "rejected" || result.state === "failed") return 1;
+    if (["rejected", "failed", "timed-out", "interrupted", "isolation-unavailable", "uncertain"].includes(result.state)) return 1;
 
     if (options.apply && result.state === "proposed") {
       const applyRequest = Object.freeze({
@@ -577,14 +597,16 @@ async function runTools(options, dependencies, output, errorOutput) {
   } catch (error) {
     errorOutput.write(`[Vesper tools error] ${safeTerminalText(error?.message || error)}\n`);
     return 1;
-  } finally { runtime?.dispose?.(); }
+  } finally { await runtime?.dispose?.(); }
 }
 
 async function makeToolRuntime(projectRoot, dependencies) {
   const runtimeOptions = {
     projectRoot,
     sessionId: dependencies.toolSessionId || crypto.randomUUID(),
-    commandExecutionEnabled: dependencies.commandExecutionEnabled === true,
+    commandExecutionEnabled: dependencies.commandExecutionEnabled === true || process.env.VESPER_ENABLE_ISOLATED_COMMANDS === "1",
+    commandWorkspaceWriteEnabled: dependencies.commandWorkspaceWriteEnabled === true || process.env.VESPER_ENABLE_SANDBOX_WRITES === "1",
+    ...(dependencies.commandBackend ? { commandBackend: dependencies.commandBackend } : {}),
     auditSink: dependencies.toolAuditSink,
     approvalHandler: async (snapshot) => {
       outputForApproval(dependencies.toolOutput || dependencies.output || process.stdout, snapshot);
@@ -606,9 +628,29 @@ function renderToolState(result) {
   if (result.approved) states.push("approved");
   if (result.executed) states.push("executed");
   if (result.verified) states.push("verified");
-  if (["failed", "rejected"].includes(result.state)) states.push(result.state);
+  if (["failed", "rejected", "timed-out", "interrupted", "isolation-unavailable", "uncertain"].includes(result.state)) states.push(result.state);
   if (!states.length) states.push(result.state);
   return states.map(safeTerminalText).join(" · ");
+}
+
+function renderCommandExecutionStatus(status) {
+  const yesNoUnknown = (value) => value === true ? "yes" : value === false ? "no" : "unknown";
+  const lines = ["Vesper isolated command execution status", `Backend: ${safeTerminalText(status.backend)}`,
+    `Linux host: ${status.platform === "linux" ? "yes" : "no"}`, `Podman installed: ${yesNoUnknown(status.installed)}`,
+    `Rootless runtime: ${status.rootless === true ? "yes" : status.rootless === false ? "no" : "unknown"}`,
+    `Image configured: ${yesNoUnknown(status.configured)}`, `Image present locally: ${yesNoUnknown(status.imagePresent)}`,
+    `Image id: ${safeTerminalText(status.imageId || "unknown")}`,
+    `Isolation prerequisites: ${yesNoUnknown(status.available)}`, `Command execution enabled by host: ${yesNoUnknown(status.hostEnabled)}`,
+    `Isolated command execution enabled: ${yesNoUnknown(status.enabled)}`,
+    `Writable workspace enabled by host: ${yesNoUnknown(status.workspaceWritesEnabled)}`,
+    `Reason: ${safeTerminalText(status.message || "No status message available.")}`, "Restrictions:"];
+  for (const [name, value] of Object.entries(status.restrictions || {})) lines.push(`  ${safeTerminalText(name)}: ${safeTerminalText(value)}`);
+  if (status.unsupported?.length) {
+    lines.push("Unsupported or unverified:");
+    for (const item of status.unsupported.slice(0, 12)) lines.push(`  - ${safeTerminalText(item)}`);
+  }
+  lines.push("This diagnostic does not start a container or run a command.", "");
+  return `${lines.join("\n")}\n`;
 }
 
 async function requestToolApproval(snapshot, dependencies) {
@@ -620,7 +662,7 @@ async function requestToolApproval(snapshot, dependencies) {
   }
   const terminal = readline.createInterface({ input, output });
   try {
-    const answer = (await terminal.question('Type "approve-once", "decline", or "cancel": ')).trim();
+    const answer = (await terminal.question('Type "approve-once", "decline", or "cancel": ').catch(() => "cancel")).trim();
     return answer === "approve-once" || answer === "decline" || answer === "cancel" ? answer : "cancel";
   } finally { terminal.close(); }
 }

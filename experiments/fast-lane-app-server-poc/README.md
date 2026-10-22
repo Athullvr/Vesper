@@ -269,9 +269,46 @@ The initial tools are `read_file`, `list_files`, `search_files`, `git_status`, `
 
 `propose_file_change` is a whole-file UTF-8 replacement proposal, not a patch engine. The existing file and proposed content must each fit in an 8 KiB review field, and the complete review must fit 20 KiB. `.git` and `.vesper` metadata paths are excluded. Existing files must be owned by the Vesper user and have the group the replacement would inherit. Applying a proposal requires a fresh `approve-once`, binds the approval to the proposal, session, project, original snapshot, and proposed content, then rechecks the target immediately before the atomic operation and verifies the resulting bytes. A concurrent change observed during revalidation invalidates the proposal. New files use atomic create-if-absent; existing files use an atomic same-directory replacement. Node does not expose a compare-and-swap rename, so a narrow race remains between the final existing-file check and replacement; a later native filesystem adapter should close that window. Replacement preserves basic mode and owner/group eligibility, but extended ACLs and xattrs are not preserved. Proposals and approvals do not survive runtime disposal. Secret-like text that the existing redactor would hide is refused for protected-operation approval so a reviewer is not asked to approve a partially hidden command or file.
 
-Shell execution is disabled by default. The API can expose it only when its host explicitly constructs the runtime with `commandExecutionEnabled: true` and an approval callback. It accepts an argv array and calls an executable with `shell: false`; every invocation still requires a fresh approval. It refuses to run as root, uses a five-second timeout, terminates the process group, limits stdout and stderr to 16 KiB each, and passes a minimal environment. This is an approval gate, not an OS sandbox: an approved executable can still access resources available to the Vesper user, including paths outside the project. Do not enable it for model-originated requests until a separate OS-level isolation policy exists. There is no CLI option that enables shell execution.
+`run_command` is disabled by default. When the host enables it, Vesper requires a one-time approval and uses a Linux rootless Podman backend; there is no host-process fallback. Before prompting, Vesper verifies the local Podman runtime, rootless status, seccomp support, cgroup v2 CPU/memory/process controllers, and a locally available Linux image matching the host architecture. Vesper never installs Podman, builds or pulls an image, or changes host configuration.
 
-Audit records retain at most 50 structured state events with tool ID, Vesper session ID, a hashed project identity, request/approval references, state, timestamp, result status, and stable error code. They omit request arguments, file content, task prompts, command output, environment values, and credentials. Read/search/Git results apply the existing sensitive-text redactor. Tool results distinguish `validated`, `proposed`, `awaiting-approval`, `approved`, `executed`, `verified`, `rejected`, and `failed`; approval is never reported as successful execution. The runtime does not execute downloaded code, invoke MCP tools, generate or apply patches automatically, or change provider behavior.
+Check the backend without creating a container:
+
+```sh
+vesper tools status
+```
+
+To enable commands for one invocation, configure a trusted image that is already present in the local rootless Podman store, then set the opt-in variables:
+
+```sh
+VESPER_ENABLE_ISOLATED_COMMANDS=1 \
+VESPER_SANDBOX_IMAGE=localhost/vesper-toolbox:latest \
+vesper tools status
+
+VESPER_ENABLE_ISOLATED_COMMANDS=1 \
+VESPER_SANDBOX_IMAGE=localhost/vesper-toolbox:latest \
+vesper tools preview run_command '{"argv":["git","status","--short"]}'
+
+VESPER_ENABLE_ISOLATED_COMMANDS=1 \
+VESPER_SANDBOX_IMAGE=localhost/vesper-toolbox:latest \
+vesper tools run run_command '{"argv":["git","status","--short"]}'
+```
+
+The preview only checks and displays the planned isolation policy. `tools run` asks for a fresh interactive approval of the exact argv, project mount, image id, network policy, and limits. The sandbox receives only the selected project at `/workspace`, mounted read-only by default. Vesper rejects workspace roots that are the user's home (or contain it), inside protected host system/runtime trees, or contain nested mount points. For an operation that needs to modify the project, both the request and a separate host opt-in are required:
+
+```sh
+VESPER_ENABLE_ISOLATED_COMMANDS=1 \
+VESPER_ENABLE_SANDBOX_WRITES=1 \
+VESPER_SANDBOX_IMAGE=localhost/vesper-toolbox:latest \
+vesper tools run run_command '{"argv":["npm","test"],"workspaceAccess":"read-write"}'
+```
+
+An approved writable mount can alter or delete project files and is separate from `propose_file_change`/`apply_file_change`. Network access remains disabled; there is no network opt-in in this phase. Vesper passes an explicit argv to Podman without wrapping it in a host shell; if the reviewed argv explicitly names a shell executable, that program can interpret its arguments inside the sandbox. The container has a read-only root, a 64 MiB `/tmp`, an 8 MiB shared-memory limit, 1 CPU, 512 MiB memory, 64 processes, a five-second maximum, and 16 KiB captured output per stream. Vesper passes a fixed `PATH`, `HOME`, and `TMPDIR` into the container, clears image/default environment values, disables proxy forwarding, drops all Linux capabilities, requests no-new-privileges and private namespaces, ignores image-declared volumes, and uses an empty hooks directory. Vesper adds no mount for the host home, SSH files, cloud credentials, runtime sockets, or host `/proc`. The selected project tree is visible to the command, so keep host credentials and service sockets outside that tree. A nested mount inside the selected project causes refusal.
+
+Before starting the command, Vesper inspects the created-but-unstarted container and checks the effective image, argv, user, workspace mount, network mode, read-only root, capability drop, security options, namespace modes, environment, and resource limits. It removes the container after completion and attempts to kill and remove it on timeout, interruption, output overflow, or disposal. A failed setup or unverifiable setting is reported unavailable; Vesper does not weaken the policy or launch the argv on the host. `vesper tools status` reports local prerequisites; `vesper tools` only lists registered tools and does not probe Podman or start a container.
+
+These controls rely on the host's rootless Podman and Linux kernel. They are container isolation, not a virtual machine: a container escape can still attack the shared host kernel, and the selected image is trusted executable code. The backend fails closed if the installed runtime does not report cgroup v2 controllers or expose the expected container inspect fields. CPU/memory/process and temporary-storage settings are verified against the created container configuration; this does not independently measure kernel enforcement or eliminate host-wide resource exhaustion. The current development environment has no Podman executable, so live container execution and runtime enforcement are unavailable for validation here until an operator installs/configures rootless Podman and supplies a suitable local image.
+
+Audit records retain at most 50 structured state events with tool ID, Vesper session ID, a hashed project identity, request/approval references, state, timestamp, result status, and stable error code. They omit request arguments, file content, task prompts, command output, environment values, and credentials. Read/search/Git results apply the existing sensitive-text redactor. Tool results distinguish `validated`, `proposed`, `awaiting-approval`, `approved`, `executed`, `verified`, `rejected`, `failed`, `timed-out`, `interrupted`, `uncertain`, and `isolation-unavailable`; approval is never reported as successful execution. The runtime does not execute downloaded code, invoke MCP tools, generate or apply patches automatically, or change provider behavior.
 
 ## VS Code extension
 

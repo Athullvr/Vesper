@@ -3,11 +3,9 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
-const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { PassThrough } = require("node:stream");
 const { parseArgs, runVesper } = require("../cli");
 const { createPermissionedToolRuntime, listToolDefinitions, renderToolApproval } = require("../permissioned-tool-runtime");
 const { OPENAI_CAPABILITIES } = require("../openai-chat-completions-provider");
@@ -371,13 +369,12 @@ test("shell execution is disabled by default and approved argv execution is boun
 });
 
 test("only one tool request can remain active across an approval wait", async (t) => {
-  if (process.platform === "win32" || process.getuid?.() === 0) return t.skip("Command execution is disabled on Windows and under root.");
   const { root } = fixture(t);
   let releaseApproval;
   const { runtime, sessionId } = makeRuntime(root, {
     commandExecutionEnabled: true,
     approvalHandler: () => new Promise((resolve) => { releaseApproval = resolve; }),
-    spawnImpl: createMockSpawn({ stdout: "should-not-run" }),
+    commandBackend: createMockCommandBackend(),
   });
   t.after(() => runtime.dispose());
   const pending = runtime.invoke(request(root, sessionId, "run_command", { argv: ["fixture-command"] }));
@@ -392,15 +389,14 @@ test("only one tool request can remain active across an approval wait", async (t
 });
 
 test("approved command execution uses argv without a shell, redacts output, and rejects replay", async (t) => {
-  if (process.platform === "win32" || process.getuid?.() === 0) return t.skip("Command execution is disabled on Windows and under root.");
   const { root } = fixture(t);
   let approvals = 0;
   let shown;
-  let spawnOptions;
+  let runOptions;
   const { runtime, sessionId } = makeRuntime(root, {
     commandExecutionEnabled: true,
     approvalHandler: async (snapshot) => { approvals += 1; shown = snapshot; return "approve-once"; },
-    spawnImpl: createMockSpawn({ stdout: "api_key=never-audit-this-value" , onSpawn: (options) => { spawnOptions = options; } }),
+    commandBackend: createMockCommandBackend({ stdout: "api_key=never-audit-this-value", onRun: (options) => { runOptions = options; } }),
   });
   t.after(() => runtime.dispose());
   const invoke = request(root, sessionId, "run_command", { argv: ["fixture-command", "safe-arg"] });
@@ -408,11 +404,15 @@ test("approved command execution uses argv without a shell, redacts output, and 
   assert.equal(result.state, "executed");
   assert.equal(result.verified, false);
   assert.match(result.result.stdout, /api_key=\[redacted\]/u);
+  assert.equal(result.result.isolated, true);
   assert.doesNotMatch(JSON.stringify(runtime.getAuditEvents()), /never-audit-this-value/u);
   assert.equal(shown.operation.shell, false);
   assert.deepEqual(shown.operation.argv, ["fixture-command", "safe-arg"]);
+  assert.equal(shown.operation.workspaceAccess, "read-only");
+  assert.equal(shown.operation.isolation.network, "disabled");
   assert.match(renderToolApproval({ ...shown, operation: { ...shown.operation, argv: ["command\u202e--unsafe"] } }), /\\u202e/u);
-  assert.equal(spawnOptions.shell, false);
+  assert.deepEqual(runOptions.argv, ["fixture-command", "safe-arg"]);
+  assert.equal(runOptions.workspaceAccess, "read-only");
   assert.equal(approvals, 1);
   const replay = await runtime.invoke(invoke);
   assert.equal(replay.error.code, "DUPLICATE_REQUEST");
@@ -420,12 +420,11 @@ test("approved command execution uses argv without a shell, redacts output, and 
 });
 
 test("an approved command with a nonzero exit is reported failed after execution", async (t) => {
-  if (process.platform === "win32" || process.getuid?.() === 0) return t.skip("Command execution is disabled on Windows and under root.");
   const { root } = fixture(t);
   const { runtime, sessionId } = makeRuntime(root, {
     commandExecutionEnabled: true,
     approvalHandler: async () => "approve-once",
-    spawnImpl: createMockSpawn({ stdout: "diagnostic", code: 7 }),
+    commandBackend: createMockCommandBackend({ stdout: "diagnostic", exitCode: 7 }),
   });
   t.after(() => runtime.dispose());
   const result = await runtime.invoke(request(root, sessionId, "run_command", { argv: ["fixture-command"] }));
@@ -439,38 +438,115 @@ test("an approved command with a nonzero exit is reported failed after execution
 });
 
 test("approved command timeout terminates the child and returns no success state", async (t) => {
-  if (process.platform === "win32" || process.getuid?.() === 0) return t.skip("Command execution is disabled on Windows and under root.");
   const { root } = fixture(t);
-  const killSignals = [];
   const { runtime, sessionId } = makeRuntime(root, {
     commandExecutionEnabled: true,
     commandTimeoutMs: 25,
     approvalHandler: async () => "approve-once",
-    spawnImpl: createMockSpawn({ hang: true, ignoreTerm: true, onKill: (signal) => killSignals.push(signal) }),
+    commandBackend: createMockCommandBackend({ runError: "COMMAND_TIMEOUT" }),
   });
   t.after(() => runtime.dispose());
   const invoke = request(root, sessionId, "run_command", { argv: ["fixture-command"] });
   const started = Date.now();
   const result = await runtime.invoke(invoke);
-  assert.equal(result.state, "failed");
+  assert.equal(result.state, "timed-out");
   assert.equal(result.error.code, "COMMAND_TIMEOUT");
   assert.equal(result.executed, true);
-  assert.deepEqual(killSignals, ["SIGTERM", "SIGKILL"]);
   assert.ok(Date.now() - started < 1_500);
 });
 
 test("command output limits terminate the child and preserve the failed state", async (t) => {
-  if (process.platform === "win32" || process.getuid?.() === 0) return t.skip("Command execution is disabled on Windows and under root.");
   const { root } = fixture(t);
   const { runtime, sessionId } = makeRuntime(root, {
     commandExecutionEnabled: true,
     approvalHandler: async () => "approve-once",
-    spawnImpl: createMockSpawn({ stdout: "x".repeat(20_000) }),
+    commandBackend: createMockCommandBackend({ runError: "OUTPUT_LIMIT" }),
   });
   t.after(() => runtime.dispose());
   const result = await runtime.invoke(request(root, sessionId, "run_command", { argv: ["fixture-command"] }));
   assert.equal(result.state, "failed");
   assert.equal(result.error.code, "OUTPUT_LIMIT");
+  assert.equal(result.executed, true);
+});
+
+test("the command approval binds the exact isolation policy and refuses policy changes", async (t) => {
+  const { root } = fixture(t);
+  let runCount = 0;
+  let prepareCount = 0;
+  const backend = createMockCommandBackend({ onPrepare: () => `policy-${++prepareCount}`, onRun: () => { runCount += 1; } });
+  const { runtime, sessionId } = makeRuntime(root, { commandExecutionEnabled: true, commandBackend: backend,
+    approvalHandler: async () => "approve-once" });
+  t.after(() => runtime.dispose());
+  const result = await runtime.invoke(request(root, sessionId, "run_command", { argv: ["fixture-command"] }));
+  assert.equal(result.state, "rejected");
+  assert.equal(result.error.code, "ISOLATION_POLICY_CHANGED");
+  assert.equal(result.executed, false);
+  assert.equal(runCount, 0);
+});
+
+test("unavailable isolation never reaches approval and never falls back to host execution", async (t) => {
+  const { root } = fixture(t);
+  let approvalCount = 0;
+  let runCount = 0;
+  const backend = createMockCommandBackend({ prepareError: "ISOLATION_RUNTIME_MISSING", onRun: () => { runCount += 1; } });
+  const { runtime, sessionId } = makeRuntime(root, { commandExecutionEnabled: true, commandBackend: backend,
+    approvalHandler: async () => { approvalCount += 1; return "approve-once"; } });
+  t.after(() => runtime.dispose());
+  const result = await runtime.invoke(request(root, sessionId, "run_command", { argv: ["touch", "should-not-exist"] }));
+  assert.equal(result.state, "isolation-unavailable");
+  assert.equal(result.error.code, "ISOLATION_RUNTIME_MISSING");
+  assert.equal(result.executed, false);
+  assert.equal(approvalCount, 0);
+  assert.equal(runCount, 0);
+  assert.equal(fs.existsSync(path.join(root, "should-not-exist")), false);
+});
+
+test("writable workspace access requires a separate host setting and is bound into approval", async (t) => {
+  const { root } = fixture(t);
+  let approvals = 0;
+  const { runtime, sessionId } = makeRuntime(root, { commandExecutionEnabled: true,
+    commandBackend: createMockCommandBackend(), approvalHandler: async () => { approvals += 1; return "decline"; } });
+  t.after(() => runtime.dispose());
+  const blocked = await runtime.invoke(request(root, sessionId, "run_command", { argv: ["make"], workspaceAccess: "read-write" }));
+  assert.equal(blocked.state, "rejected");
+  assert.equal(blocked.error.code, "UNSUPPORTED_OPERATION");
+  assert.equal(approvals, 0);
+});
+
+test("an explicitly enabled writable command is reviewed with its exact mount mode", async (t) => {
+  const { root } = fixture(t);
+  let reviewed;
+  let executed;
+  const { runtime, sessionId } = makeRuntime(root, { commandExecutionEnabled: true, commandWorkspaceWriteEnabled: true,
+    commandBackend: createMockCommandBackend({ onRun: (input) => { executed = input; } }),
+    approvalHandler: async (snapshot) => { reviewed = snapshot; return "approve-once"; } });
+  t.after(() => runtime.dispose());
+  const result = await runtime.invoke(request(root, sessionId, "run_command", { argv: ["make", "test"], workspaceAccess: "read-write" }));
+  assert.equal(result.state, "executed");
+  assert.equal(reviewed.operation.workspaceAccess, "read-write");
+  assert.equal(executed.workspaceAccess, "read-write");
+});
+
+test("runtime interruption reaches the sandbox boundary and is reported as interrupted", async (t) => {
+  const { root } = fixture(t);
+  let executionStarted = false;
+  const backend = createMockCommandBackend();
+  backend.run = ({ signal }) => new Promise((_resolve, reject) => {
+    executionStarted = true;
+    signal.addEventListener("abort", () => {
+      const error = new Error("cancelled"); error.code = "COMMAND_INTERRUPTED"; error.executed = true; reject(error);
+    }, { once: true });
+  });
+  const { runtime, sessionId } = makeRuntime(root, { commandExecutionEnabled: true, commandBackend: backend,
+    approvalHandler: async () => "approve-once" });
+  t.after(() => runtime.dispose());
+  const pending = runtime.invoke(request(root, sessionId, "run_command", { argv: ["sleep", "100"] }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(executionStarted, true);
+  assert.equal(runtime.interrupt(), true);
+  const result = await pending;
+  assert.equal(result.state, "interrupted");
+  assert.equal(result.error.code, "COMMAND_INTERRUPTED");
   assert.equal(result.executed, true);
 });
 
@@ -513,6 +589,23 @@ test("CLI parser requires a registered-tool-shaped JSON argument and rejects unr
   });
   assert.throws(() => parseArgs(["tools", "run", "read_file", "not-json"]), /valid JSON/u);
   assert.throws(() => parseArgs(["tools", "run", "read_file", '{"path":"a"}', "--apply"]), /only follow a propose_file_change/u);
+  assert.deepEqual(parseArgs(["tools", "status"]), { command: "tools", action: "status", help: false });
+});
+
+test("tools status is an explicit read-only diagnostic and tools list does not probe Podman", async (t) => {
+  const { root } = fixture(t);
+  let inspections = 0;
+  const backend = createMockCommandBackend({ onInspect: () => { inspections += 1; } });
+  const listed = capture();
+  assert.equal(await runVesper(["tools", "list"], { commandBackend: backend, output: listed.stream, errorOutput: capture().stream }), 0);
+  assert.equal(inspections, 0);
+  const status = capture();
+  const exitCode = await runVesper(["tools", "status"], { commandBackend: backend, output: status.stream, errorOutput: capture().stream });
+  assert.equal(exitCode, 0);
+  assert.equal(inspections, 1);
+  assert.match(status.text, /Rootless runtime: yes/u);
+  assert.match(status.text, /does not start a container/u);
+  assert.doesNotMatch(status.text, /test-secret-must-not-pass/u);
 });
 
 test("OpenAI provider remains text-only and Codex-native approval implementation stays separate", () => {
@@ -524,41 +617,30 @@ test("OpenAI provider remains text-only and Codex-native approval implementation
   assert.match(approvalSource, /invalidated/u);
 });
 
-function createMockSpawn({ stdout = "", stderr = "", code = 0, hang = false, ignoreTerm = false, onSpawn = () => {}, onKill = () => {} } = {}) {
-  return (executable, args, options) => {
-    onSpawn(options, executable, args);
-    const child = new EventEmitter();
-    child.pid = 1_000_000;
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    let keepAlive;
-    let closed = false;
-    if (hang) keepAlive = setTimeout(() => {}, 2_000);
-    child.kill = (signal) => {
-      onKill(signal);
-      if (ignoreTerm && signal === "SIGTERM") return true;
-      clearTimeout(keepAlive);
-      if (!child.stdout.writableEnded) child.stdout.end();
-      if (!child.stderr.writableEnded) child.stderr.end();
-      setImmediate(() => {
-        if (closed) return;
-        closed = true;
-        child.emit("close", null, signal);
-      });
-      return true;
-    };
-    if (!hang) {
-      setImmediate(() => {
-        if (closed) return;
-        if (!child.stdout.writableEnded) child.stdout.end(stdout);
-        if (!child.stderr.writableEnded) child.stderr.end(stderr);
-        setImmediate(() => {
-          if (closed) return;
-          closed = true;
-          child.emit("close", code, null);
-        });
-      });
-    }
-    return child;
+function createMockCommandBackend({ stdout = "", stderr = "", exitCode = 0, onRun = () => {}, onPrepare = null,
+  onInspect = () => {}, prepareError = null, runError = null } = {}) {
+  let preparations = 0;
+  const imageId = `sha256:${"a".repeat(64)}`;
+  return {
+    inspect: async () => { onInspect(); return { backend: "podman-rootless", platform: "linux", installed: true, rootless: true,
+      configured: true, imagePresent: true, imageId, available: true, enabled: true, restrictions: {}, unsupported: [],
+      policy: { version: "test", seccompEnabled: true, cgroupVersion: "v2", controllers: ["cpu", "memory", "pids"] } }; },
+    prepare: async (input) => {
+      preparations += 1;
+      if (prepareError) { const error = new Error(prepareError); error.code = prepareError; error.rejected = true; throw error; }
+      const binding = onPrepare ? onPrepare(input, preparations) : crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
+      return Object.freeze({ binding, argv: input.argv, workspaceRoot: input.workspaceRoot, workspaceAccess: input.workspaceAccess,
+        imageId, display: { backend: "Rootless Podman", imageId, network: "disabled", readOnlyRootFilesystem: true,
+          seccomp: "enabled", noNewPrivileges: true, capabilities: "all dropped", cpuCount: 1, memoryMiB: 512,
+          privateNamespaces: "PID, IPC, UTS, cgroup", hostSockets: "not mounted", hostProc: "not mounted",
+          processLimit: 64, timeoutMs: input.timeoutMs, outputLimitBytesPerStream: 16_384 } });
+    },
+    run: async (input) => {
+      onRun(input);
+      if (runError) { const error = new Error(runError); error.code = runError; error.executed = true; throw error; }
+      return Object.freeze({ argv: input.argv, exitCode, signal: null, stdout, stderr, truncated: false, isolated: true,
+        backend: "podman-rootless", imageId, workspaceAccess: input.workspaceAccess, containerConfigurationVerified: true });
+    },
+    dispose: async () => {},
   };
 }
