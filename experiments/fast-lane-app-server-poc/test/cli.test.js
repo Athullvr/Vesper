@@ -477,7 +477,8 @@ test("a failed saved-thread reconnect keeps the session and the next prompt can 
   assert.equal(status, 0);
   assert.equal(resumeAttempts, 2);
   assert.equal(turnCount, 1);
-  assert.match(output.text(), /Codex error .* temporary reconnect failure/u);
+  assert.match(output.text(), /Codex error .* saved provider conversation could not be resumed/u);
+  assert.doesNotMatch(output.text(), /temporary reconnect failure/u);
   assert.match(output.text(), /Recovered answer\./u);
   assert.equal(store.load(saved.sessionId).threadId, "codex-saved-thread");
   assert.equal(fs.readdirSync(store.directory).filter((name) => name.endsWith(".json")).length, 1);
@@ -561,7 +562,8 @@ test("interactive session switching lists only this project, verifies reconnect,
   assert.doesNotMatch(initialList, new RegExp(isolated.sessionId, "u"));
   assert.match(visible, /belongs to .* Vesper is running in/u);
   assert.match(visible, /was not found/u);
-  assert.match(visible, /temporary reconnect failure/u);
+  assert.match(visible, /saved provider conversation could not be resumed/u);
+  assert.doesNotMatch(visible, /temporary reconnect failure/u);
   assert.match(visible, /Vesper history · empty/u);
   assert.match(visible, /Answer from codex-thread-second/u);
   assert.match(visible, /Answer from codex-thread-first/u);

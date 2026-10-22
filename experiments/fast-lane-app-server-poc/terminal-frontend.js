@@ -4,7 +4,11 @@ const readline = require("node:readline");
 const { RouteMetrics, ROUTING_REASON_COUNT_CODES, classifyRequest, createRoutingDecisionRecord, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
-const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
+const { unavailableHistory } = require("./conversation-history");
+const { approvalReview } = require("./approval-review");
+const { createExecutionProvider } = require("./execution-provider");
+const { assertExecutionProvider } = require("./execution-interface");
+const { codexApprovalResponse, normalizeApprovalRequest } = require("./codex-execution-provider");
 const { getPlanningMetadata } = require("./capability-planner");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
 const { LiveTurnDiffView } = require("./live-turn-diff-view");
@@ -37,18 +41,20 @@ const STREAM_SENSITIVE_MARKER_NAMES = [
 ];
 
 class TerminalFrontend {
-  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, capabilityProvider = null, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
+  constructor({ cwd, handlers, executionProvider, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedConversationId = null, savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, onExecutionState, capabilityProvider = null, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (!handlers || typeof handlers !== "object") throw new TypeError("Local handlers are required.");
-    if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
+    const provider = executionProvider || (appServer ? createExecutionProvider({ client: appServer }) : null);
+    assertExecutionProvider(provider);
     this.cwd = cwd;
     this.handlers = handlers;
-    this.appServer = appServer;
-    this.savedThreadId = savedThreadId;
-    this.savedHistoryState = savedThreadId ? "pending" : "not-needed";
+    this.executionProvider = provider;
+    this.savedConversationId = savedConversationId || savedThreadId || null;
+    this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
     this.sessionId = sessionId;
     this.onWorkspaceCommand = onWorkspaceCommand;
     this.onTask = onTask;
+    this.onExecutionState = onExecutionState;
     this.capabilityProvider = capabilityProvider;
     this.routingDiagnostics = Boolean(routingDiagnostics);
     this.output = output;
@@ -78,9 +84,11 @@ class TerminalFrontend {
     });
     this.pendingApprovals = new Set();
     this.approvalQueue = Promise.resolve();
+    this.handleExecutionEvent = this.handleExecutionEvent.bind(this);
     this.handleProgress = this.handleProgress.bind(this);
 
-    this.appServer.on?.("progress", this.handleProgress);
+    this.executionProvider.setApprovalHandler?.((request) => this.requestApproval(request));
+    this.executionProvider.on("event", this.handleExecutionEvent);
     this.lineIO.onInterrupt?.(() => this.handleInterrupt());
   }
 
@@ -107,7 +115,7 @@ class TerminalFrontend {
     } finally {
       this.closed = true;
       this.lineIO.close?.();
-      this.appServer.off?.("progress", this.handleProgress);
+      this.executionProvider.off("event", this.handleExecutionEvent);
     }
   }
 
@@ -188,16 +196,13 @@ class TerminalFrontend {
         },
         fallback: async () => {
           await this.restoreSavedHistory();
-          return this.appServer.runTurn({
-            prompt,
-            cwd: this.cwd,
-            onDelta: (delta) => this.writeStreamDelta(delta),
-          });
+          return this.executionProvider.submitTask({ task: prompt, projectPath: this.cwd });
         },
       });
       const result = routed.fallbackResult;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs, { routingDecision: routed.routingDecision });
+      await this.onExecutionState?.({ status: "active", recovery: null });
       this.finishStream();
       if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
@@ -206,6 +211,12 @@ class TerminalFrontend {
     } catch (error) {
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs, { routingDecision });
+      if (["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "RESUME_FAILED", "SUBMISSION_OUTCOME_UNCERTAIN"].includes(error?.code)) {
+        const recoveryCode = error.code === "SUBMISSION_OUTCOME_UNCERTAIN"
+          ? "submission-outcome-uncertain"
+          : error.code === "RESUME_FAILED" ? "resume-failed" : "connection-lost";
+        try { await this.onExecutionState?.({ status: "recovery-required", recovery: { code: recoveryCode } }); } catch { /* Report the provider error even if metadata could not be refreshed. */ }
+      }
       this.finishStream();
       this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
@@ -221,12 +232,15 @@ class TerminalFrontend {
     }
   }
 
-  requestApproval(method, params = {}, context) {
+  requestApproval(request, params, context) {
+    const legacyMethod = typeof request === "string" ? request : null;
+    const approvalRequest = legacyMethod ? normalizeApprovalRequest(legacyMethod, params || {}, context) : request;
+    if (legacyMethod) this.handleExecutionEvent({ type: "approval-required", request: approvalRequest });
     const pending = this.approvalQueue.then(async () => {
       this.approvalPromptDepth += 1;
       this.turnDiffView.suspend();
       try {
-        return await this.promptForApproval(method, params, context);
+        return await this.promptForApproval(approvalRequest);
       } finally {
         this.approvalPromptDepth = Math.max(0, this.approvalPromptDepth - 1);
         if (this.approvalPromptDepth === 0) {
@@ -243,72 +257,71 @@ class TerminalFrontend {
       }
     });
     this.approvalQueue = pending.catch(() => undefined);
-    this.pendingApprovals.add(pending);
+    const result = legacyMethod ? pending.then((choice) => codexApprovalResponse(legacyMethod, choice?.choice || "decline", params || {})) : pending;
+    this.pendingApprovals.add(result);
     pending.then(
-      () => this.pendingApprovals.delete(pending),
-      () => this.pendingApprovals.delete(pending)
+      () => this.pendingApprovals.delete(result),
+      () => this.pendingApprovals.delete(result)
     );
-    return pending;
+    return result;
   }
 
-  async promptForApproval(method, params = {}, context) {
-    const fileApproval = method === "item/fileChange/requestApproval";
-    const snapshot = fileApproval && context?.fileChange ? createFileChangeSnapshot(context.fileChange) : null;
-    const currentFileReview = () => snapshot && context?.signal && !context.signal.aborted &&
-      typeof context.isCurrent === "function" && context.isCurrent() &&
-      snapshot.threadId === params.threadId && snapshot.turnId === params.turnId && snapshot.itemId === params.itemId;
-    if (method === "applyPatchApproval" || (fileApproval && (!currentFileReview() || params.grantRoot != null))) {
-      this.write("[Vesper] File-change approval declined: complete changes with an exact current thread/turn/item identity and one-time scope are required.\n");
-      return refusedApproval(method);
+  async promptForApproval(request = {}) {
+    if (typeof request === "string") {
+      const legacyMethod = request;
+      const normalized = normalizeApprovalRequest(legacyMethod, arguments[1] || {}, arguments[2]);
+      const choice = await this.promptForApproval(normalized);
+      return codexApprovalResponse(legacyMethod, choice?.choice || "decline", arguments[1] || {});
     }
-    const details = approvalDetails(method, params, snapshot);
+    const fileApproval = request.type === "file-change";
+    const evidence = request.evidence;
+    const snapshot = fileApproval && evidence?.fileChange ? createFileChangeSnapshot(evidence.fileChange) : null;
+    const currentFileReview = () => snapshot && evidence?.signal && !evidence.signal.aborted &&
+      typeof evidence.isCurrent === "function" && evidence.isCurrent() &&
+      snapshot.threadId === request.conversationId && snapshot.turnId === request.taskId && snapshot.itemId === request.itemId;
+    if (request.type === "unsupported" || (fileApproval && (!currentFileReview() || !snapshot))) {
+      if (request.type === "unsupported") {
+        this.write("[Vesper] Unsupported approval request declined.\n");
+        return { choice: "decline" };
+      }
+      this.write("[Vesper] File-change approval declined: complete changes with an exact current thread/turn/item identity and one-time scope are required.\n");
+      return { choice: "decline" };
+    }
+    const details = request.review || { title: "unknown approval", body: "No approval details are available.", truncated: true };
     this.write(`\n\n[Codex approval required · ${details.title}]\n`);
     if (details.body) this.write(`${details.body}\n`);
 
     if (details.truncated) {
       this.write("The complete approval details do not fit the terminal review limit; Vesper declined this request.\n");
-      return refusedApproval(method);
+      return { choice: "decline" };
     }
 
-    if (method === "item/commandExecution/requestApproval" && Array.isArray(params.availableDecisions) && !params.availableDecisions.includes("accept")) {
+    if (request.type === "command" && request.canApprove === false) {
       this.write("This command cannot be approved through the available protocol decisions.\n");
-      return refusedApproval(method);
+      return { choice: "decline" };
     }
 
     const answer = await this.lineIO.question("Type yes to approve once, cancel to cancel, or anything else to decline: ",
-      fileApproval ? { signal: context.signal } : undefined);
+      fileApproval ? { signal: evidence.signal } : undefined);
     if (fileApproval && !currentFileReview()) {
       this.write("[Vesper] File-change review expired or changed; approval declined.\n");
-      return refusedApproval(method);
+      return { choice: "decline" };
     }
     const choice = String(answer || "").trim().toLowerCase();
     const approved = choice === "yes";
     const cancelled = choice === "cancel";
     this.write(`[Vesper] Approval choice: ${approved ? "approve once" : cancelled ? "cancel" : "decline"}.\n`);
 
-    if (method === "item/permissions/requestApproval") {
-      if (!approved) return { permissions: {}, scope: "turn" };
-      return { permissions: cloneJsonValue(params.permissions || {}), scope: "turn" };
-    }
-    if (method === "applyPatchApproval" || method === "execCommandApproval") {
-      return {
-        decision: approved
-          ? "approved"
-          : cancelled
-            ? "abort"
-            : { denied: { rejection: "User declined the request." } },
-      };
-    }
-    return { decision: approved ? "accept" : cancelled ? "cancel" : "decline" };
+    return { choice: approved ? "approve-once" : cancelled ? "cancel" : "decline" };
   }
 
   async restoreSavedHistory() {
-    if (!this.savedThreadId || this.savedHistoryState === "loaded") return;
+    if (!this.savedConversationId || this.savedHistoryState === "loaded") return;
 
     let resumedThreadId;
     try {
-      resumedThreadId = await this.appServer.resumeThread(this.cwd);
-      if (resumedThreadId !== this.savedThreadId) {
+      const resumed = await this.executionProvider.resumeConversation({ projectPath: this.cwd, conversationId: this.savedConversationId });
+      if (resumed?.conversationId !== this.savedConversationId) {
         throw new Error("Codex app-server resumed a different thread than the saved Vesper session.");
       }
     } catch (error) {
@@ -319,11 +332,10 @@ class TerminalFrontend {
     this.savedHistoryState = "loaded";
     let historyView;
     try {
-      const history = await this.appServer.readThreadHistory();
-      if (history?.threadId !== this.savedThreadId) {
+      historyView = await this.executionProvider.readConversationHistory();
+      if (!historyView || !Array.isArray(historyView.entries)) {
         throw new Error("Codex returned history for a different saved thread.");
       }
-      historyView = projectConversationHistory(history);
     } catch (error) {
       historyView = unavailableHistory(
         `The saved Codex thread is connected, but conversation history could not be retrieved: ${safeTerminalText(error?.message || error)}. Vesper has not treated it as empty.`
@@ -336,20 +348,25 @@ class TerminalFrontend {
     }
   }
 
-  replaceAppServer(appServer, { sessionId = null, savedThreadId = null } = {}) {
+  replaceExecutionProvider(executionProvider, { sessionId = null, savedConversationId = null, savedThreadId = null } = {}) {
     if (this.activeRequest || this.pendingApprovals.size) throw new Error("A Vesper session can only be switched while the terminal is idle.");
-    if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
-    this.appServer.off?.("progress", this.handleProgress);
-    this.appServer = appServer;
-    this.appServer.on?.("progress", this.handleProgress);
+    assertExecutionProvider(executionProvider);
+    this.executionProvider.off("event", this.handleExecutionEvent);
+    this.executionProvider = executionProvider;
+    this.executionProvider.setApprovalHandler?.((request) => this.requestApproval(request));
+    this.executionProvider.on("event", this.handleExecutionEvent);
     this.sessionId = sessionId;
-    this.savedThreadId = savedThreadId;
-    this.savedHistoryState = savedThreadId ? "pending" : "not-needed";
+    this.savedConversationId = savedConversationId || savedThreadId || null;
+    this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
     this.turnDiffIdentity = null;
     this.turnDiffRendered = false;
     this.pendingTurnDiffFinal = null;
     this.commandActivity = null;
     this.metrics = new RouteMetrics();
+  }
+
+  replaceAppServer(appServer, options = {}) {
+    return this.replaceExecutionProvider(createExecutionProvider({ client: appServer }), options);
   }
 
   writeStreamDelta(delta) {
@@ -418,52 +435,80 @@ class TerminalFrontend {
     this.streamLimitReported = true;
   }
 
-  handleProgress(event) {
+  handleExecutionEvent(event) {
     if (!event || typeof event !== "object") return;
     switch (event.type) {
-      case "thread_starting": this.write("[Codex] Starting a thread…\n"); break;
-      case "thread_resuming": this.write("[Codex] Resuming the saved thread…\n"); break;
-      case "turn_started": this.write("[Codex] Working…\n"); break;
-      case "turn_identity":
-        this.turnDiffIdentity = isTurnDiffIdentity(event.threadId, event.turnId)
-          ? { threadId: event.threadId, turnId: event.turnId }
+      case "text-delta": this.writeStreamDelta(event.text); break;
+      case "conversation-state":
+        if (event.state === "starting") this.write("[Codex] Starting a thread…\n");
+        else if (event.state === "resuming") this.write("[Codex] Resuming the saved thread…\n");
+        break;
+      case "task-started": this.write("[Codex] Working…\n"); break;
+      case "task-identity":
+        this.turnDiffIdentity = isTurnDiffIdentity(event.conversationId, event.taskId)
+          ? { threadId: event.conversationId, turnId: event.taskId }
           : null;
         if (this.turnDiffIdentity) this.turnDiffView.begin();
-        this.renderCommandActivity(this.commandActivity?.bindTurn(event.threadId, event.turnId));
+        this.renderCommandActivity(this.commandActivity?.bindTurn(event.conversationId, event.taskId));
         this.renderFileChangeActivities(event.fileChanges);
         break;
-      case "turn_status":
-        this.renderCommandActivity(this.commandActivity?.setTurnStatus(event.threadId, event.turnId, event.status));
-        break;
-      case "approval_requested":
-        if (event.method === "item/commandExecution/requestApproval") {
-          this.renderCommandActivity(this.commandActivity?.applyApproval(event.params, "requested"));
+      case "task-state":
+        if (["completed", "failed", "interrupted"].includes(event.state)) {
+          this.renderCommandActivity(this.commandActivity?.setTurnStatus(event.conversationId, event.taskId, event.state));
         }
         break;
-      case "approval_decided":
-        if (event.method === "item/commandExecution/requestApproval") {
-          this.renderCommandActivity(this.commandActivity?.applyApproval(event.params, event.status));
+      case "approval-required":
+        if (event.request?.type === "command") {
+          this.renderCommandActivity(this.commandActivity?.applyApproval({
+            threadId: event.request.conversationId,
+            turnId: event.request.taskId,
+            itemId: event.request.itemId,
+            approvalId: event.request.approvalId,
+            command: event.request.command,
+            cwd: event.request.cwd,
+          }, "requested"));
         }
         break;
-      case "codex_progress":
-        if (["item/started", "item/completed", "item/commandExecution/outputDelta"].includes(event.method)) {
-          this.renderCommandActivity(this.commandActivity?.applyProtocolNotification(event.method, event.params));
+      case "approval-decided":
+        if (event.itemId) {
+          this.renderCommandActivity(this.commandActivity?.applyApproval({
+            threadId: event.conversationId,
+            turnId: event.taskId,
+            itemId: event.itemId,
+            approvalId: event.approvalId,
+            command: event.command,
+            cwd: event.cwd,
+          }, event.status));
         }
         break;
-      case "file_change_activity":
+      case "command-activity":
+        this.renderCommandActivity(event.update ? [event.update] : []);
+        break;
+      case "file-change":
         this.renderFileChangeActivities([event.activity]);
         break;
-      case "turn_diff_activity":
-        this.renderTurnDiffActivity(event.activity);
+      case "task-progress":
+        if (event.kind === "aggregate-diff") {
+          if (event.stage === "update") this.updateTurnDiffActivity(event.activity);
+          else this.renderTurnDiffActivity(event.activity);
+        } else if (event.kind === "approval-declined") {
+          this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.message)}\n`);
+        }
         break;
-      case "turn_diff_updated":
-        this.updateTurnDiffActivity(event.activity);
-        break;
-      case "turn_timed_out": this.write("[Vesper] Turn timed out; asking Codex to interrupt…\n"); break;
-      case "disconnected": this.write(`[Codex disconnected] ${safeTerminalText(event.reason || "app-server connection closed")}\n`); break;
-      case "interrupt_requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
-      case "file_approval_declined": this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.reason)}\n`); break;
+      case "connection-lost": this.write(`[Codex disconnected] ${safeTerminalText(event.message || "provider connection closed")}\n`); break;
+      case "interrupt-requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
       default: break;
+    }
+  }
+
+  // Compatibility entry point for existing callers that supplied an app-server
+  // client directly. Production execution subscribes only to normalized events.
+  handleProgress(event) {
+    if (!event || typeof event !== "object") return;
+    if (event.type === "turn_identity") {
+      this.handleExecutionEvent({ type: "task-identity", conversationId: event.threadId, taskId: event.turnId, fileChanges: event.fileChanges });
+    } else if (event.type === "turn_diff_activity" || event.type === "turn_diff_updated") {
+      this.handleExecutionEvent({ type: "task-progress", kind: "aggregate-diff", stage: event.type === "turn_diff_updated" ? "update" : "final", activity: event.activity });
     }
   }
 
@@ -527,7 +572,7 @@ class TerminalFrontend {
       this.interruptPending = true;
       this.lineIO.cancelPending?.();
       this.write("\n[Vesper] Ctrl+C received; interrupting this turn. Vesper will return to the prompt when it ends.\n");
-      Promise.resolve(this.appServer.interrupt?.()).catch((error) => {
+      Promise.resolve(this.executionProvider.interrupt()).catch((error) => {
         this.write(`[Vesper interrupt error] ${safeTerminalText(error?.message || error)}\n`);
       });
     } else {
@@ -685,6 +730,10 @@ function createLineIO(input, output) {
 }
 
 function approvalDetails(method, params, fileChange) {
+  return approvalReview(method, params, fileChange);
+}
+
+function legacyApprovalDetails(method, params, fileChange) {
   const lines = [];
   let truncated = false;
   const add = (label, value, json = false, redact = false, singleLine = false) => {

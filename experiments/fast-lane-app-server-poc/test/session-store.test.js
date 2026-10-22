@@ -24,7 +24,7 @@ test("session metadata is private, atomic, and contains only Vesper session iden
   assert.equal(directoryStat.mode & 0o777, 0o700);
   assert.equal(fileStat.mode & 0o777, 0o600);
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(sessionPath, "utf8"))).sort(), [
-    "createdAt", "cwd", "schemaVersion", "sessionId", "threadId", "updatedAt",
+    "createdAt", "cwd", "providerConversationId", "providerId", "recovery", "schemaVersion", "sessionId", "status", "updatedAt",
   ]);
   assert.deepEqual(store.load(session.sessionId), session);
 
@@ -33,6 +33,38 @@ test("session metadata is private, atomic, and contains only Vesper session iden
   assert.equal(store.load(session.sessionId).threadId, "codex-thread-123");
   assert.throws(() => store.write({ ...session, prompt: "not stored" }), /Invalid Vesper session metadata/u);
   assert.throws(() => store.update(session.sessionId, { apiKey: "not stored" }), /Only the project directory/u);
+  assert.throws(() => store.update(session.sessionId, { providerId: "another-provider" }), /Only the project directory/u);
+});
+
+test("legacy Codex thread records migrate in memory and preserve the exact conversation mapping", (t) => {
+  const root = temporaryRoot(t);
+  const directory = path.join(root, "sessions");
+  const store = new SessionStore({ directory });
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const legacy = {
+    schemaVersion: 1,
+    sessionId: "00000000-0000-4000-8000-000000000001",
+    cwd: "/workspace/project",
+    threadId: "saved-codex-thread",
+    createdAt: "2026-10-19T12:00:00.000Z",
+    updatedAt: "2026-10-19T12:01:00.000Z",
+  };
+  fs.writeFileSync(path.join(directory, `${legacy.sessionId}.json`), `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+  const loaded = store.load(legacy.sessionId);
+  assert.equal(loaded.providerId, "codex-app-server");
+  assert.equal(loaded.providerConversationId, "saved-codex-thread");
+  assert.equal(loaded.threadId, "saved-codex-thread", "the legacy accessor remains available to older callers");
+  assert.equal(loaded.status, "active");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(directory, `${legacy.sessionId}.json`), "utf8")).schemaVersion, 1);
+
+  const persisted = store.touch(legacy.sessionId);
+  const raw = JSON.parse(fs.readFileSync(path.join(directory, `${legacy.sessionId}.json`), "utf8"));
+  assert.equal(persisted.providerConversationId, "saved-codex-thread");
+  assert.equal(raw.schemaVersion, 2);
+  assert.equal(raw.providerConversationId, "saved-codex-thread");
+  assert.equal(Object.hasOwn(raw, "threadId"), false);
+  assert.throws(() => store.update(legacy.sessionId, { providerConversationId: "different-thread" }), /cannot be rebound/u);
 });
 
 test("session store rejects symlinked session files and directories", (t) => {

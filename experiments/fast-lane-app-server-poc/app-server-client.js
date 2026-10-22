@@ -174,8 +174,9 @@ class AppServerClient extends EventEmitter {
     } catch (error) {
       // A lost start reply leaves acceptance unknown. Close this transport
       // before allowing another request, rather than leaving an orphan turn.
-      this.handleExit(error, generation);
-      this.finish(active, undefined, error, "disconnected");
+      const uncertain = markExecutionError(error, "SUBMISSION_OUTCOME_UNCERTAIN");
+      this.handleExit(uncertain, generation);
+      this.finish(active, undefined, uncertain, "disconnected");
     }
 
     return active.completion;
@@ -657,7 +658,7 @@ class AppServerClient extends EventEmitter {
         this.finish(active, { status: active.timedOut ? "timeout" : "interrupted" }, undefined, active.timedOut ? "timeout" : "interrupted");
         break;
       case "failed":
-        this.finish(active, undefined, new Error(turn.error?.message || "Codex turn failed."), "failed");
+        this.finish(active, undefined, markExecutionError(new Error(turn.error?.message || "Codex turn failed."), "TASK_FAILED"), "failed");
         break;
       default:
         this.finish(active, undefined, new Error(`Codex turn ended in unsupported status ${String(turn.status || "unknown")}.`), "unknown");
@@ -708,6 +709,9 @@ class AppServerClient extends EventEmitter {
 
   handleExit(error, generation) {
     if (generation !== this.connectionGeneration || !this.child) return;
+    if (this.activeTurn && !error?.executionCode) {
+      markExecutionError(error, this.activeTurn.startAcknowledged ? "CONNECTION_LOST" : "SUBMISSION_OUTCOME_UNCERTAIN");
+    }
     if (!this.disposed) this.emit("progress", { type: "disconnected", reason: safeErrorMessage(error) });
     const child = this.child;
     this.child = undefined;
@@ -832,6 +836,13 @@ function isSafeProtocolIdentity(value) {
 function safeErrorMessage(error) {
   const message = error instanceof Error ? error.message : String(error);
   return message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").slice(0, 800);
+}
+
+function markExecutionError(error, code) {
+  const normalized = error instanceof Error ? error : new Error("Codex app-server request failed.");
+  normalized.executionCode = code;
+  if (!normalized.code || ["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "SUBMISSION_OUTCOME_UNCERTAIN", "TASK_FAILED"].includes(normalized.code)) normalized.code = code;
+  return normalized;
 }
 
 module.exports = {

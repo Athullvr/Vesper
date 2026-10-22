@@ -222,7 +222,8 @@ test("initialization failures and timeouts are visible and the input loop recove
   const { frontend, output } = makeFrontend({ answers: ["Build a website", "Explain Git refs", "Try another request", ":quit"], appServer });
 
   await frontend.run();
-  assert.match(output(), /Codex error .* mock app-server initialization failure/u);
+  assert.match(output(), /Codex error .* provider reported that the task failed/u);
+  assert.doesNotMatch(output(), /mock app-server initialization failure/u);
   assert.match(output(), /Codex · timed out and interrupted/u);
   assert.match(output(), /Codex · completed/u);
   assert.equal(appServer.turns.length, 3);
@@ -280,7 +281,8 @@ test("failed and interrupted fallback turns never print a completed or confirmed
     appServer, answers: ["Inspect the repository", "Analyze the bug", ":quit"],
   });
   await frontend.run();
-  assert.match(output(), /Codex error .* Turn failed/u);
+  assert.match(output(), /Codex error .* provider reported that the task failed/u);
+  assert.doesNotMatch(output(), /Turn failed/u);
   assert.match(output(), /Codex · interrupted/u);
   assert.doesNotMatch(output(), /Codex · completed|Vesper local/u);
   assert.equal(io.questions.length, 3);

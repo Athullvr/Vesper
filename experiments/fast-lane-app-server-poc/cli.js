@@ -5,6 +5,7 @@ const { execFile } = require("node:child_process");
 const path = require("node:path");
 const readline = require("node:readline/promises");
 const { AppServerClient } = require("./app-server-client");
+const { createExecutionProvider } = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
 const { MAX_SESSION_LIST_ENTRIES, SessionStore } = require("./session-store");
 const { discoverMcp, discoverPlugins, discoverSkills, renderDiscovery, runCodexCommand } = require("./integration-discovery");
@@ -521,30 +522,43 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
 
     output.write(`Vesper session: ${session.sessionId}\n`);
     const sessionStatus = resumed ? "resumed" : "new";
-    const threadStatus = session.threadId ? "saved Codex thread" : "no Codex thread yet";
+    const threadStatus = session.providerConversationId ? "saved Codex thread" : "no Codex thread yet";
     output.write(`Session status: ${sessionStatus} · ${threadStatus}\n`);
     output.write(`Project: ${safeCliField(cwd)}\n`);
 
     let terminal;
     const clientFactory = dependencies.clientFactory || ((clientOptions) => new AppServerClient(clientOptions));
-    const createClient = (selectedSession) => clientFactory({
-      ...(dependencies.clientOptions || {}),
-      initialThreadId: selectedSession.threadId,
-      onThreadId: async (threadId) => {
-        const updated = store.update(selectedSession.sessionId, { threadId });
-        if (session.sessionId === selectedSession.sessionId) session = updated;
-      },
-      onApproval: (method, params, context) => terminal.requestApproval(method, params, context),
-    });
+    const providerFactory = dependencies.executionProviderFactory || createExecutionProvider;
+    const createClient = (selectedSession) => {
+      if (selectedSession.providerId !== "codex-app-server") {
+        throw new Error(`This session belongs to unsupported provider ${safeCliField(selectedSession.providerId)}. Start an explicit new session to use Codex.`);
+      }
+      return providerFactory({
+        providerId: selectedSession.providerId,
+        clientFactory,
+        clientOptions: {
+          ...(dependencies.clientOptions || {}),
+          initialThreadId: selectedSession.providerConversationId,
+          onThreadId: async (threadId) => {
+            const updated = store.update(selectedSession.sessionId, {
+              providerConversationId: threadId,
+              status: "active",
+              recovery: null,
+            });
+            if (session.sessionId === selectedSession.sessionId) session = updated;
+          },
+        },
+      });
+    };
     appServer = createClient(session);
 
     const activateSession = async (selectedSession, action) => {
       const nextClient = createClient(selectedSession);
       const previousClient = appServer;
       try {
-        terminal.replaceAppServer(nextClient, {
+        terminal.replaceExecutionProvider(nextClient, {
           sessionId: selectedSession.sessionId,
-          savedThreadId: selectedSession.threadId,
+          savedConversationId: selectedSession.providerConversationId,
         });
       } catch (error) {
         nextClient.dispose?.();
@@ -553,9 +567,9 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       session = selectedSession;
       appServer = nextClient;
       previousClient?.dispose?.();
-      output.write(`\n[Vesper] ${action}: ${safeCliField(session.sessionId)} · ${session.threadId ? "saved Codex thread" : "no Codex thread yet"}\n`);
+      output.write(`\n[Vesper] ${action}: ${safeCliField(session.sessionId)} · ${session.providerConversationId ? "saved Codex thread" : "no Codex thread yet"}\n`);
       output.write(`Project: ${safeCliField(cwd)}\n`);
-      if (session.threadId) {
+      if (session.providerConversationId) {
         try {
           await terminal.restoreSavedHistory();
         } catch (error) {
@@ -618,7 +632,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         if (!sessions.length) output.write("No Vesper sessions found for this project.\n");
         for (const item of sessions) {
           const current = item.sessionId === session.sessionId ? " · current" : "";
-          const thread = item.threadId ? "saved Codex thread" : "no Codex thread";
+          const thread = item.providerConversationId ? "saved Codex thread" : "no Codex thread";
           output.write(`${safeCliField(item.sessionId)}  ${safeCliField(item.updatedAt)}  ${thread}${current}\n`);
         }
         output.write("Use :switch SESSION_ID to resume one.\n");
@@ -655,17 +669,20 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     terminal = new TerminalFrontend({
       cwd,
       handlers,
-      appServer,
+      executionProvider: appServer,
       input: dependencies.input || process.stdin,
       output,
       lineIO: dependencies.lineIO,
       metrics: dependencies.metrics,
-      savedThreadId: session.threadId,
+      savedConversationId: session.providerConversationId,
       sessionId: session.sessionId,
       onWorkspaceCommand: handleWorkspaceCommand,
       capabilityProvider,
       onTask: () => {
         session = store.touch(session.sessionId);
+      },
+      onExecutionState: ({ status, recovery }) => {
+        session = store.update(session.sessionId, { status, recovery });
       },
     });
     await terminal.run();

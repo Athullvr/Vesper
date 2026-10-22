@@ -4,6 +4,7 @@ const { randomBytes } = require("node:crypto");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 const { AppServerClient } = require("./app-server-client");
+const { createExecutionProvider } = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { SessionStore } = require("./session-store");
@@ -11,7 +12,7 @@ const { resolveProjectDirectory } = require("./cli");
 const { createCapabilityProvider } = require("./capability-catalog");
 const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { createCapabilityPlan, getPlanningMetadata, renderCapabilityPlan } = require("./capability-planner");
-const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
+const { unavailableHistory } = require("./conversation-history");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
 
@@ -197,13 +198,13 @@ async function handlePrompt(prompt, targetPanel = panel) {
   activeCodexRequestId = requestId;
   activeRequestType = "turn";
   postToPanel(targetPanel, { type: "assistant-start", requestId });
-  if (session.threadId && !client.threadReady) {
+  if (session.providerConversationId && !client.getState().conversationReady) {
     setSessionView(targetPanel, {
       state: "restoring",
       text: "Restoring the saved Codex thread…",
       blocked: false,
     });
-  } else if (client.threadReady) {
+  } else if (client.getState().conversationReady) {
     setSessionView(targetPanel, {
       state: "connected",
       text: "Connected · using the active Vesper session.",
@@ -217,11 +218,12 @@ async function handlePrompt(prompt, targetPanel = panel) {
     });
   }
 
-  const onDelta = (delta) => {
-    if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
-      postToPanel(targetPanel, { type: "assistant-delta", requestId, text: delta });
+  const onExecutionEvent = (event) => {
+    if (event?.type === "text-delta" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      postToPanel(targetPanel, { type: "assistant-delta", requestId, text: event.text });
     }
   };
+  client.on("event", onExecutionEvent);
   let routingDecision;
   try {
     const planning = await getPlanningMetadata({
@@ -235,7 +237,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       handlers: localHandlers,
       context: { cwd, capabilities: capabilityProviderFor(cwd), planning },
       onRoutingDecision: (record) => { routingDecision = record; },
-      fallback: () => client.runTurn({ prompt, cwd, onDelta }),
+      fallback: () => client.submitTask({ task: prompt, projectPath: cwd }),
     });
     const result = routed.fallbackResult;
     const elapsedMs = Math.round(performance.now() - startedAt);
@@ -249,17 +251,22 @@ async function handlePrompt(prompt, targetPanel = panel) {
     } else {
       postToPanel(targetPanel, { type: "assistant-done", requestId, elapsedMs, usage: "session saved" });
     }
+    try { sessionStore.update(session.sessionId, { status: "active", recovery: null }); } catch { /* Keep the completed task result visible if metadata could not be refreshed. */ }
     if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
       setSessionView(targetPanel, { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false });
     }
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs, false, routingDecision);
-    writeLog(`request=${requestId} fallback=failed elapsed_ms=${elapsedMs} reason=${safeMessage(error)}`);
-    const interrupted = error.turnStatus === "interrupted";
-    const terminalTurnState = ["failed", "interrupted"].includes(error.turnStatus);
+    writeLog(`request=${requestId} fallback=failed elapsed_ms=${elapsedMs} code=${error.code || "TASK_FAILED"}`);
+    const interrupted = error.code === "TASK_INTERRUPTED";
+    const terminalTurnState = ["TASK_FAILED", "TASK_INTERRUPTED"].includes(error.code);
     if (!terminalTurnState) {
-      const canRetry = Boolean(client.threadId || session.threadId);
+      const recoveryCode = error.code === "SUBMISSION_OUTCOME_UNCERTAIN"
+        ? "submission-outcome-uncertain"
+        : error.code === "RESUME_FAILED" ? "resume-failed" : "connection-lost";
+      try { sessionStore.update(session.sessionId, { status: "recovery-required", recovery: { code: recoveryCode } }); } catch { /* Recovery UI remains available if metadata is not writable. */ }
+      const canRetry = Boolean(session.providerConversationId);
       setSessionView(targetPanel, {
         state: "recovery-required",
         text: canRetry
@@ -280,6 +287,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       elapsedMs,
     });
   } finally {
+    client.off("event", onExecutionEvent);
     if (activeCodexRequestId === requestId) {
       activeCodexRequestId = undefined;
       activeRequestType = undefined;
@@ -359,7 +367,7 @@ async function selectProject(targetPanel) {
 async function retryResume(targetPanel) {
   if (activeCodexRequestId !== undefined || !sessionView.canRetry) return;
   const project = selectedProjectContext();
-  if (!project.available || !selectedSession?.threadId) return;
+  if (!project.available || !selectedSession?.providerConversationId) return;
 
   const requestId = ++requestSequence;
   const session = selectedSession;
@@ -373,7 +381,7 @@ async function retryResume(targetPanel) {
   setSessionView(targetPanel, { state: "restoring", text: "Verifying the saved Codex thread…", blocked: true });
   postHistoryState(targetPanel, { state: "loading", text: "Restoring saved conversation history…", entries: [], truncated: false });
   try {
-    await client.resumeThread(project.path);
+    await client.recover({ projectPath: project.path, conversationId: session.providerConversationId });
     await loadHistoryForSession(targetPanel, { client, session, projectPath: project.path, generation, historyLoadId, requestId });
   } catch (error) {
     if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
@@ -444,60 +452,65 @@ function appServerForSession(session, cwd, generation) {
   if (appServer && appServerSessionId === session.sessionId) return appServer;
   disposeCurrentAppServer();
   const sessionId = session.sessionId;
-  const client = new AppServerClient({
-    initialThreadId: session.threadId,
-    sandbox: "read-only",
-    onThreadId: async (threadId) => {
-      const latest = sessionStore.load(sessionId);
-      if (latest.cwd !== cwd) throw new Error("The Vesper session belongs to a different project folder.");
-      if (latest.threadId && latest.threadId !== threadId) {
-        throw new Error("This Vesper session is already bound to another Codex thread.");
-      }
-      const saved = sessionStore.update(sessionId, { threadId });
-      if (selectedSession?.sessionId === sessionId && projectGeneration === generation) selectedSession = saved;
-    },
-    onApproval: async (method) => {
-      if (method === "item/permissions/requestApproval") return { permissions: {}, scope: "turn" };
-      if (method === "applyPatchApproval" || method === "execCommandApproval") {
-        return { decision: { denied: { rejection: "Vesper VS Code does not grant approvals." } } };
-      }
-      return { decision: "decline" };
+  if (session.providerId !== "codex-app-server") {
+    throw new Error(`This Vesper session belongs to unsupported provider ${safeMessage(session.providerId)}. Start a new conversation explicitly to use Codex.`);
+  }
+  const client = createExecutionProvider({
+    providerId: session.providerId,
+    clientFactory: (options) => new AppServerClient(options),
+    clientOptions: {
+      initialThreadId: session.providerConversationId,
+      sandbox: "read-only",
+      onThreadId: async (threadId) => {
+        const latest = sessionStore.load(sessionId);
+        if (latest.cwd !== cwd) throw new Error("The Vesper session belongs to a different project folder.");
+        if (latest.providerConversationId && latest.providerConversationId !== threadId) {
+          throw new Error("This Vesper session is already bound to another Codex thread.");
+        }
+        const saved = sessionStore.update(sessionId, {
+          providerConversationId: threadId,
+          status: "active",
+          recovery: null,
+        });
+        if (selectedSession?.sessionId === sessionId && projectGeneration === generation) selectedSession = saved;
+      },
     },
   });
-  client.on("progress", (event) => {
+  client.setApprovalHandler(async () => ({ choice: "decline" }));
+  client.on("event", (event) => {
     if (appServer !== client || appServerSessionId !== sessionId || projectGeneration !== generation ||
         selectedSession?.sessionId !== sessionId) return;
-    if (event.type === "thread_resuming") {
+    if (event.type === "conversation-state" && event.state === "resuming") {
       setSessionView(panel, {
         state: "restoring",
         text: historyLoadingSessionId === sessionId ? "Restoring the saved thread and conversation history…" : "Restoring the saved Codex thread…",
         blocked: historyLoadingSessionId === sessionId,
       });
-    } else if (event.type === "thread_resumed") {
+    } else if (event.type === "conversation-state" && event.state === "resumed") {
       if (historyLoadingSessionId === sessionId) {
         setSessionView(panel, { state: "restoring", text: "Saved thread verified; loading conversation history…", blocked: true });
       } else {
         setSessionView(panel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
       }
-    } else if (event.type === "thread_starting") {
+    } else if (event.type === "conversation-state" && event.state === "starting") {
       setSessionView(panel, { state: "connecting", text: "Starting a new read-only Codex thread…", blocked: false });
-    } else if (event.type === "thread_started") {
+    } else if (event.type === "conversation-state" && event.state === "created") {
       setSessionView(panel, { state: "connected", text: "Connected · new conversation started.", blocked: false });
-    } else if (event.type === "disconnected") {
+    } else if (event.type === "connection-lost") {
       setSessionView(panel, {
         state: "disconnected",
         text: "Codex disconnected. The saved session is kept; reconnect before sending another task.",
         blocked: true,
-        canRetry: Boolean(client.threadId),
+        canRetry: Boolean(client.getState().conversationId),
         canStartNew: true,
       });
-    } else if (event.type === "turn_started" && event.threadId === client.threadId && isSafeProtocolIdentity(event.turnId) &&
+    } else if (event.type === "task-started" && event.conversationId === client.getState().conversationId && isSafeProtocolIdentity(event.taskId) &&
         activeCodexRequestId !== undefined) {
       postToPanel(panel, {
         type: "assistant-running",
         requestId: activeCodexRequestId,
-        threadId: event.threadId,
-        turnId: event.turnId,
+        threadId: event.conversationId,
+        turnId: event.taskId,
         status: "inProgress",
       });
     }
@@ -596,8 +609,8 @@ function loadSelectedSession() {
         text: "No saved conversation for this folder. A Vesper session will be created when you send a Codex task.",
         blocked: false,
       };
-    } else if (selectedSession.threadId) {
-      sessionView = appServer?.threadReady && appServerSessionId === selectedSession.sessionId
+    } else if (selectedSession.providerConversationId) {
+      sessionView = appServer?.getState().conversationReady && appServerSessionId === selectedSession.sessionId
         ? { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false }
         : {
           state: "saved",
@@ -646,7 +659,7 @@ async function restoreSelectedHistory(targetPanel) {
     });
     return;
   }
-  if (!session?.threadId) {
+  if (!session?.providerConversationId) {
     postHistoryState(targetPanel, {
       state: "empty",
       entries: [],
@@ -674,7 +687,10 @@ async function restoreSelectedHistory(targetPanel) {
   });
 
   try {
-    if (!client.threadReady) await client.resumeThread(project.path);
+    if (!client.getState().conversationReady) await client.resumeConversation({
+      projectPath: project.path,
+      conversationId: session.providerConversationId,
+    });
     await loadHistoryForSession(targetPanel, {
       client,
       session,
@@ -691,15 +707,12 @@ async function restoreSelectedHistory(targetPanel) {
 
 async function loadHistoryForSession(targetPanel, { client, session, projectPath, generation, historyLoadId, requestId } = {}) {
   if (!isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId })) return false;
-  const result = await client.readThreadHistory();
+  const result = await client.readConversationHistory();
   if (!isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId })) return false;
-  if (result.threadId !== session.threadId) throw new Error("Codex returned history for a different thread.");
-
-  const projected = projectConversationHistory(result);
-  postHistoryState(targetPanel, projected);
+  postHistoryState(targetPanel, result);
   setSessionView(targetPanel, {
     state: "connected",
-    text: projected.state === "unavailable"
+    text: result.state === "unavailable"
       ? "Connected to the saved conversation; its history is unavailable. New tasks are available."
       : "Connected · saved Codex conversation restored.",
     blocked: false,
@@ -714,7 +727,8 @@ function showHistoryFailure(targetPanel, { client, session, generation, historyL
       isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId });
   if (!isCurrent) return;
 
-  const threadVerified = client.threadReady && client.threadId === session.threadId;
+  const providerState = client.getState();
+  const threadVerified = providerState.conversationReady && providerState.conversationId === session.providerConversationId;
   const historyError = unavailableHistory(safeMessage(error)).text;
   postHistoryState(targetPanel, unavailableHistory(threadVerified
     ? `The saved Codex thread is connected, but conversation history could not be retrieved: ${historyError}. Vesper has not treated it as empty.`
@@ -730,7 +744,7 @@ function showHistoryFailure(targetPanel, { client, session, generation, historyL
       state: "recovery-required",
       text: `Could not reconnect to the saved conversation: ${historyError}. The saved session was kept. Retry or explicitly start a new conversation.`,
       blocked: true,
-      canRetry: Boolean(session.threadId),
+      canRetry: Boolean(session.providerConversationId),
       canStartNew: true,
     });
   }
