@@ -93,9 +93,10 @@ class TerminalFrontend {
   }
 
   async run() {
-    this.write("Vesper · local routing with Codex app-server fallback\n");
+    this.write(`Vesper · local routing with ${this.providerDisplayName()} fallback\n`);
+    this.write(`Execution provider: ${this.providerDisplayName()}\n`);
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :capabilities status|show ID to inspect local status, :plan TASK for an advisory preview, :routing for session counts, and :quit to exit. Local answers do not start Codex turns.\n\n");
+    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :capabilities status|show ID to inspect local status, :plan TASK for an advisory preview, :routing for session counts, and :quit to exit. Local answers do not start provider tasks.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -192,7 +193,7 @@ class TerminalFrontend {
         onRoutingDecision: (record) => {
           routingDecision = record;
           this.writeRoutingDecision(record);
-          this.write("[Codex · connecting]\n");
+          this.write(`[${this.providerShortName()} · connecting]\n`);
         },
         fallback: async () => {
           await this.restoreSavedHistory();
@@ -202,23 +203,31 @@ class TerminalFrontend {
       const result = routed.fallbackResult;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs, { routingDecision: routed.routingDecision });
-      await this.onExecutionState?.({ status: "active", recovery: null });
+      const uncertainInterrupt = result?.status === "interrupted" && result?.recoveryCode === "submission-outcome-uncertain";
+      await this.onExecutionState?.(uncertainInterrupt
+        ? { status: "recovery-required", recovery: { code: result.recoveryCode } }
+        : { status: "active", recovery: null });
       this.finishStream();
-      if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
+      if (result?.status === "completed" && this.executionProvider.id === "openai-chat-completions") {
+        this.write(`\n\n[OpenAI text generated · not executed · files unchanged${result.truncated ? " · response truncated" : ""} · ${elapsedMs} ms]\n`);
+      } else if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
+      else if (result?.status === "interrupted" && uncertainInterrupt) this.write("\n\n[OpenAI request interrupted locally · remote completion unknown · start a new conversation to continue]\n");
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
       else if (result?.status === "timeout") this.write("\n\n[Codex · timed out and interrupted]\n");
-      else this.write(`\n\n[Codex · ended with status ${safeTerminalText(result?.status || "unknown")}]\n`);
+      else this.write(`\n\n[${this.providerShortName()} · ended with status ${safeTerminalText(result?.status || "unknown")}]\n`);
     } catch (error) {
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs, { routingDecision });
-      if (["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "RESUME_FAILED", "SUBMISSION_OUTCOME_UNCERTAIN"].includes(error?.code)) {
-        const recoveryCode = error.code === "SUBMISSION_OUTCOME_UNCERTAIN"
+      if (["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "RESUME_FAILED", "SUBMISSION_OUTCOME_UNCERTAIN", "UNSUPPORTED_OPERATION"].includes(error?.code)) {
+        const recoveryCode = error.code === "UNSUPPORTED_OPERATION"
+          ? "unsupported-operation"
+          : error.code === "SUBMISSION_OUTCOME_UNCERTAIN"
           ? "submission-outcome-uncertain"
           : error.code === "RESUME_FAILED" ? "resume-failed" : "connection-lost";
         try { await this.onExecutionState?.({ status: "recovery-required", recovery: { code: recoveryCode } }); } catch { /* Report the provider error even if metadata could not be refreshed. */ }
       }
       this.finishStream();
-      this.write(`\n\n[Codex error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
+      this.write(`\n\n[${this.providerShortName()} error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
     } finally {
       this.finishStream();
       this.turnDiffView.end();
@@ -230,6 +239,18 @@ class TerminalFrontend {
       }
       if (this.exitAfterTurn) this.lineIO.close?.();
     }
+  }
+
+  providerShortName() {
+    return this.executionProvider.id === "openai-chat-completions" ? "OpenAI" : "Codex";
+  }
+
+  providerDisplayName() {
+    const state = this.executionProvider.getState?.() || {};
+    if (this.executionProvider.id === "openai-chat-completions") {
+      return `OpenAI API${state.model ? ` · ${safeTerminalText(state.model)}` : ""} (text only)`;
+    }
+    return "Codex app-server";
   }
 
   requestApproval(request, params, context) {
@@ -450,10 +471,11 @@ class TerminalFrontend {
     switch (event.type) {
       case "text-delta": this.writeStreamDelta(event.text); break;
       case "conversation-state":
-        if (event.state === "starting") this.write("[Codex] Starting a thread…\n");
-        else if (event.state === "resuming") this.write("[Codex] Resuming the saved thread…\n");
+        if (event.state === "starting") this.write(`[${this.providerShortName()}] Starting a conversation…\n`);
+        else if (event.state === "created") this.write(`[${this.providerShortName()}] Conversation ready.\n`);
+        else if (event.state === "resuming") this.write(`[${this.providerShortName()}] Resuming the saved conversation…\n`);
         break;
-      case "task-started": this.write("[Codex] Working…\n"); break;
+      case "task-started": this.write(`[${this.providerShortName()}] Working…\n`); break;
       case "task-identity":
         this.turnDiffIdentity = isTurnDiffIdentity(event.conversationId, event.taskId)
           ? { threadId: event.conversationId, turnId: event.taskId }
@@ -479,8 +501,8 @@ class TerminalFrontend {
           this.write(`[Vesper] File-change approval declined: ${safeTerminalText(event.message)}\n`);
         }
         break;
-      case "connection-lost": this.write(`[Codex disconnected] ${safeTerminalText(event.message || "provider connection closed")}\n`); break;
-      case "interrupt-requested": this.write("[Vesper] Interrupting the Codex turn…\n"); break;
+      case "connection-lost": this.write(`[${this.providerShortName()} disconnected] ${safeTerminalText(event.message || "provider connection closed")}\n`); break;
+      case "interrupt-requested": this.write(`[Vesper] Interrupting the ${this.providerShortName()} task…\n`); break;
       default: break;
     }
   }

@@ -38,6 +38,87 @@ test("VS Code keeps local routing local and persists only the Vesper session and
   assert.equal(panel.last("session-state").state, "connected");
 });
 
+test("VS Code can select OpenAI and labels normalized output as generated text, not executed", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-openai-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const previousFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, authorization: options.headers.Authorization, body: JSON.parse(options.body) });
+    const events = [
+      { choices: [{ delta: { content: "Remote guidance." }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ].map((item) => `data: ${JSON.stringify(item)}\n\n`).join("");
+    return new Response(`${events}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  t.after(() => { globalThis.fetch = previousFetch; });
+
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    environment: {
+      VESPER_PROVIDER: "openai-chat-completions",
+      OPENAI_API_KEY: "fixture-only-secret",
+      VESPER_OPENAI_MODEL: "fixture-model",
+      VESPER_OPENAI_BASE_URL: "https://api.fixture.test/v1",
+      VESPER_OPENAI_TIMEOUT_MS: "4000",
+    },
+  });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  assert.equal(panel.last("provider-info").providerId, "openai-chat-completions");
+  await panel.send({ type: "submit", text: "Explain this API shape." });
+
+  assert.equal(panel.all("assistant-delta").map((message) => message.text).join(""), "Remote guidance.");
+  assert.equal(panel.last("assistant-done").generatedTextOnly, true);
+  assert.equal(panel.last("assistant-done").model, "fixture-model");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.fixture.test/v1/chat/completions");
+  assert.equal(calls[0].authorization, "Bearer fixture-only-secret");
+  assert.equal(JSON.stringify(calls[0].body).includes(fs.realpathSync(project)), false);
+  const session = harness.store().findLatestByCwd(fs.realpathSync(project));
+  assert.equal(session.providerId, "openai-chat-completions");
+  assert.match(session.providerConversationId, /^oai_[0-9a-f-]{36}$/u);
+  assert.doesNotMatch(fs.readFileSync(path.join(harness.home, "sessions", `${session.sessionId}.json`), "utf8"), /Explain this API shape|fixture-only-secret/u);
+
+  const webview = mountWebview(panel.html);
+  webview.dispatch(panel.last("provider-info"));
+  webview.dispatch({ type: "assistant-start", requestId: 1, providerId: "openai-chat-completions" });
+  webview.dispatch({ type: "assistant-delta", requestId: 1, text: "Remote guidance." });
+  webview.dispatch(panel.last("assistant-done"));
+  assert.match(webview.elements.get("messages").children[0].children[0].textContent, /generated text · not executed · files unchanged/u);
+  assert.match(webview.elements.get("status").textContent, /text generated, not executed/u);
+  assert.match(webview.elements.get("provider-privacy").textContent, /OpenAI receives submitted task and saved conversation text only/u);
+  assert.match(panel.html, /project files are not sent/u);
+});
+
+test("VS Code keeps a saved provider and uses VESPER_PROVIDER only for a new session", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-provider-resume-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    environment: {
+      VESPER_PROVIDER: "openai-chat-completions",
+      OPENAI_API_KEY: "fixture-only-secret",
+      VESPER_OPENAI_MODEL: "fixture-model",
+      VESPER_OPENAI_BASE_URL: "https://api.fixture.test/v1",
+    },
+  });
+  const saved = harness.store().create(fs.realpathSync(project), { providerId: "codex-app-server" });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  assert.equal(panel.last("provider-info").providerId, "codex-app-server");
+  assert.match(panel.last("session-state").text, /first Codex app-server conversation/u);
+
+  await panel.send({ type: "start-new-session" });
+  const sessions = harness.store().listByCwd(fs.realpathSync(project));
+  assert.equal(sessions.length, 2);
+  assert.ok(sessions.some((session) => session.sessionId === saved.sessionId && session.providerId === "codex-app-server"));
+  assert.equal(harness.store().findLatestByCwd(fs.realpathSync(project)).providerId, "openai-chat-completions");
+  assert.equal(panel.last("provider-info").providerId, "openai-chat-completions");
+});
+
 test("VS Code Plan preview uses the panel bridge without starting a Codex thread or logging task text", async (t) => {
   const root = makeTempDirectory("vesper-vscode-plan-preview-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -505,7 +586,9 @@ test("approval refusals and the read-only sandbox remain active in the persisten
 function createHarness(t, folders, options = {}) {
   const home = makeTempDirectory("vesper-vscode-home-");
   const previousHome = process.env.VESPER_HOME;
+  const previousEnvironment = Object.fromEntries(Object.keys(options.environment || {}).map((key) => [key, process.env[key]]));
   process.env.VESPER_HOME = home;
+  for (const [key, value] of Object.entries(options.environment || {})) process.env[key] = value;
   const state = {
     requests: [],
     serverRequests: [],
@@ -739,6 +822,10 @@ function createHarness(t, folders, options = {}) {
     for (const subscription of context?.subscriptions || []) subscription.dispose?.();
     if (previousHome === undefined) delete process.env.VESPER_HOME;
     else process.env.VESPER_HOME = previousHome;
+    for (const [key, value] of Object.entries(previousEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     childProcess.execFile = originalExecFile;
     childProcess.spawn = originalSpawn;
     Module._load = originalLoad;
@@ -793,7 +880,7 @@ function mountWebview(html) {
   const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/u)?.[1];
   assert.equal(typeof script, "string", "the panel HTML contains its nonce-bound script");
   const ids = [
-    "messages", "status", "form", "prompt", "preview-plan", "send", "stop", "choose-project", "project-name",
+    "messages", "status", "provider-info", "provider-privacy", "form", "prompt", "preview-plan", "send", "stop", "choose-project", "project-name",
     "project-path", "session-state", "history-state", "recovery-actions", "retry-resume", "start-new-session",
   ];
   const elements = new Map(ids.map((id) => [id, new MockElement(id)]));

@@ -4,9 +4,16 @@ const fs = require("node:fs");
 const { execFile } = require("node:child_process");
 const path = require("node:path");
 const readline = require("node:readline/promises");
-const { createExecutionProvider } = require("./execution-provider");
+const {
+  DEFAULT_PROVIDER_ID,
+  OPENAI_PROVIDER_ID,
+  createExecutionProvider,
+  getProviderStatus,
+  listProviders,
+  resolveDefaultProviderId,
+} = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
-const { MAX_SESSION_LIST_ENTRIES, SessionStore } = require("./session-store");
+const { MAX_SESSION_LIST_ENTRIES, SessionStore, defaultSessionDirectory } = require("./session-store");
 const { discoverMcp, discoverPlugins, discoverSkills, renderDiscovery, runCodexCommand } = require("./integration-discovery");
 const {
   buildCapabilityCatalog,
@@ -32,6 +39,9 @@ Usage:
   vesper sessions list [PROJECT_DIRECTORY]
   vesper sessions resume SESSION_ID [PROJECT_DIRECTORY]
   vesper sessions new [PROJECT_DIRECTORY]
+  vesper providers
+  vesper providers status [--provider PROVIDER_ID] [--check]
+  vesper --provider PROVIDER_ID [--new] [PROJECT_DIRECTORY]
   vesper plugins [PROJECT_DIRECTORY]
   vesper mcp [PROJECT_DIRECTORY]
   vesper skills [PROJECT_DIRECTORY]
@@ -53,6 +63,9 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 :new to start another session, :capabilities status|show ID to inspect local capability state,
 :plan TASK to preview an advisory plan, :routing to inspect current-session routing counts, and :quit to exit.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
+
+Codex remains the default provider. OpenAI Chat Completions sends task text and its locally stored
+conversation only; it does not read project files, run commands, apply code, or verify changes.
 
 The plugins, mcp, and skills commands are read-only. Capabilities combines their local discovery
 results and can use documented Codex CLI commands for confirmed plugin and MCP changes. Vesper never
@@ -95,12 +108,35 @@ an existing Vesper session to view passive MCP startup notifications from its cu
 
 function parseArgs(argv) {
   const args = [...argv];
+  if (args[0] === "providers") return parseProvidersArgs(args.slice(1));
   if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
   if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
   if (args[0] === "plan") return parsePlanArgs(args.slice(1));
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
   return parseRunArgs(args);
+}
+
+function parseProvidersArgs(args) {
+  if (!args.length) return { command: "providers", action: "list", help: false };
+  if (args[0] === "--help" || args[0] === "-h") return { command: "providers", help: true };
+  if (args[0] !== "status") throw new Error("Usage: vesper providers [status [--provider PROVIDER_ID] [--check]].");
+  let providerId = null;
+  let check = false;
+  for (let index = 1; index < args.length; index += 1) {
+    if (args[index] === "--check") {
+      if (check) throw new Error("Use --check only once.");
+      check = true;
+    } else if (args[index] === "--provider") {
+      if (providerId) throw new Error("Use --provider only once.");
+      providerId = args[index + 1];
+      if (!providerId || !/^[a-z][a-z0-9-]{0,79}$/u.test(providerId)) throw new Error("--provider requires a provider id.");
+      index += 1;
+    } else {
+      throw new Error(`Unknown providers option: ${safeTerminalText(args[index])}.`);
+    }
+  }
+  return { command: "providers", action: "status", providerId, check, help: false };
 }
 
 function parsePlanArgs(args) {
@@ -216,6 +252,7 @@ function parseRunArgs(argv) {
 
   let newSession = false;
   let resumeId = null;
+  let providerId = null;
   let help = false;
   const positional = [];
 
@@ -229,6 +266,11 @@ function parseRunArgs(argv) {
       if (!value || value.startsWith("-")) throw new Error("--resume requires a Vesper session id.");
       resumeId = value;
       index += 1;
+    } else if (arg === "--provider") {
+      if (providerId !== null) throw new Error("Use --provider only once.");
+      providerId = args[index + 1];
+      if (!providerId || !/^[a-z][a-z0-9-]{0,79}$/u.test(providerId)) throw new Error("--provider requires a provider id.");
+      index += 1;
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${safeTerminalText(arg)}`);
     } else {
@@ -238,7 +280,7 @@ function parseRunArgs(argv) {
 
   if (newSession && resumeId) throw new Error("Use either --new or --resume, not both.");
   if (positional.length > 1) throw new Error("Provide at most one project directory.");
-  return { command: "run", newSession, resumeId, help, projectDirectory: positional[0] || null };
+  return { command: "run", newSession, resumeId, help, projectDirectory: positional[0] || null, ...(providerId ? { providerId } : {}) };
 }
 
 function parseSessionsArgs(args) {
@@ -301,10 +343,11 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) supplies the key.\n  VESPER_OPENAI_MODEL selects the model; VESPER_OPENAI_BASE_URL optionally selects an OpenAI-compatible endpoint.\n  VESPER_PROVIDER selects the default for new sessions.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
+  if (options.command === "providers") return runProviders(options, dependencies, output, errorOutput);
   if (options.command === "plan") return runPlan(options, dependencies, output, errorOutput);
 
   if (options.command === "capabilities") {
@@ -339,6 +382,62 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   return runInteractiveVesper(options, dependencies, output, errorOutput);
+}
+
+async function runProviders(options, dependencies, output, errorOutput) {
+  const environment = dependencies.environment || process.env;
+  const selectedProviderId = resolveDefaultProviderId(environment);
+  if (options.action === "list") {
+    output.write(`Selected provider for new sessions: ${safeCliField(selectedProviderId)}\n`);
+    output.write("Available providers:\n");
+    for (const provider of listProviders()) {
+      const marker = provider.id === selectedProviderId ? " · selected" : "";
+      output.write(`- ${safeCliField(provider.id)} · ${safeCliField(provider.name)}${marker}\n`);
+      output.write(`  ${safeCliField(provider.description)}\n`);
+    }
+    output.write("Listing providers does not contact any provider. Use vesper providers status --provider openai-chat-completions --check for an explicit GET /models connectivity check.\n");
+    return 0;
+  }
+
+  const providerId = options.providerId || selectedProviderId;
+  let provider;
+  try {
+    const status = getProviderStatus(providerId, environment);
+    output.write(`Provider: ${safeCliField(status.name)} (${safeCliField(status.id)})\n`);
+    output.write(`Selected for new sessions: ${status.id === selectedProviderId ? "yes" : "no"}\n`);
+    output.write(`Configured: ${status.configured === null ? "unknown (Codex CLI status not checked)" : status.configured ? "yes" : "no"}\n`);
+    if (status.model) output.write(`Model: ${safeCliField(status.model)}\n`);
+    if (status.apiKeyEnvVar) output.write(`API key: ${status.apiKeyConfigured ? "present" : "missing"} (${safeCliField(status.apiKeyEnvVar)}; value hidden)\n`);
+    output.write(`Reachability: ${options.check ? "check requested" : status.reachability}\n`);
+    output.write("Operations:\n");
+    for (const [operation, supported] of Object.entries(status.capabilities)) {
+      output.write(`- ${safeCliField(operation)}: ${supported ? "supported" : "unsupported"}\n`);
+    }
+    for (const message of status.configurationMessages || []) output.write(`Configuration: ${safeCliField(message)}\n`);
+    if (!options.check) {
+      output.write("No network or app-server connectivity check was performed. Add --check to request one explicitly.\n");
+      return status.configured === false ? 1 : 0;
+    }
+    const cwd = resolveProjectDirectory(dependencies.projectDirectory || process.cwd());
+    const providerFactory = dependencies.executionProviderFactory || createExecutionProvider;
+    provider = providerFactory({
+      providerId,
+      environment,
+      ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}),
+      ...(dependencies.conversationDirectory ? { conversationDirectory: dependencies.conversationDirectory } : {}),
+      ...(dependencies.clientFactory ? { clientFactory: dependencies.clientFactory } : {}),
+      ...(dependencies.clientOptions ? { clientOptions: dependencies.clientOptions } : {}),
+    });
+    const check = await provider.initialize({ projectPath: cwd, checkConnection: true });
+    output.write(`Reachability: yes · configured model ${check.modelAvailable ? "listed" : "not listed"}\n`);
+    return check.modelAvailable ? 0 : 1;
+  } catch (error) {
+    const reachability = provider?.getState?.().reachability === "yes" ? "yes · API check failed" : "no";
+    output.write(`Reachability: ${reachability} · ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  } finally {
+    provider?.dispose?.();
+  }
 }
 
 async function runPlan(options, dependencies, output, errorOutput) {
@@ -502,6 +601,9 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
   let executionProvider;
   try {
     const store = dependencies.store || new SessionStore();
+    const environment = dependencies.environment || process.env;
+    const environmentProvider = typeof environment.VESPER_PROVIDER === "string" ? environment.VESPER_PROVIDER.trim() : "";
+    const requestedProviderId = options.providerId || dependencies.providerId || null;
     let session;
     let cwd;
     let resumed = false;
@@ -511,18 +613,29 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       const selectedCwd = options.projectDirectory ? resolveProjectDirectory(options.projectDirectory) : storedCwd;
       if (selectedCwd !== storedCwd) throw new Error("The selected directory does not match this saved Vesper session.");
       cwd = storedCwd;
+      if (requestedProviderId && requestedProviderId !== session.providerId) {
+        throw new Error(`Session ${session.sessionId} belongs to provider ${session.providerId}; selected provider is ${requestedProviderId}. Resume with --provider ${session.providerId}, or use --new to create a separate session.`);
+      }
       resumed = true;
     } else {
       cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
       session = options.newSession ? null : store.findLatestByCwd(cwd);
+      if (session && requestedProviderId && requestedProviderId !== session.providerId) {
+        throw new Error(`The latest session for this project belongs to provider ${session.providerId}; selected provider is ${requestedProviderId}. Use --new to create a separate session, or select the saved provider.`);
+      }
       resumed = Boolean(session);
-      if (!session) session = store.create(cwd);
+      if (!session) {
+        const newProviderId = requestedProviderId || environmentProvider || DEFAULT_PROVIDER_ID;
+        if (!listProviders().some((provider) => provider.id === newProviderId)) throw new Error(`Unsupported provider ${safeCliField(newProviderId)}. Run vesper providers to see supported providers.`);
+        session = store.create(cwd, { providerId: newProviderId });
+      }
     }
 
     output.write(`Vesper session: ${session.sessionId}\n`);
     const sessionStatus = resumed ? "resumed" : "new";
-    const threadStatus = session.providerConversationId ? "saved Codex thread" : "no Codex thread yet";
-    output.write(`Session status: ${sessionStatus} · ${threadStatus}\n`);
+    const conversationStatus = providerConversationLabel(session);
+    output.write(`Session status: ${sessionStatus} · ${conversationStatus}\n`);
+    output.write(`Execution provider: ${safeCliField(session.providerId)}${session.providerId === OPENAI_PROVIDER_ID && environment.VESPER_OPENAI_MODEL ? ` · model ${safeCliField(environment.VESPER_OPENAI_MODEL)}` : ""}\n`);
     output.write(`Project: ${safeCliField(cwd)}\n`);
 
     let terminal;
@@ -532,25 +645,32 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       const conversationId = selectedSession.providerConversationId !== undefined
         ? selectedSession.providerConversationId
         : selectedSession.threadId || null;
-      if (providerId !== "codex-app-server") {
-        throw new Error(`This session belongs to unsupported provider ${safeCliField(providerId || "unknown")}. Start an explicit new session to use Codex.`);
+      if (!listProviders().some((provider) => provider.id === providerId)) {
+        throw new Error(`This Vesper session belongs to unsupported provider ${safeCliField(providerId || "unknown")}. Select a supported provider in a new session; Vesper will not change the saved session provider.`);
       }
-      return providerFactory({
+      const providerOptions = {
         providerId,
-        ...(dependencies.clientFactory ? { clientFactory: dependencies.clientFactory } : {}),
-        clientOptions: {
+        environment,
+        onConversationId: async (conversationId) => {
+          const updated = store.update(selectedSession.sessionId, {
+            providerConversationId: conversationId,
+            status: "active",
+            recovery: null,
+          });
+          if (session.sessionId === selectedSession.sessionId) session = updated;
+        },
+      };
+      if (providerId === OPENAI_PROVIDER_ID) {
+        providerOptions.conversationDirectory = dependencies.conversationDirectory || path.join(store.directory || defaultSessionDirectory(), "provider-conversations");
+        providerOptions.fetchImpl = dependencies.fetchImpl || globalThis.fetch;
+      } else {
+        if (dependencies.clientFactory) providerOptions.clientFactory = dependencies.clientFactory;
+        providerOptions.clientOptions = {
           ...(dependencies.clientOptions || {}),
           initialThreadId: conversationId,
-          onThreadId: async (threadId) => {
-            const updated = store.update(selectedSession.sessionId, {
-              providerConversationId: threadId,
-              status: "active",
-              recovery: null,
-            });
-            if (session.sessionId === selectedSession.sessionId) session = updated;
-          },
-        },
-      });
+        };
+      }
+      return providerFactory(providerOptions);
     };
     executionProvider = createProvider(session);
 
@@ -569,7 +689,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       session = selectedSession;
       executionProvider = nextClient;
       previousClient?.dispose?.();
-      output.write(`\n[Vesper] ${action}: ${safeCliField(session.sessionId)} · ${session.providerConversationId ? "saved Codex thread" : "no Codex thread yet"}\n`);
+      output.write(`\n[Vesper] ${action}: ${safeCliField(session.sessionId)} · ${providerConversationLabel(session)} · ${safeCliField(session.providerId)}\n`);
       output.write(`Project: ${safeCliField(cwd)}\n`);
       if (session.providerConversationId) {
         try {
@@ -634,14 +754,19 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         if (!sessions.length) output.write("No Vesper sessions found for this project.\n");
         for (const item of sessions) {
           const current = item.sessionId === session.sessionId ? " · current" : "";
-          const thread = item.providerConversationId ? "saved Codex thread" : "no Codex thread";
-          output.write(`${safeCliField(item.sessionId)}  ${safeCliField(item.updatedAt)}  ${thread}${current}\n`);
+          const conversation = providerConversationLabel(item);
+          output.write(`${safeCliField(item.sessionId)}  ${safeCliField(item.updatedAt)}  ${safeCliField(item.providerId)} · ${conversation}${current}\n`);
         }
         output.write("Use :switch SESSION_ID to resume one.\n");
         return true;
       }
       if (name === ":new" && args.length === 0) {
-        await activateSession(store.create(cwd), "New session");
+        const newProviderId = requestedProviderId || environmentProvider || DEFAULT_PROVIDER_ID;
+        if (!listProviders().some((provider) => provider.id === newProviderId)) {
+          output.write(`[Vesper] Unsupported provider ${safeCliField(newProviderId)}. Run vesper providers to see supported providers.\n`);
+          return true;
+        }
+        await activateSession(store.create(cwd, { providerId: newProviderId }), "New session");
         return true;
       }
       if (name === ":switch" && args.length === 1) {
@@ -714,6 +839,11 @@ function runGitCommand(args, cwd) {
 
 function safeCliField(value) {
   return safeTerminalText(value);
+}
+
+function providerConversationLabel(session) {
+  if (session.providerId === DEFAULT_PROVIDER_ID) return session.providerConversationId ? "saved Codex thread" : "no Codex thread yet";
+  return session.providerConversationId ? "saved provider conversation" : "no provider conversation yet";
 }
 
 module.exports = {

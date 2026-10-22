@@ -3,10 +3,10 @@ const { execFile } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
-const { createExecutionProvider } = require("./execution-provider");
+const { DEFAULT_PROVIDER_ID, OPENAI_PROVIDER_ID, createExecutionProvider, listProviders, resolveDefaultProviderId } = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
-const { SessionStore } = require("./session-store");
+const { SessionStore, defaultSessionDirectory } = require("./session-store");
 const { resolveProjectDirectory } = require("./cli");
 const { createCapabilityProvider } = require("./capability-catalog");
 const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
@@ -178,10 +178,11 @@ async function handlePrompt(prompt, targetPanel = panel) {
 
   try {
     if (!selectedSession) {
-      selectedSession = sessionStore.create(cwd);
+      const providerId = selectedProviderForNewSession();
+      selectedSession = sessionStore.create(cwd, { providerId });
       sessionView = {
         state: "new",
-        text: "New Vesper session created. Codex will start a read-only thread for this folder.",
+        text: `New Vesper session created for ${providerDisplayName(providerId)}.`,
         blocked: false,
       };
       postSessionView(targetPanel);
@@ -196,11 +197,12 @@ async function handlePrompt(prompt, targetPanel = panel) {
   const client = executionProviderForSession(session, cwd, generation);
   activeCodexRequestId = requestId;
   activeRequestType = "turn";
-  postToPanel(targetPanel, { type: "assistant-start", requestId });
+  postToPanel(targetPanel, { type: "assistant-start", requestId, providerId: session.providerId });
+  const providerName = providerSessionName(session.providerId);
   if (session.providerConversationId && !client.getState().conversationReady) {
     setSessionView(targetPanel, {
       state: "restoring",
-      text: "Restoring the saved Codex thread…",
+      text: `Restoring the saved ${providerName} conversation…`,
       blocked: false,
     });
   } else if (client.getState().conversationReady) {
@@ -212,7 +214,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
   } else {
     setSessionView(targetPanel, {
       state: "connecting",
-      text: "Connecting to Codex and starting this Vesper session…",
+      text: `Connecting to ${providerName} for this Vesper session…`,
       blocked: false,
     });
   }
@@ -245,14 +247,32 @@ async function handlePrompt(prompt, targetPanel = panel) {
     if (result.status === "interrupted" || result.status === "timeout") {
       postToPanel(targetPanel, {
         type: "assistant-error", requestId, state: result.status,
-        text: result.status === "timeout" ? "Codex turn timed out." : "Turn interrupted.", elapsedMs,
+        providerId: session.providerId,
+        text: result.status === "timeout" ? `${providerName} task timed out.` : session.providerId === OPENAI_PROVIDER_ID
+          ? "The request was interrupted locally. The remote service may have completed it; Vesper did not resubmit it. Start a new conversation to continue."
+          : "Turn interrupted.", elapsedMs,
       });
     } else {
-      postToPanel(targetPanel, { type: "assistant-done", requestId, elapsedMs, usage: "session saved" });
+      postToPanel(targetPanel, {
+        type: "assistant-done", requestId, elapsedMs, usage: "session saved",
+        providerId: session.providerId,
+        model: client.getState().model || null,
+        generatedTextOnly: session.providerId === OPENAI_PROVIDER_ID,
+        truncated: Boolean(result.truncated),
+      });
     }
-    try { sessionStore.update(session.sessionId, { status: "active", recovery: null }); } catch { /* Keep the completed task result visible if metadata could not be refreshed. */ }
+    const uncertainInterrupt = result.status === "interrupted" && result.recoveryCode === "submission-outcome-uncertain";
+    try {
+      sessionStore.update(session.sessionId, uncertainInterrupt
+        ? { status: "recovery-required", recovery: { code: "submission-outcome-uncertain" } }
+        : { status: "active", recovery: null });
+    } catch { /* Keep the task result visible if metadata could not be refreshed. */ }
     if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
-      setSessionView(targetPanel, { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false });
+      setSessionView(targetPanel, uncertainInterrupt
+        ? { state: "recovery-required", text: "The remote request may have completed. Its transcript is retained, and this conversation cannot be submitted again safely.", blocked: true, canStartNew: true }
+        : { state: "connected", text: session.providerId === OPENAI_PROVIDER_ID
+          ? "OpenAI · this Vesper session is saved."
+          : "Connected · this Vesper session is saved.", blocked: false });
     }
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
@@ -263,14 +283,17 @@ async function handlePrompt(prompt, targetPanel = panel) {
     if (!terminalTurnState) {
       const recoveryCode = error.code === "SUBMISSION_OUTCOME_UNCERTAIN"
         ? "submission-outcome-uncertain"
-        : error.code === "RESUME_FAILED" ? "resume-failed" : "connection-lost";
+        : error.code === "UNSUPPORTED_OPERATION" ? "unsupported-operation"
+          : error.code === "RESUME_FAILED" ? "resume-failed" : "connection-lost";
       try { sessionStore.update(session.sessionId, { status: "recovery-required", recovery: { code: recoveryCode } }); } catch { /* Recovery UI remains available if metadata is not writable. */ }
-      const canRetry = Boolean(session.providerConversationId);
+      const canRetry = Boolean(session.providerConversationId && client.capabilities.recovery);
       setSessionView(targetPanel, {
         state: "recovery-required",
-        text: canRetry
-          ? "Connection failed before Vesper could confirm whether the task completed. The saved session identity was kept; reconnect before sending another task."
-          : "Codex did not confirm the new thread. Start a new conversation explicitly before sending another task.",
+        text: error.code === "UNSUPPORTED_OPERATION"
+          ? `${providerName} returned an operation Vesper does not execute. This conversation is blocked; start a new conversation to continue.`
+          : canRetry
+          ? `Connection failed before Vesper could confirm whether the ${providerName} task completed. The saved session identity was kept; reconnect before sending another task.`
+          : `${providerName} did not confirm the new conversation. Start a new conversation explicitly before sending another task.`,
         blocked: true,
         canRetry,
         canStartNew: true,
@@ -282,7 +305,8 @@ async function handlePrompt(prompt, targetPanel = panel) {
       type: "assistant-error",
       requestId,
       state: interrupted ? "interrupted" : "failed",
-      text: interrupted ? "Turn interrupted." : `Codex fallback failed: ${safeMessage(error)}`,
+      providerId: session.providerId,
+      text: interrupted ? "Turn interrupted." : `${providerName} task failed: ${safeMessage(error)}`,
       elapsedMs,
     });
   } finally {
@@ -411,19 +435,19 @@ function startNewSession(targetPanel) {
     const previousSessionId = selectedSession?.sessionId;
     invalidateHistoryLoad();
     disposeCurrentAppServer();
-    selectedSession = sessionStore.create(project.path);
+    selectedSession = sessionStore.create(project.path, { providerId: selectedProviderForNewSession() });
     sessionLookupError = undefined;
     sessionView = {
       state: "new",
       text: previousSessionId
         ? "A new Vesper session was created. The previous saved session was retained."
-        : "New Vesper session created. Codex will start a read-only thread for this folder.",
+        : `New Vesper session created for ${providerDisplayName(selectedSession.providerId)}.`,
       blocked: false,
     };
     postSessionView(targetPanel);
     postHistoryState(targetPanel, {
       state: "empty",
-      text: "This new Vesper session has no saved Codex conversation history yet.",
+      text: "This new Vesper session has no saved provider conversation history yet.",
       entries: [],
       truncated: false,
     });
@@ -451,53 +475,61 @@ function executionProviderForSession(session, cwd, generation) {
   if (executionProvider && executionProviderSessionId === session.sessionId) return executionProvider;
   disposeCurrentAppServer();
   const sessionId = session.sessionId;
-  if (session.providerId !== "codex-app-server") {
-    throw new Error(`This Vesper session belongs to unsupported provider ${safeMessage(session.providerId)}. Start a new conversation explicitly to use Codex.`);
+  if (!listProviders().some((provider) => provider.id === session.providerId)) {
+    throw new Error(`This Vesper session belongs to unsupported provider ${safeMessage(session.providerId)}. Vesper kept its provider mapping; select a supported provider in a new session.`);
   }
-  const client = createExecutionProvider({
+  const providerOptions = {
     providerId: session.providerId,
-    clientOptions: {
+    environment: process.env,
+    onConversationId: async (conversationId) => {
+      const latest = sessionStore.load(sessionId);
+      if (latest.cwd !== cwd || latest.providerId !== session.providerId) throw new Error("The Vesper session project or provider identity changed.");
+      if (latest.providerConversationId && latest.providerConversationId !== conversationId) {
+        throw new Error("This Vesper session is already bound to another provider conversation.");
+      }
+      const saved = sessionStore.update(sessionId, {
+        providerConversationId: conversationId,
+        status: "active",
+        recovery: null,
+      });
+      if (selectedSession?.sessionId === sessionId && projectGeneration === generation) selectedSession = saved;
+    },
+  };
+  if (session.providerId === OPENAI_PROVIDER_ID) {
+    providerOptions.conversationDirectory = path.join(sessionStore.directory || defaultSessionDirectory(), "provider-conversations");
+  } else {
+    providerOptions.clientOptions = {
       initialThreadId: session.providerConversationId,
       sandbox: "read-only",
-      onThreadId: async (threadId) => {
-        const latest = sessionStore.load(sessionId);
-        if (latest.cwd !== cwd) throw new Error("The Vesper session belongs to a different project folder.");
-        if (latest.providerConversationId && latest.providerConversationId !== threadId) {
-          throw new Error("This Vesper session is already bound to another Codex thread.");
-        }
-        const saved = sessionStore.update(sessionId, {
-          providerConversationId: threadId,
-          status: "active",
-          recovery: null,
-        });
-        if (selectedSession?.sessionId === sessionId && projectGeneration === generation) selectedSession = saved;
-      },
-    },
-  });
-  client.setApprovalHandler(async () => ({ choice: "decline" }));
+    };
+  }
+  const client = createExecutionProvider(providerOptions);
+  if (client.capabilities.approvalEvents) client.setApprovalHandler(async () => ({ choice: "decline" }));
   client.on("event", (event) => {
     if (executionProvider !== client || executionProviderSessionId !== sessionId || projectGeneration !== generation ||
         selectedSession?.sessionId !== sessionId) return;
     if (event.type === "conversation-state" && event.state === "resuming") {
       setSessionView(panel, {
         state: "restoring",
-        text: historyLoadingSessionId === sessionId ? "Restoring the saved thread and conversation history…" : "Restoring the saved Codex thread…",
+        text: historyLoadingSessionId === sessionId ? "Restoring the saved conversation and history…" : `Restoring the saved ${providerDisplayName(session.providerId)} conversation…`,
         blocked: historyLoadingSessionId === sessionId,
       });
     } else if (event.type === "conversation-state" && event.state === "resumed") {
       if (historyLoadingSessionId === sessionId) {
         setSessionView(panel, { state: "restoring", text: "Saved thread verified; loading conversation history…", blocked: true });
       } else {
-        setSessionView(panel, { state: "connected", text: "Connected · saved conversation restored.", blocked: false });
+        setSessionView(panel, { state: "connected", text: session.providerId === OPENAI_PROVIDER_ID
+          ? "OpenAI · saved conversation restored."
+          : "Connected · saved conversation restored.", blocked: false });
       }
     } else if (event.type === "conversation-state" && event.state === "starting") {
-      setSessionView(panel, { state: "connecting", text: "Starting a new read-only Codex thread…", blocked: false });
+      setSessionView(panel, { state: "connecting", text: `Starting a new ${providerDisplayName(session.providerId)} conversation…`, blocked: false });
     } else if (event.type === "conversation-state" && event.state === "created") {
       setSessionView(panel, { state: "connected", text: "Connected · new conversation started.", blocked: false });
     } else if (event.type === "connection-lost") {
       setSessionView(panel, {
         state: "disconnected",
-        text: "Codex disconnected. The saved session is kept; reconnect before sending another task.",
+        text: `${providerDisplayName(session.providerId)} disconnected. The saved session is kept; reconnect before sending another task.`,
         blocked: true,
         canRetry: Boolean(client.getState().conversationId),
         canStartNew: true,
@@ -507,6 +539,8 @@ function executionProviderForSession(session, cwd, generation) {
       postToPanel(panel, {
         type: "assistant-running",
         requestId: activeCodexRequestId,
+        conversationId: event.conversationId,
+        taskId: event.taskId,
         threadId: event.conversationId,
         turnId: event.taskId,
         status: "inProgress",
@@ -604,7 +638,7 @@ function loadSelectedSession() {
     if (!selectedSession) {
       sessionView = {
         state: "new",
-        text: "No saved conversation for this folder. A Vesper session will be created when you send a Codex task.",
+        text: `No saved conversation for this folder. A ${providerDisplayName(selectedProviderForNewSession())} session will be created when you send a task.`,
         blocked: false,
       };
     } else if (selectedSession.providerConversationId) {
@@ -612,13 +646,13 @@ function loadSelectedSession() {
         ? { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false }
         : {
           state: "saved",
-          text: "Saved conversation found. Vesper will verify the same Codex thread before continuing.",
+          text: `Saved ${providerDisplayName(selectedSession.providerId)} conversation found. Vesper will resume that provider conversation before continuing.`,
           blocked: false,
         };
     } else {
       sessionView = {
         state: "new",
-        text: "Saved Vesper session found without a Codex thread. Sending a task will start its first read-only thread.",
+        text: `Saved Vesper session found without a provider conversation. Sending a task will start its first ${providerDisplayName(selectedSession.providerId)} conversation.`,
         blocked: false,
       };
     }
@@ -680,7 +714,7 @@ async function restoreSelectedHistory(targetPanel) {
   });
   setSessionView(targetPanel, {
     state: "restoring",
-    text: "Verifying the saved Codex thread and loading its history…",
+    text: `Verifying the saved ${providerDisplayName(session.providerId)} conversation and loading its history…`,
     blocked: true,
   });
 
@@ -742,7 +776,7 @@ function showHistoryFailure(targetPanel, { client, session, generation, historyL
       state: "recovery-required",
       text: `Could not reconnect to the saved conversation: ${historyError}. The saved session was kept. Retry or explicitly start a new conversation.`,
       blocked: true,
-      canRetry: Boolean(session.providerConversationId),
+      canRetry: Boolean(session.providerConversationId && client.capabilities.recovery),
       canStartNew: true,
     });
   }
@@ -769,6 +803,30 @@ function invalidateHistoryLoad() {
 
 function postSessionView(targetPanel) {
   postToPanel(targetPanel, { type: "session-state", ...sessionView });
+  const providerId = selectedSession?.providerId ||
+    (typeof process.env.VESPER_PROVIDER === "string" && process.env.VESPER_PROVIDER.trim()) || DEFAULT_PROVIDER_ID;
+  postToPanel(targetPanel, {
+    type: "provider-info",
+    providerId,
+    displayName: providerDisplayName(providerId),
+    model: providerId === OPENAI_PROVIDER_ID ? String(process.env.VESPER_OPENAI_MODEL || "").slice(0, 200) : null,
+  });
+}
+
+function selectedProviderForNewSession() {
+  const providerId = resolveDefaultProviderId(process.env);
+  if (!listProviders().some((provider) => provider.id === providerId)) throw new Error(`Unsupported provider ${safeMessage(providerId)}. Run vesper providers to see supported providers.`);
+  return providerId;
+}
+
+function providerDisplayName(providerId) {
+  if (providerId === OPENAI_PROVIDER_ID) return "OpenAI Chat Completions (text only)";
+  if (providerId === DEFAULT_PROVIDER_ID) return "Codex app-server";
+  return safeMessage(providerId || "unknown provider");
+}
+
+function providerSessionName(providerId) {
+  return providerId === OPENAI_PROVIDER_ID ? "OpenAI" : providerId === DEFAULT_PROVIDER_ID ? "Codex" : providerDisplayName(providerId);
 }
 
 function setSessionView(targetPanel, view) {
@@ -831,6 +889,7 @@ function getHtml(webview) {
     header { border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 10px; }
     h1 { font-size: 18px; margin: 0 0 4px; }
     #status { color: var(--vscode-descriptionForeground); font-size: 12px; }
+    #provider-info { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 4px; }
     #project-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
     #project-details { min-width: 0; flex: 1; }
     #project-name { font-weight: 600; }
@@ -860,6 +919,7 @@ function getHtml(webview) {
   <main>
     <header>
       <h1>Vesper</h1>
+      <div id="provider-info">Execution provider: Codex app-server</div>
       <div id="project-row">
         <div id="project-details"><div id="project-name">Loading project…</div><div id="project-path"></div></div>
         <button id="choose-project" type="button">Choose project</button>
@@ -879,12 +939,17 @@ function getHtml(webview) {
       <button id="send" type="submit">Send</button>
       <button id="stop" type="button" hidden>Stop</button>
     </form>
-    <footer>Local Git and test checks stay local. Codex uses a read-only sandbox; Vesper declines approval requests.</footer>
+    <footer>
+      <div>Local routing and project checks stay local.</div>
+      <div id="provider-privacy">Codex uses a read-only sandbox; Vesper declines approval requests.</div>
+    </footer>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const messages = document.getElementById('messages');
     const status = document.getElementById('status');
+    const providerInfo = document.getElementById('provider-info');
+    const providerPrivacy = document.getElementById('provider-privacy');
     const form = document.getElementById('form');
     const prompt = document.getElementById('prompt');
     const send = document.getElementById('send');
@@ -900,6 +965,8 @@ function getHtml(webview) {
     const startNewSession = document.getElementById('start-new-session');
     let activeAssistant;
     let activeRequestId;
+    let currentProviderId = 'codex-app-server';
+    let currentProviderName = 'Codex app-server';
     let sessionBlocked = false;
     let recoveryLoading = false;
 
@@ -967,13 +1034,21 @@ function getHtml(webview) {
     stop.addEventListener('click', () => {
       if (activeRequestId === undefined || stop.disabled) return;
       stop.disabled = true;
-      status.textContent = 'Interrupt requested · waiting for Codex turn state…';
+      status.textContent = 'Interrupt requested · waiting for ' + currentProviderName + ' task state…';
       vscode.postMessage({ type: 'interrupt', requestId: activeRequestId });
     });
 
     window.addEventListener('message', (event) => {
       const message = event.data || {};
       if (message.type === 'status') status.textContent = message.text;
+      if (message.type === 'provider-info') {
+        currentProviderId = typeof message.providerId === 'string' ? message.providerId : 'codex-app-server';
+        currentProviderName = typeof message.displayName === 'string' ? message.displayName : currentProviderId;
+        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : currentProviderId === 'openai-chat-completions' ? ' · model not configured' : '');
+        providerPrivacy.textContent = currentProviderId === 'openai-chat-completions'
+          ? 'OpenAI receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.'
+          : 'Codex uses a read-only sandbox; Vesper declines approval requests.';
+      }
       if (message.type === 'project') {
         if ((projectPath.dataset.currentPath || '') !== (message.path || '')) {
           messages.replaceChildren();
@@ -984,7 +1059,7 @@ function getHtml(webview) {
         }
         projectPath.dataset.currentPath = message.path || '';
         projectName.textContent = message.available ? (message.name || 'Workspace folder') : (message.name ? message.name + ' · unavailable' : 'No workspace folder selected');
-        projectPath.textContent = message.path || 'Open a folder in VS Code to start a Codex task.';
+        projectPath.textContent = message.path || 'Open a folder in VS Code to start a provider task.';
         projectPath.title = message.path || '';
       }
       if (message.type === 'conversation-history') {
@@ -1032,7 +1107,7 @@ function getHtml(webview) {
         activeRequestId = message.requestId;
         setBusy(true);
         if (message.kind === 'turn') {
-          activeAssistant = addMessage('assistant', 'Codex · task continued after panel reopen…', '');
+          activeAssistant = addMessage('assistant', currentProviderName + ' · task continued after panel reopen…', '');
           stop.hidden = false;
           stop.disabled = false;
         }
@@ -1044,7 +1119,7 @@ function getHtml(webview) {
       }
       if (message.type === 'local-answer') {
         const state = message.result?.status || 'confirmed';
-        addMessage('assistant', 'Fast Lane local · ' + state + ' · no Codex turn · ' + message.elapsedMs + ' ms', message.text);
+        addMessage('assistant', 'Vesper local · ' + state + ' · no provider task · ' + message.elapsedMs + ' ms', message.text);
         setBusy(false);
       }
       if (message.type === 'error') {
@@ -1058,50 +1133,54 @@ function getHtml(webview) {
       }
       if (message.type === 'assistant-start') {
         activeRequestId = message.requestId;
-        activeAssistant = addMessage('assistant', 'Codex · connecting…', '');
+        if (typeof message.providerId === 'string') currentProviderId = message.providerId;
+        activeAssistant = addMessage('assistant', currentProviderName + ' · connecting…', '');
         stop.hidden = false;
         stop.disabled = false;
         setBusy(true);
-        status.textContent = 'Codex · connecting to the selected project…';
+        status.textContent = currentProviderName + ' · connecting…';
       }
       if (message.type === 'assistant-running' && message.requestId === activeRequestId) {
-        status.textContent = 'Codex · running';
-        if (activeAssistant) activeAssistant.title.textContent = 'Codex · running…';
+        status.textContent = currentProviderName + ' · running';
+        if (activeAssistant) activeAssistant.title.textContent = currentProviderName + ' · running…';
       }
       if (message.type === 'assistant-delta' && message.requestId === activeRequestId && activeAssistant) {
         activeAssistant.body.textContent += message.text;
         messages.scrollTop = messages.scrollHeight;
       }
       if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
-        status.textContent = 'Interrupt sent · waiting for Codex to stop…';
+        status.textContent = 'Interrupt sent · waiting for ' + currentProviderName + ' to stop…';
       }
       if (message.type === 'assistant-interrupt-error' && message.requestId === activeRequestId) {
         status.textContent = 'Interrupt was not confirmed · the turn may still be running.';
         stop.disabled = false;
-        if (activeAssistant) activeAssistant.title.textContent = 'Codex · running (interrupt not confirmed)';
+        if (activeAssistant) activeAssistant.title.textContent = currentProviderName + ' · running (interrupt not confirmed)';
       }
       if (message.type === 'assistant-done' && message.requestId === activeRequestId && activeAssistant) {
-        activeAssistant.title.textContent = 'Codex · ' + message.elapsedMs + ' ms · ' + message.usage;
+        const generated = message.generatedTextOnly || message.providerId === 'openai-chat-completions';
+        activeAssistant.title.textContent = (generated ? 'OpenAI · generated text · not executed · files unchanged' : 'Codex · completed') + (message.truncated ? ' · response truncated' : '') + ' · ' + message.elapsedMs + ' ms · ' + message.usage + (message.model ? ' · ' + message.model : '');
         activeAssistant = undefined;
       }
       if (message.type === 'assistant-done' && message.requestId === activeRequestId) {
         activeRequestId = undefined;
-        status.textContent = 'Codex · completed';
+        status.textContent = message.generatedTextOnly || message.providerId === 'openai-chat-completions'
+          ? 'OpenAI · text generated, not executed' + (message.truncated ? ' · response truncated' : '')
+          : 'Codex · completed';
         stop.hidden = true;
         setBusy(false);
       }
       if (message.type === 'assistant-error' && message.requestId === activeRequestId) {
         if (activeAssistant) {
           const interrupted = message.state === 'interrupted';
-          activeAssistant.title.textContent = interrupted ? 'Codex · interrupted' : 'Codex · failed · ' + message.elapsedMs + ' ms';
+          activeAssistant.title.textContent = interrupted ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed · ' + message.elapsedMs + ' ms';
           activeAssistant.body.textContent += (activeAssistant.body.textContent ? '\\n\\n' : '') + message.text;
           activeAssistant = undefined;
         } else {
-          const label = message.state === 'interrupted' ? 'Codex · interrupted' : 'Codex fallback error · ' + message.elapsedMs + ' ms';
+          const label = message.state === 'interrupted' ? currentProviderName + ' · interrupted' : currentProviderName + ' error · ' + message.elapsedMs + ' ms';
           addMessage('assistant', label, message.text);
         }
         activeRequestId = undefined;
-        status.textContent = message.state === 'interrupted' ? 'Codex · interrupted' : 'Codex · failed; the conversation remains visible in this panel.';
+        status.textContent = message.state === 'interrupted' ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed; the conversation remains visible in this panel.';
         stop.hidden = true;
         setBusy(false);
       }

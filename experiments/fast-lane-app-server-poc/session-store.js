@@ -263,7 +263,7 @@ function withLegacyCodexAlias(session) {
 function normalizeRecovery(value, now) {
   if (value === null) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError("Invalid Vesper provider recovery metadata.");
-  const codes = new Set(["connection-lost", "resume-failed", "submission-outcome-uncertain"]);
+  const codes = new Set(["connection-lost", "resume-failed", "submission-outcome-uncertain", "unsupported-operation"]);
   if (!codes.has(value.code)) throw new TypeError("Invalid Vesper provider recovery code.");
   return { code: value.code, observedAt: now.toISOString() };
 }
@@ -271,7 +271,7 @@ function normalizeRecovery(value, now) {
 function isValidRecovery(recovery) {
   return Boolean(recovery && typeof recovery === "object" && !Array.isArray(recovery) &&
     Object.keys(recovery).length === 2 &&
-    ["connection-lost", "resume-failed", "submission-outcome-uncertain"].includes(recovery.code) &&
+    ["connection-lost", "resume-failed", "submission-outcome-uncertain", "unsupported-operation"].includes(recovery.code) &&
     Number.isFinite(Date.parse(recovery.observedAt)));
 }
 

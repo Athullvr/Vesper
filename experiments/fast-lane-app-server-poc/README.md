@@ -2,8 +2,8 @@
 
 This prototype has two frontends over the same small routing core:
 
-- A VS Code extension panel that answers explicit Git and test-evidence questions locally and sends other prompts to Codex app-server.
-- A minimal terminal frontend named `vesper` with the same local-first routing and a persistent Codex app-server thread per Vesper session.
+- A VS Code extension panel that answers explicit Git and test-evidence questions locally and sends other prompts to the selected execution provider.
+- A minimal terminal frontend named `vesper` with the same local-first routing and provider-owned conversation continuity per Vesper session.
 
 The prototype uses Node.js built-ins, Git, the VS Code Extension API for the panel, and the installed Codex CLI. It has no npm runtime dependencies.
 
@@ -40,7 +40,7 @@ vesper sessions resume SESSION_ID
 vesper sessions new
 ```
 
-`list` shows at most the 50 newest sessions for the selected canonical project and prints only the Vesper id and update time. Session metadata does not retain a title or prompt preview. `resume` defaults to the current project and rejects a session saved for another project; it reconnects through the verified Codex `thread/resume` path. `new` creates a separate session and leaves existing sessions intact. Each command accepts an optional project directory.
+`list` shows at most the 50 newest sessions for the selected canonical project and prints the Vesper id, update time, provider, and whether a provider conversation is saved. Session metadata does not retain a title or prompt preview. `resume` defaults to the current project and rejects a session saved for another project; it resumes with the same provider recorded on that session. `new` creates a separate session and leaves existing sessions intact. Each command accepts an optional project directory.
 
 Read-only integration discovery is available from the terminal. `vesper plugins` checks project and personal local marketplace manifests plus the local plugin cache; `vesper mcp` uses Codex's JSON listing command; and `vesper skills` checks project and user skill directories. These commands show only names, status, and source, never MCP command arguments, environment values, skill instructions, or conversation text. `vesper modules` is not implemented.
 
@@ -199,13 +199,33 @@ File-change approval (`item/fileChange/requestApproval`) is shown only with a di
 
 Session metadata is stored under `~/.vesper/sessions/` (or `$VESPER_HOME/sessions/` when `VESPER_HOME` is set). Schema version 2 records the stable Vesper session id, canonical project path, provider id, provider conversation id, session status, bounded recovery code/timestamp, and creation/update timestamps. A legacy `threadId` field is read as a Codex provider conversation id; the old record is rewritten in version 2 on the next session update. The in-memory `threadId` accessor remains as a compatibility alias for Codex callers, but it is not written to version 2 files. The session directory and files are created with mode `0700` and `0600`; prompts, responses, and authentication material are not stored there. App-server stderr is not copied to terminal output.
 
-## Provider execution interface
+## Provider selection and OpenAI-compatible execution
 
-`execution-interface.js` defines the provider contract, explicit capability declarations, bounded normalized events, and stable structured error codes. `execution-provider.js` is the small provider-selection boundary; Codex app-server is the only active adapter in this phase. `codex-execution-provider.js` wraps the existing `AppServerClient`, translates its protocol activity into normalized events, and converts normalized one-time approval choices back to Codex responses. The existing client remains responsible for app-server framing, session identity checks, uncertain start acknowledgements, and exact file-change evidence capture.
+`execution-interface.js` defines the provider contract, explicit capability declarations, bounded normalized events, and stable structured error codes. `execution-provider.js` is the small selection boundary. Codex app-server remains the default; OpenAI Chat Completions can be selected for a new Vesper session:
 
-Terminal and VS Code submit through `submitTask`, interrupt through `interrupt`, resume through `resumeConversation`/`recover`, and consume events such as `text-delta`, `task-started`, `command-activity`, `approval-required`, `file-change`, `task-state`, and `connection-lost`. Event payloads are bounded and omit raw protocol parameters. Approval UI receives a normalized review object; the adapter retains the captured file evidence and maps `approve-once`, `decline`, and `cancel` to the installed Codex schema. A lost `turn/start` acknowledgement is reported as `SUBMISSION_OUTCOME_UNCERTAIN`, never automatically submitted again.
+```sh
+vesper providers
+vesper providers status --provider openai-chat-completions
+vesper providers status --provider openai-chat-completions --check
 
-A future provider should implement the contract methods `initialize`, `startConversation`, `resumeConversation`, `readConversationHistory`, `submitTask`, `interrupt`, `recover`, `getState`, and `dispose`; emit contract-versioned normalized `event` objects; and declare `streaming`, `interruptions`, `resume`, `conversationHistory`, `approvalEvents`, `fileChanges`, `commandExecutionEvents`, `recovery`, and `persistentSessions` as explicit booleans. It should return a structured `UNSUPPORTED_OPERATION` error where a declared-false capability is requested, and must not claim support without an actual provider signal. No second provider or generalized registry is included yet. Local handlers still run before provider dispatch and do not initialize Codex; capability-plan previews remain advisory.
+# Set OPENAI_API_KEY in your shell or secret manager before selecting this provider.
+export VESPER_OPENAI_MODEL='your-model-id'
+vesper --provider openai-chat-completions --new /path/to/project
+```
+
+`VESPER_OPENAI_API_KEY` can be used instead of `OPENAI_API_KEY`. `VESPER_OPENAI_BASE_URL` optionally changes the API base URL and `VESPER_OPENAI_TIMEOUT_MS` sets a 1,000 to 600,000 ms request timeout. The default base is `https://api.openai.com/v1`. `VESPER_PROVIDER=openai-chat-completions` selects OpenAI for new sessions launched from the terminal or VS Code. Existing sessions retain their stored provider; an explicit selection that conflicts with a saved session is rejected. Start a separate session with `--new` or the panel's **Start new conversation** action. Codex remains selected when `VESPER_PROVIDER` is unset.
+
+`vesper providers` only lists local adapter declarations and does not make a network request. `vesper providers status` reports configuration without connecting. The explicit `--check` makes a bounded authenticated `GET /models` request and checks whether the configured model appears; it does not generate text or make a paid completion request. Codex's explicit check connects the local app-server. The configured API key is read from the environment and is never printed or written to session files.
+
+The OpenAI adapter targets the documented Chat Completions `POST /chat/completions` streaming interface: it sends one `developer` instruction message, the bounded locally saved user/assistant text history, and the current task, with `stream: true`, `store: false`, and no tools. OpenAI documents server-sent event chunks with `choices[].delta.content`, a finish reason, and the `[DONE]` marker ([Chat Completions create API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create), [streaming guide](https://developers.openai.com/api/docs/guides/streaming-responses)). Configure a model and compatible endpoint that support developer messages and this streaming request shape. A custom endpoint can handle tasks if it matches that request and SSE response shape. The explicit connectivity check separately expects `GET /models` to return a `data` array; endpoints without that listing shape can still handle tasks, but Vesper cannot verify the configured model through that check. Compatibility is not assumed for arbitrary endpoints. Redirects, non-SSE responses, malformed records, oversized output, and incomplete streams fail closed. `store: false` is sent as an API request option; it is not a guarantee about provider retention or account data controls, which remain governed by the selected provider's current terms and settings.
+
+The provider owns a private local message record under `~/.vesper/sessions/provider-conversations/` (or `$VESPER_HOME/sessions/provider-conversations/`), separate from the Vesper session metadata. Conversation files and their directory use `0600` and `0700` permissions, are bounded, and are scoped to the canonical project path, provider, model, and API-base fingerprint. Vesper stores the stable local conversation id on the session record. Resume reuses that exact local transcript; it does not depend on a remote thread ID. If request submission may have reached the server but no complete response was confirmed, the transcript is marked uncertain and Vesper never resubmits that task. The API does not provide a supported way for this adapter to reconcile an uncertain response or cancel generation remotely, so recovery is declared unsupported; interrupt aborts Vesper's local HTTP stream and reports the remote completion as unknown.
+
+Using this provider sends the submitted task and the provider-owned conversation text to the configured remote API. Vesper does not send the project path or repository files, does not run tool calls, does not execute commands, does not apply generated code, and does not create approval events. VS Code and terminal label its output as generated text, not executed, with files unchanged. You must apply and validate any suggested changes yourself. Its declared support is streaming, local interruption, local transcript resume/history, and local session persistence; approvals, file changes, command execution, and request-outcome recovery are unsupported. A returned `tool_calls` response is rejected, never executed.
+
+The Codex adapter continues to wrap the existing `AppServerClient`, translates app-server activity into normalized events, and maps one-time approval choices back to Codex responses. The existing client remains responsible for app-server framing, session identity checks, uncertain start acknowledgements, and exact file-change evidence capture. A lost `turn/start` acknowledgement is reported as `SUBMISSION_OUTCOME_UNCERTAIN`, never automatically submitted again. Terminal and VS Code consume normalized `text-delta`, `task-started`, `command-activity`, `approval-required`, `file-change`, `task-state`, and `connection-lost` events; provider-specific protocol payloads do not reach the panel by default.
+
+An additional provider must implement `initialize`, `startConversation`, `resumeConversation`, `readConversationHistory`, `submitTask`, `interrupt`, `recover`, `getState`, and `dispose`; emit contract-versioned normalized `event` objects; and declare streaming, interruptions, resume, history, approvals, file changes, command execution, recovery, and persistence support explicitly. A declared-false operation must return a structured `UNSUPPORTED_OPERATION`. Local handlers still run before provider dispatch; capability-plan previews remain advisory and do not dispatch capabilities.
 
 ## VS Code extension
 
