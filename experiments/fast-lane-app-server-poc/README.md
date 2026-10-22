@@ -44,6 +44,31 @@ vesper sessions new
 
 Read-only integration discovery is available from the terminal. `vesper plugins` checks project and personal local marketplace manifests plus the local plugin cache; `vesper mcp` uses Codex's JSON listing command; and `vesper skills` checks project and user skill directories. These commands show only names, status, and source, never MCP command arguments, environment values, skill instructions, or conversation text. `vesper modules` is not implemented.
 
+The unified catalog supports list, search, detail, and status workflows:
+
+```sh
+vesper capabilities
+vesper capabilities search git
+vesper capabilities show skill:project/review/SKILL.md
+vesper capabilities status
+```
+
+IDs are stable for a source identity: plugins use `plugin:MARKETPLACE/NAME`, MCP servers use `mcp:NAME`, and skills use `skill:project/RELATIVE_PATH` or `skill:user/RELATIVE_PATH`. Capability details show the source location and explicit `unknown` states. A configured and enabled MCP server is marked available for use, but its authentication, connectivity, and runtime operation remain unknown. A cached plugin does not establish that Codex enabled or loaded it; a skill manifest does not establish that Codex loaded the skill. The catalog does not send capability metadata to Codex or change routing heuristics.
+
+Vesper can manage only operations with a documented Codex CLI interface. Each operation prints the exact target, intended change, backup/recovery guidance, then requires typing the capability ID:
+
+```sh
+vesper capabilities install plugin:marketplace/plugin-name
+vesper capabilities remove plugin:marketplace/plugin-name
+vesper capabilities remove mcp:server-name
+vesper capabilities configure mcp local-server --stdio /path/to/server --arg start
+vesper capabilities configure mcp hosted-server --url https://mcp.example.org --bearer-token-env-var MCP_TOKEN
+```
+
+Plugin install/remove and MCP add/remove use the installed `codex plugin` and `codex mcp` commands. Before invoking them, Vesper copies an existing `$CODEX_HOME/config.toml` to a unique mode-`0600` backup. The Codex CLI performs the configuration change, preserving unrelated settings according to its own implementation. Vesper reports completion only after local discovery verifies the result. Plugin installation can download remote marketplace content: treat it as untrusted. Vesper does not execute the downloaded code, though Codex may load the installed capability in later use. MCP setup stores the configuration but Vesper does not launch the server. Vesper does not accept environment-variable values; for an HTTP bearer token, provide only the environment-variable name.
+
+The inspected Codex CLI has no MCP or plugin enable/disable command and no MCP update command. `vesper capabilities enable|disable ID` explains the limitation without changing anything. To replace an MCP definition, remove it and configure it again. Skills are read-only in this version. Configuration details and environment values are not printed; stdio arguments are omitted from the confirmation summary. Avoid passing secret values as command arguments because the operating system may expose process arguments to local users.
+
 To run straight from the checkout without linking or opening VS Code, invoke the checked-in launcher from the project directory:
 
 ```sh
@@ -87,13 +112,13 @@ The installed CLI reports `codex-cli 0.162.1`. Its help exposes fixed built-in c
 
 No supported in-process extension point for adding Vesper UI to the Codex CLI terminal was documented in the inspected CLI 0.162.1 help or plugin documentation. Codex's [app-server protocol](https://developers.openai.com/blog/codex-as-a-platform) is the documented integration surface for an application-owned frontend; the installed CLI labels it experimental. Vesper therefore runs as its own transparent terminal frontend and uses the installed Codex app-server/runtime for fallback turns. Running `codex` still launches Codex normally. Vesper does not replace or modify the `codex` executable, copy credentials, or reset Codex configuration.
 
-The v0.2 discovery commands use bounded, read-only sources:
+The original discovery commands use bounded, read-only sources:
 
 - `vesper plugins` reads `$PROJECT/.agents/plugins/marketplace.json`, `~/.agents/plugins/marketplace.json`, and plugin cache directory names under `$CODEX_HOME/plugins/cache` (default `~/.codex/plugins/cache`). A cached copy is reported as `installed`; a local marketplace entry with `policy.installation: "AVAILABLE"` is `available`. Other policy states, remote/universal marketplaces, and whether an item is enabled or loaded remain `unknown`. It does not run `codex plugin list --available`, because that can consult configured and remote marketplaces.
 - `vesper mcp` runs the installed CLI's documented read-only `codex mcp list --json` command and projects only each server name and its `enabled` boolean. Vesper labels enabled servers `installed` (configured and enabled), disabled servers `available` (configured but disabled), and missing/failed state `unknown`. Codex has no list of unconfigured MCP servers, so Vesper cannot discover hypothetical servers.
 - `vesper skills` recursively checks `$PROJECT/.agents/skills/` and `$CODEX_HOME/skills/` for `SKILL.md` files, with a five-level depth and 2,000-directory scan cap. A valid named manifest is `available`; missing, malformed, or other skill sources are `unknown`. Codex exposes no separate installed/enabled skill state through these sources, so runtime loading or activation remains unknown.
 
-Codex's built-in plugin and MCP commands remain available independently (`codex plugin list --help`, `codex mcp list --help`). Vesper implements no integration installation, activation, removal, download, or user-configuration edits. Plugin list output is scoped to local files instead of the CLI's remote marketplace catalogue; plugin activation, managed sources, and Codex runtime-loaded status cannot be determined by this read-only local scan.
+The catalog reuses the same local discovery sources. It does not inspect Codex settings for secrets or query remote marketplace listings; the plugin search scope remains local marketplace manifests and the local cache. Codex's built-in commands remain available independently (`codex plugin list --help`, `codex mcp list --help`, `codex plugin add --help`, `codex mcp add --help`). Vesper uses `codex plugin add/remove` and `codex mcp add/remove` only after an explicit typed confirmation. It does not edit Codex configuration directly, download marketplace data itself, or claim runtime-loaded state.
 
 When Codex requests command, file, patch, or permission approval, Vesper shows the request in the terminal. Only typing `yes` grants a one-time approval; all other answers decline, except the explicit `cancel` answer. Permission-profile approval grants only the displayed requested profile for that turn. Vesper does not automatically approve commands or make session-wide grants. Unsupported request methods return a protocol error.
 

@@ -36,7 +36,7 @@ const STREAM_SENSITIVE_MARKER_NAMES = [
 ];
 
 class TerminalFrontend {
-  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
+  constructor({ cwd, handlers, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, capabilityProvider = null, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (!handlers || typeof handlers !== "object") throw new TypeError("Local handlers are required.");
     if (!appServer || typeof appServer.runTurn !== "function") throw new TypeError("A Codex app-server client is required.");
@@ -48,6 +48,7 @@ class TerminalFrontend {
     this.sessionId = sessionId;
     this.onWorkspaceCommand = onWorkspaceCommand;
     this.onTask = onTask;
+    this.capabilityProvider = capabilityProvider;
     this.routingDiagnostics = Boolean(routingDiagnostics);
     this.output = output;
     this.lineIO = lineIO || createLineIO(input, output);
@@ -138,7 +139,7 @@ class TerminalFrontend {
       const routed = await routeRequest(prompt, {
         decision,
         handlers: this.handlers,
-        context: { cwd: this.cwd },
+        context: { cwd: this.cwd, capabilities: this.capabilityProvider },
         onRoutingDecision: (routingDecision) => this.writeRoutingDecision(routingDecision),
       });
       const elapsedMs = Math.max(0, Date.now() - startedAt);
@@ -168,7 +169,7 @@ class TerminalFrontend {
       const routed = await routeRequest(prompt, {
         decision,
         handlers: this.handlers,
-        context: { cwd: this.cwd },
+        context: { cwd: this.cwd, capabilities: this.capabilityProvider },
         onRoutingDecision: (record) => {
           routingDecision = record;
           this.writeRoutingDecision(record);

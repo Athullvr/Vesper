@@ -8,6 +8,7 @@ const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { SessionStore } = require("./session-store");
 const { resolveProjectDirectory } = require("./cli");
+const { createCapabilityProvider } = require("./capability-catalog");
 const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
@@ -31,6 +32,7 @@ let activeRequestType;
 let historyLoadSequence = 0;
 let historyLoadingSessionId;
 let deferredHistoryRestore = false;
+const capabilityProviders = new Map();
 
 function activate(context) {
   output = vscode.window.createOutputChannel("Vesper");
@@ -124,7 +126,11 @@ async function handlePrompt(prompt, targetPanel = panel) {
   writeLog(`request=${requestId} route=${decision.route} reason=${decision.reason} intent=${decision.intent || "none"}`);
 
   if (decision.route === "local") {
-    const routed = await routeRequest(prompt, { decision, handlers: localHandlers, context: { cwd } });
+    const routed = await routeRequest(prompt, {
+      decision,
+      handlers: localHandlers,
+      context: { cwd, capabilities: capabilityProviderFor(cwd) },
+    });
     const result = routed.result;
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs, result.status === "unavailable", routed.routingDecision);
@@ -214,7 +220,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
     const routed = await routeRequest(prompt, {
       decision,
       handlers: localHandlers,
-      context: { cwd },
+      context: { cwd, capabilities: capabilityProviderFor(cwd) },
       onRoutingDecision: (record) => { routingDecision = record; },
       fallback: () => client.runTurn({ prompt, cwd, onDelta }),
     });
@@ -270,6 +276,12 @@ async function handlePrompt(prompt, targetPanel = panel) {
       if (panel && selectedSession?.sessionId === session.sessionId) void restoreSelectedHistory(panel);
     }
   }
+}
+
+function capabilityProviderFor(cwd) {
+  if (typeof cwd !== "string" || !cwd) return null;
+  if (!capabilityProviders.has(cwd)) capabilityProviders.set(cwd, createCapabilityProvider({ cwd }));
+  return capabilityProviders.get(cwd);
 }
 
 async function selectProject(targetPanel) {

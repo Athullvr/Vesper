@@ -3,10 +3,21 @@
 const fs = require("node:fs");
 const { execFile } = require("node:child_process");
 const path = require("node:path");
+const readline = require("node:readline/promises");
 const { AppServerClient } = require("./app-server-client");
 const { createLocalHandlers } = require("./local-handlers");
 const { MAX_SESSION_LIST_ENTRIES, SessionStore } = require("./session-store");
-const { discoverMcp, discoverPlugins, discoverSkills, renderDiscovery } = require("./integration-discovery");
+const { discoverMcp, discoverPlugins, discoverSkills, renderDiscovery, runCodexCommand } = require("./integration-discovery");
+const {
+  buildCapabilityCatalog,
+  createCapabilityProvider,
+  findCapability,
+  renderCapability,
+  renderCapabilityList,
+  renderCatalogStatus,
+  searchCapabilities,
+} = require("./capability-catalog");
+const { runCapabilityOperation } = require("./capability-management");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
 
 const USAGE = `Vesper terminal frontend
@@ -21,6 +32,14 @@ Usage:
   vesper plugins [PROJECT_DIRECTORY]
   vesper mcp [PROJECT_DIRECTORY]
   vesper skills [PROJECT_DIRECTORY]
+  vesper capabilities [list] [PROJECT_DIRECTORY]
+  vesper capabilities show <ID> [PROJECT_DIRECTORY]
+  vesper capabilities search <QUERY>
+  vesper capabilities status [PROJECT_DIRECTORY]
+  vesper capabilities install <ID> [PROJECT_DIRECTORY]
+  vesper capabilities remove <ID> [PROJECT_DIRECTORY]
+  vesper capabilities configure mcp <NAME> (--stdio <COMMAND> [--arg <ARG> ...] | --url <HTTPS_URL> [--bearer-token-env-var <NAME>])
+  vesper capabilities enable|disable <ID>
   vesper --help
 
 Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
@@ -30,8 +49,10 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 :new to start another session, :routing to inspect current-session routing counts, and :quit to exit.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
-Discovery commands are read-only. They show local sources and report unknown state when Codex does not
-expose it. Vesper does not install or change integrations.
+The plugins, mcp, and skills commands are read-only. Capabilities combines their local discovery
+results and can use documented Codex CLI commands for confirmed plugin and MCP changes. Vesper never
+downloads or executes code without an explicit operation and confirmation. Capability discovery does
+not prove that Codex loaded a capability or that it is operational.
 `;
 
 const SESSIONS_USAGE = `Vesper session management
@@ -45,12 +66,108 @@ The default project is the current working directory. Session resume requires th
 match the saved session's canonical project path.
 `;
 
+const CAPABILITIES_USAGE = `Vesper capability catalog and management
+
+Usage:
+  vesper capabilities [list] [PROJECT_DIRECTORY]
+  vesper capabilities show ID [PROJECT_DIRECTORY]
+  vesper capabilities search QUERY
+  vesper capabilities status [PROJECT_DIRECTORY]
+  vesper capabilities install PLUGIN_ID [PROJECT_DIRECTORY]
+  vesper capabilities remove PLUGIN_OR_MCP_ID [PROJECT_DIRECTORY]
+  vesper capabilities configure mcp NAME --stdio COMMAND [--arg ARG ...]
+  vesper capabilities configure mcp NAME --url HTTPS_URL [--bearer-token-env-var NAME]
+  vesper capabilities enable|disable ID
+
+Management operations show their target, intended change, backup/recovery guidance, and require
+typing the exact capability ID. Vesper uses documented Codex CLI commands and does not accept
+environment-variable values. Discovery never proves that Codex loaded or can operate a capability.
+Enable/disable is currently unsupported by the inspected provider interfaces.
+`;
+
 function parseArgs(argv) {
   const args = [...argv];
   if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
+  if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
   return parseRunArgs(args);
+}
+
+function parseCapabilityArgs(args) {
+  if (!args.length) return { command: "capabilities", action: "list", projectDirectory: null, help: false };
+  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command: "capabilities", help: true };
+  let [action, ...rest] = args;
+  if (action === "--help" || action === "-h") return { command: "capabilities", help: true };
+  const knownActions = ["list", "show", "search", "status", "install", "remove", "configure", "enable", "disable"];
+  if (!knownActions.includes(action)) {
+    if (args.length === 1 && !action.startsWith("-")) {
+      return { command: "capabilities", action: "list", projectDirectory: action, help: false };
+    }
+    throw new Error(`Unknown capabilities command: ${safeTerminalText(action)}. Run vesper capabilities --help.`);
+  }
+  if (rest.length === 1 && ["--help", "-h"].includes(rest[0])) return { command: "capabilities", action, help: true };
+
+  if (action === "search") {
+    const query = rest.join(" ").trim();
+    if (!query || query.startsWith("-")) throw new Error("Usage: vesper capabilities search QUERY.");
+    return { command: "capabilities", action, query, projectDirectory: null, help: false };
+  }
+
+  if (action === "configure") return parseCapabilityConfigureArgs(rest);
+  if (action === "show" || action === "install" || action === "remove" || action === "enable" || action === "disable") {
+    if (rest.some((arg) => arg.startsWith("-"))) throw new Error(`Unexpected option for vesper capabilities ${action}.`);
+    if (rest.length < 1 || rest.length > 2) throw new Error(`Usage: vesper capabilities ${action} ID [PROJECT_DIRECTORY].`);
+    return { command: "capabilities", action, capabilityId: rest[0], projectDirectory: rest[1] || null, help: false };
+  }
+  if (rest.some((arg) => arg.startsWith("-"))) throw new Error(`Unexpected option for vesper capabilities ${action}.`);
+  if (rest.length > 1) throw new Error(`Usage: vesper capabilities ${action} [PROJECT_DIRECTORY].`);
+  return { command: "capabilities", action, projectDirectory: rest[0] || null, help: false };
+}
+
+function parseCapabilityConfigureArgs(args) {
+  if (args[0] !== "mcp" || !args[1] || args[1].startsWith("-")) {
+    throw new Error("Usage: vesper capabilities configure mcp NAME (--stdio COMMAND [--arg ARG ...] | --url HTTPS_URL [--bearer-token-env-var NAME]).");
+  }
+  const name = args[1];
+  let transport = null;
+  let command = null;
+  let url = null;
+  let bearerTokenEnvVar = null;
+  const mcpArgs = [];
+  for (let index = 2; index < args.length; index += 1) {
+    const option = args[index];
+    if (option === "--stdio" || option === "--url") {
+      if (transport) throw new Error("Choose exactly one of --stdio or --url.");
+      const value = args[index + 1];
+      if (!value || value.startsWith("--")) throw new Error(`${option} requires a value.`);
+      transport = option === "--stdio" ? "stdio" : "url";
+      if (transport === "stdio") command = value;
+      else url = value;
+      index += 1;
+    } else if (option === "--arg") {
+      if (!transport || transport !== "stdio") throw new Error("--arg can only be used after --stdio.");
+      const value = args[index + 1];
+      if (value === undefined) throw new Error("--arg requires a value.");
+      mcpArgs.push(value);
+      index += 1;
+    } else if (option === "--bearer-token-env-var") {
+      if (bearerTokenEnvVar) throw new Error("Use --bearer-token-env-var only once.");
+      bearerTokenEnvVar = args[index + 1];
+      if (!bearerTokenEnvVar || bearerTokenEnvVar.startsWith("--")) throw new Error("--bearer-token-env-var requires an environment variable name, not a value.");
+      index += 1;
+    } else {
+      throw new Error(`Unknown MCP configuration option: ${safeTerminalText(option)}. Vesper does not accept environment-variable values.`);
+    }
+  }
+  if (!transport) throw new Error("Choose one MCP transport with --stdio or --url.");
+  return {
+    command: "capabilities",
+    action: "configure",
+    projectDirectory: null,
+    mcpConfiguration: { name, transport, command, url, args: mcpArgs, bearerTokenEnvVar },
+    help: false,
+  };
 }
 
 function parseRunArgs(argv) {
@@ -144,8 +261,12 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
+  }
+
+  if (options.command === "capabilities") {
+    return runCapabilities(options, dependencies, output, errorOutput);
   }
 
   if (options.command === "sessions") {
@@ -182,6 +303,81 @@ function discoveryUsage(command) {
   return `Vesper ${command} discovery (read-only)\n\nUsage:\n  vesper ${command} [PROJECT_DIRECTORY]\n\nNo integration is installed, enabled, disabled, downloaded, or modified.\n`;
 }
 
+async function runCapabilities(options, dependencies, output, errorOutput) {
+  let cwd;
+  try {
+    cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    const discoveryOptions = dependencies.discoveryOptions || {};
+    const commandRunner = dependencies.codexCommandRunner || runCodexCommand;
+    const catalog = await buildCapabilityCatalog({ cwd, discoveryOptions, commandRunner });
+
+    if (options.action === "list") {
+      output.write(renderCapabilityList(catalog.capabilities));
+      if (catalog.diagnostics.length) {
+        output.write(`Discovery notes (${catalog.diagnostics.length}):\n`);
+        for (const diagnostic of catalog.diagnostics.slice(0, 12)) {
+          output.write(`- ${safeTerminalText(diagnostic.type)}: ${safeTerminalText(diagnostic.message)}\n`);
+        }
+        if (catalog.diagnostics.length > 12) output.write(`- Additional notes omitted: ${catalog.diagnostics.length - 12}.\n`);
+      }
+      return 0;
+    }
+    if (options.action === "show") {
+      const capability = findCapability(catalog, options.capabilityId);
+      if (!capability) {
+        errorOutput.write(`[Vesper capability error] Capability ${safeTerminalText(options.capabilityId)} was not found in the local catalog. Run vesper capabilities status for discovery notes.\n`);
+        return 1;
+      }
+      output.write(renderCapability(capability));
+      return 0;
+    }
+    if (options.action === "search") {
+      const results = searchCapabilities(catalog, options.query);
+      output.write(renderCapabilityList(results, `Vesper capability search · ${safeTerminalText(options.query)}`));
+      if (!results.length) output.write("No matching capability metadata was found in the local catalog.\n");
+      return 0;
+    }
+    if (options.action === "status") {
+      output.write(renderCatalogStatus(catalog));
+      return 0;
+    }
+
+    return runCapabilityOperation({
+      operation: options.action,
+      capabilityId: options.capabilityId,
+      mcpConfiguration: options.mcpConfiguration,
+      cwd,
+      catalog,
+      discoveryOptions,
+      commandRunner,
+      confirm: (request) => requestCapabilityConfirmation(request, dependencies, output),
+      output,
+      errorOutput,
+    });
+  } catch (error) {
+    errorOutput.write(`[Vesper capability error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  }
+}
+
+async function requestCapabilityConfirmation(request, dependencies, output) {
+  if (typeof dependencies.confirmCapabilityAction === "function") {
+    return dependencies.confirmCapabilityAction(request);
+  }
+  const input = dependencies.confirmationInput || process.stdin;
+  if (!input?.isTTY) {
+    output.write("Confirmation requires an interactive terminal; no changes were made.\n");
+    return false;
+  }
+  const terminal = readline.createInterface({ input, output: dependencies.confirmationOutput || output });
+  try {
+    const answer = await terminal.question(`Type ${request.id} to confirm: `);
+    return answer.trim() === request.id;
+  } finally {
+    terminal.close();
+  }
+}
+
 async function runSessionsList(options, dependencies, output, errorOutput) {
   try {
     const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
@@ -214,6 +410,7 @@ async function runDiscovery(options, dependencies, output, errorOutput) {
     } else {
       result = await discoverMcp({
         cwd,
+        codexHome: dependencies.discoveryOptions?.codexHome,
         commandRunner: dependencies.codexCommandRunner,
       });
     }
@@ -335,6 +532,11 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     };
 
     const handlers = dependencies.handlers || createLocalHandlers({ runGit: dependencies.runGit || runGitCommand });
+    const capabilityProvider = dependencies.capabilityProvider || createCapabilityProvider({
+      cwd,
+      discoveryOptions: dependencies.discoveryOptions || {},
+      commandRunner: dependencies.codexCommandRunner,
+    });
     terminal = new TerminalFrontend({
       cwd,
       handlers,
@@ -346,6 +548,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       savedThreadId: session.threadId,
       sessionId: session.sessionId,
       onWorkspaceCommand: handleWorkspaceCommand,
+      capabilityProvider,
       onTask: () => {
         session = store.touch(session.sessionId);
       },

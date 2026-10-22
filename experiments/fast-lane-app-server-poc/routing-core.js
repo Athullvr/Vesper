@@ -304,7 +304,7 @@ async function routeRequest(request, {
     return {
       decision,
       routingDecision,
-      ...(typeof fallback === "function" ? { fallbackResult: await fallback(decision) } : {}),
+      ...(typeof fallback === "function" ? { fallbackResult: await fallback(decision, context) } : {}),
     };
   }
 

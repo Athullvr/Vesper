@@ -40,7 +40,8 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
       const pluginName = safeName(plugin?.name);
       if (!pluginName) continue;
       const key = `${marketplaceName}\u0000${pluginName}`;
-      const installed = cachedPlugins.has(key);
+      const cached = cachedPlugins.get(key);
+      const installed = Boolean(cached);
       const installation = plugin?.policy?.installation;
       const status = installed ? "installed" : installation === "AVAILABLE" ? "available" : "unknown";
       const detail = installed
@@ -50,8 +51,11 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
           : "marketplace entry exists, but its availability policy is not known";
       entries.set(key, {
         name: pluginName,
+        description: safeDescription(plugin?.description),
+        marketplace: marketplaceName,
         status,
         source: installed ? `${marketplace.source}; CODEX_HOME plugin cache` : marketplace.source,
+        location: installed ? [marketplace.filePath, cached.location] : [marketplace.filePath],
         detail,
       });
     }
@@ -63,8 +67,11 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
     if (entries.has(key)) continue;
     entries.set(key, {
       name: cached.name,
+      description: null,
+      marketplace: cached.marketplace,
       status: "installed",
       source: "CODEX_HOME/plugins/cache",
+      location: [cached.location],
       detail: "cached plugin copy found; enabled or loaded state is unknown",
     });
   }
@@ -78,8 +85,9 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
   return { category: "plugins", items, notes };
 }
 
-async function discoverMcp({ cwd, commandRunner = runCodexCommand } = {}) {
+async function discoverMcp({ cwd, codexHome = defaultCodexHome(), commandRunner = runCodexCommand } = {}) {
   const source = "codex mcp list --json (installed Codex CLI)";
+  const location = path.join(codexHome, "config.toml");
   try {
     const result = await commandRunner("codex", ["mcp", "list", "--json"], {
       cwd,
@@ -100,7 +108,7 @@ async function discoverMcp({ cwd, commandRunner = runCodexCommand } = {}) {
         : server.enabled === false
           ? "configured but disabled in Codex"
           : "configured; enabled state was not reported";
-      items.push({ name, status, source, detail });
+      items.push({ name, description: safeDescription(server?.description), status, source, location, detail });
     }
     items.sort(compareDiscoveryItems);
     const notes = [
@@ -115,7 +123,7 @@ async function discoverMcp({ cwd, commandRunner = runCodexCommand } = {}) {
       : "Codex MCP discovery failed; check that the installed Codex CLI can run `codex mcp list --json`.";
     return {
       category: "mcp",
-      items: [{ name: null, status: "unknown", source, detail: unavailable }],
+      items: [{ name: null, status: "unknown", source, location, detail: unavailable }],
       notes: ["No server names or configuration values were printed."],
       failed: true,
     };
@@ -124,8 +132,8 @@ async function discoverMcp({ cwd, commandRunner = runCodexCommand } = {}) {
 
 function discoverSkills({ cwd, home = os.homedir(), codexHome = defaultCodexHome(home), filesystem = fs } = {}) {
   const roots = [
-    { directory: path.join(cwd, ".agents", "skills"), source: "project .agents/skills" },
-    { directory: path.join(codexHome, "skills"), source: "user CODEX_HOME/skills" },
+    { directory: path.join(cwd, ".agents", "skills"), source: "project .agents/skills", scope: "project" },
+    { directory: path.join(codexHome, "skills"), source: "user CODEX_HOME/skills", scope: "user" },
   ];
   const entries = [];
   const notes = [];
@@ -174,7 +182,11 @@ function readPluginCache(cacheRoot, filesystem) {
       const marketplaceName = safeName(marketplace.name);
       const pluginName = safeName(plugin.name);
       if (!marketplaceName || !pluginName) continue;
-      results.set(`${marketplaceName}\u0000${pluginName}`, { marketplace: marketplaceName, name: pluginName });
+      results.set(`${marketplaceName}\u0000${pluginName}`, {
+        marketplace: marketplaceName,
+        name: pluginName,
+        location: path.join(cacheRoot, marketplace.name, plugin.name),
+      });
       scanned += 1;
       if (scanned >= MAX_SCAN_ENTRIES) return results;
     }
@@ -212,8 +224,12 @@ function readSkillName(filePath, filesystem) {
     const content = filesystem.readFileSync(filePath, "utf8");
     const frontmatter = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1];
     const value = frontmatter?.match(/^\s*name\s*:\s*([^\r\n#]+?)\s*$/mu)?.[1]?.replace(/^["']|["']$/gu, "").trim();
+    const rawDescription = frontmatter?.match(/^\s*description\s*:\s*([^\r\n]+?)\s*$/mu)?.[1]?.trim();
+    const description = rawDescription && !["|", ">", "|-", ">-"] .includes(rawDescription)
+      ? safeDescription(rawDescription.replace(/^["']|["']$/gu, ""))
+      : null;
     const name = safeName(value);
-    return name ? { status: "ok", name } : { status: "error" };
+    return name ? { status: "ok", name, description } : { status: "error" };
   } catch {
     return { status: "error" };
   }
@@ -247,8 +263,11 @@ function scanSkillDirectory(root, directory, depth, filesystem, entries, scan) {
         const relativeSkillPath = path.relative(root.directory, skillPath).split(path.sep).join("/");
         entries.push({
           name,
+          description: skill.description || null,
           status: skill.status === "ok" ? "available" : "unknown",
           source: `${root.source}/${relativeSkillPath}`,
+          location: skillPath,
+          sourceKey: `${root.scope}/${relativeSkillPath}`,
           detail: skill.status === "ok"
             ? "SKILL.md found; whether Codex loaded or activated it is unknown"
             : "skill file exists, but its metadata could not be verified",
@@ -277,6 +296,12 @@ function safeName(value) {
   const name = value.trim();
   if (!name || name.length > 120 || /[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(name)) return null;
   return name;
+}
+
+function safeDescription(value) {
+  if (typeof value !== "string") return null;
+  const description = value.replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/gu, " ").replace(/\s+/gu, " ").trim();
+  return description ? description.slice(0, 1_000) : null;
 }
 
 function safeTerminalText(value) {
@@ -308,6 +333,7 @@ function runCodexCommand(command, args, { cwd, timeout = 10_000, maxBuffer = 1_0
 
 module.exports = {
   MAX_DISCOVERY_ITEMS,
+  defaultCodexHome,
   discoverMcp,
   discoverPlugins,
   discoverSkills,
