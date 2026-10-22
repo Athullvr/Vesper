@@ -693,7 +693,11 @@ test("turn/start timeout closes the transport because server acceptance is unkno
   };
   const { client } = createClient(server, { rpcTimeoutMs: 10 });
   t.after(() => client.dispose());
-  await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), /Timed out waiting.*turn\/start/u);
+  await assert.rejects(client.runTurn({ prompt: "Inspect", cwd: "/workspace" }), (error) => {
+    assert.match(error.message, /Timed out waiting.*turn\/start/u);
+    assert.equal(error.executionCode, "SUBMISSION_OUTCOME_UNCERTAIN");
+    return true;
+  });
   assert.equal(server.killed, true);
   assert.equal(client.activeTurn, undefined);
 });

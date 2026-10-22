@@ -33,6 +33,7 @@ class CodexExecutionProvider extends EventEmitter {
     this.capabilities = CODEX_CAPABILITIES;
     this.approvalHandler = approvalHandler;
     this.disposed = false;
+    this.connectionInitialized = false;
     this.commandActivity = new CommandActivityStore();
     this.initialConversationId = safeIdentity(clientOptions?.initialThreadId) || null;
     this.handleClientProgress = this.handleClientProgress.bind(this);
@@ -52,8 +53,8 @@ class CodexExecutionProvider extends EventEmitter {
   }
 
   getState() {
-    const availability = this.disposed ? "unavailable" : this.conversationReady ? "available" : "unknown";
-    const state = this.disposed ? "closed" : this.conversationReady ? "connected" : this.conversationId ? "disconnected" : "uninitialized";
+    const availability = this.disposed ? "unavailable" : this.connectionInitialized || this.conversationReady ? "available" : "unknown";
+    const state = this.disposed ? "closed" : this.conversationReady ? "connected" : this.connectionInitialized ? "initialized" : this.conversationId ? "disconnected" : "uninitialized";
     return Object.freeze({
       providerId: this.id,
       availability,
@@ -78,6 +79,7 @@ class CodexExecutionProvider extends EventEmitter {
     }
     try {
       await this.client.connect(projectPath);
+      this.connectionInitialized = true;
       return { providerId: this.id, available: true };
     } catch (error) {
       throw mapProviderError(error, "PROVIDER_UNAVAILABLE");
@@ -89,6 +91,7 @@ class CodexExecutionProvider extends EventEmitter {
     if (typeof this.client.ensureThread !== "function") throw unsupportedOperation(this.id, "start conversation");
     try {
       await this.client.connect(projectPath);
+      this.connectionInitialized = true;
       await this.client.ensureThread(projectPath);
       return { providerId: this.id, conversationId: this.conversationId };
     } catch (error) {
@@ -203,6 +206,9 @@ class CodexExecutionProvider extends EventEmitter {
 
   async handleApprovalRequest(method, params = {}, context) {
     const request = normalizeApprovalRequest(method, params, context);
+    if (request.type === "command") {
+      this.emitCommandUpdates(this.commandActivity.applyApproval(approvalActivityParams(request), "requested"));
+    }
     this.emitEvent("approval-required", { request: publicApprovalRequest(request) });
     if (typeof this.approvalHandler !== "function") return codexApprovalResponse(method, "decline", params);
     let choice = "decline";
@@ -223,6 +229,7 @@ class CodexExecutionProvider extends EventEmitter {
     const taskId = safeIdentity(event.turnId) || null;
     switch (event.type) {
       case "initialized":
+        this.connectionInitialized = true;
         this.emitEvent("connection-state", { state: "ready" });
         break;
       case "thread_starting":
@@ -261,6 +268,7 @@ class CodexExecutionProvider extends EventEmitter {
         // approval callback. The protocol payload is deliberately discarded.
         break;
       case "approval_decided":
+        this.emitCommandUpdates(this.commandActivity.applyApproval(event.params, event.status));
         this.emitEvent("approval-decided", normalizeApprovalActivity(event.params, event.status));
         break;
       case "codex_progress":
@@ -281,6 +289,7 @@ class CodexExecutionProvider extends EventEmitter {
         this.emitEvent("task-state", { state: "timed-out", conversationId });
         break;
       case "disconnected":
+        this.connectionInitialized = false;
         this.emitEvent("connection-lost", { message: "Codex app-server connection was lost.", conversationId });
         break;
       case "interrupt_requested":
@@ -365,11 +374,21 @@ function publicApprovalRequest(request) {
     taskId: request.taskId,
     itemId: request.itemId,
     approvalId: request.approvalId,
-    command: request.command,
-    cwd: request.cwd,
-    review: request.review,
+    reviewTitle: request.review.title,
+    reviewTruncated: request.review.truncated,
     canApprove: request.canApprove,
   });
+}
+
+function approvalActivityParams(request) {
+  return {
+    threadId: request.conversationId,
+    turnId: request.taskId,
+    itemId: request.itemId,
+    approvalId: request.approvalId,
+    command: request.command,
+    cwd: request.cwd,
+  };
 }
 
 function normalizeApprovalActivity(params = {}, status) {
@@ -407,16 +426,16 @@ function mapProviderError(error, fallbackCode) {
   if (error?.name === "ExecutionError") return error;
   const executionCode = error?.executionCode || error?.code;
   if (error?.code === "ENOENT") {
-    return createExecutionError("PROVIDER_UNAVAILABLE", "Codex CLI is unavailable. Install it or correct PATH, then retry.", { providerId: CODEX_PROVIDER_ID, cause: error });
+    return createExecutionError("PROVIDER_UNAVAILABLE", "Codex CLI is unavailable. Install it or correct PATH, then retry.", { providerId: CODEX_PROVIDER_ID });
   }
   if (executionCode === "SUBMISSION_OUTCOME_UNCERTAIN") {
-    return createExecutionError("SUBMISSION_OUTCOME_UNCERTAIN", "The provider did not confirm whether it accepted this task. Reconnect before submitting it again.", { providerId: CODEX_PROVIDER_ID, cause: error });
+    return createExecutionError("SUBMISSION_OUTCOME_UNCERTAIN", "The provider did not confirm whether it accepted this task. Reconnect before submitting it again.", { providerId: CODEX_PROVIDER_ID });
   }
   if (executionCode === "TASK_INTERRUPTED" || error?.turnStatus === "interrupted") {
-    return createExecutionError("TASK_INTERRUPTED", "The task was interrupted.", { providerId: CODEX_PROVIDER_ID, cause: error });
+    return createExecutionError("TASK_INTERRUPTED", "The task was interrupted.", { providerId: CODEX_PROVIDER_ID });
   }
   if (executionCode === "CONNECTION_LOST") {
-    return createExecutionError("CONNECTION_LOST", "The provider connection was lost. Reconnect before submitting another task.", { providerId: CODEX_PROVIDER_ID, cause: error });
+    return createExecutionError("CONNECTION_LOST", "The provider connection was lost. Reconnect before submitting another task.", { providerId: CODEX_PROVIDER_ID });
   }
   const code = ["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "RESUME_FAILED", "SUBMISSION_OUTCOME_UNCERTAIN", "TASK_FAILED", "TASK_INTERRUPTED", "INVALID_REQUEST"].includes(executionCode)
     ? executionCode
@@ -432,7 +451,8 @@ function mapProviderError(error, fallbackCode) {
           : code === "TASK_FAILED"
             ? "The provider reported that the task failed."
             : "The provider operation failed.";
-  return createExecutionError(code, message, { providerId: CODEX_PROVIDER_ID, retryable: false, cause: error });
+  const retryable = ["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "RESUME_FAILED"].includes(code);
+  return createExecutionError(code, message, { providerId: CODEX_PROVIDER_ID, retryable });
 }
 
 function mapTurnState(status) {

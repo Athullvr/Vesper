@@ -4,7 +4,6 @@ const fs = require("node:fs");
 const { execFile } = require("node:child_process");
 const path = require("node:path");
 const readline = require("node:readline/promises");
-const { AppServerClient } = require("./app-server-client");
 const { createExecutionProvider } = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
 const { MAX_SESSION_LIST_ENTRIES, SessionStore } = require("./session-store");
@@ -500,7 +499,7 @@ async function runDiscovery(options, dependencies, output, errorOutput) {
 }
 
 async function runInteractiveVesper(options, dependencies, output, errorOutput) {
-  let appServer;
+  let executionProvider;
   try {
     const store = dependencies.store || new SessionStore();
     let session;
@@ -527,15 +526,14 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     output.write(`Project: ${safeCliField(cwd)}\n`);
 
     let terminal;
-    const clientFactory = dependencies.clientFactory || ((clientOptions) => new AppServerClient(clientOptions));
     const providerFactory = dependencies.executionProviderFactory || createExecutionProvider;
-    const createClient = (selectedSession) => {
+    const createProvider = (selectedSession) => {
       if (selectedSession.providerId !== "codex-app-server") {
         throw new Error(`This session belongs to unsupported provider ${safeCliField(selectedSession.providerId)}. Start an explicit new session to use Codex.`);
       }
       return providerFactory({
         providerId: selectedSession.providerId,
-        clientFactory,
+        ...(dependencies.clientFactory ? { clientFactory: dependencies.clientFactory } : {}),
         clientOptions: {
           ...(dependencies.clientOptions || {}),
           initialThreadId: selectedSession.providerConversationId,
@@ -550,11 +548,11 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         },
       });
     };
-    appServer = createClient(session);
+    executionProvider = createProvider(session);
 
     const activateSession = async (selectedSession, action) => {
-      const nextClient = createClient(selectedSession);
-      const previousClient = appServer;
+      const nextClient = createProvider(selectedSession);
+      const previousClient = executionProvider;
       try {
         terminal.replaceExecutionProvider(nextClient, {
           sessionId: selectedSession.sessionId,
@@ -565,7 +563,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         throw error;
       }
       session = selectedSession;
-      appServer = nextClient;
+      executionProvider = nextClient;
       previousClient?.dispose?.();
       output.write(`\n[Vesper] ${action}: ${safeCliField(session.sessionId)} · ${session.providerConversationId ? "saved Codex thread" : "no Codex thread yet"}\n`);
       output.write(`Project: ${safeCliField(cwd)}\n`);
@@ -664,12 +662,12 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       cwd,
       discoveryOptions: dependencies.discoveryOptions || {},
       commandRunner: dependencies.codexCommandRunner,
-      runtimeStatusAdapter: createCodexRuntimeStatusAdapter({ getRuntimeClient: () => appServer }),
+      runtimeStatusAdapter: createCodexRuntimeStatusAdapter({ getRuntimeClient: () => executionProvider }),
     });
     terminal = new TerminalFrontend({
       cwd,
       handlers,
-      executionProvider: appServer,
+      executionProvider,
       input: dependencies.input || process.stdin,
       output,
       lineIO: dependencies.lineIO,
@@ -691,7 +689,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     errorOutput.write(`[Vesper error] ${safeTerminalText(error?.message || error)}\n`);
     return 1;
   } finally {
-    appServer?.dispose?.();
+    executionProvider?.dispose?.();
   }
 }
 

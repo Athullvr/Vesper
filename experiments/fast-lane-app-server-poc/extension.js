@@ -3,7 +3,6 @@ const { execFile } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
-const { AppServerClient } = require("./app-server-client");
 const { createExecutionProvider } = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
@@ -17,8 +16,8 @@ const { unavailableHistory } = require("./conversation-history");
 const MAX_PROMPT_LENGTH = 32 * 1024;
 
 let output;
-let appServer;
-let appServerSessionId;
+let executionProvider;
+let executionProviderSessionId;
 let panel;
 let requestSequence = 0;
 let localHandlers;
@@ -194,7 +193,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
 
   const session = selectedSession;
   const generation = projectGeneration;
-  const client = appServerForSession(session, cwd, generation);
+  const client = executionProviderForSession(session, cwd, generation);
   activeCodexRequestId = requestId;
   activeRequestType = "turn";
   postToPanel(targetPanel, { type: "assistant-start", requestId });
@@ -329,7 +328,7 @@ function capabilityProviderFor(cwd) {
   if (!capabilityProviders.has(cwd)) capabilityProviders.set(cwd, createCapabilityProvider({
     cwd,
     runtimeStatusAdapter: createCodexRuntimeStatusAdapter({
-      getRuntimeClient: () => selectedSession?.cwd === cwd && appServerSessionId === selectedSession.sessionId ? appServer : null,
+      getRuntimeClient: () => selectedSession?.cwd === cwd && executionProviderSessionId === selectedSession.sessionId ? executionProvider : null,
     }),
   }));
   return capabilityProviders.get(cwd);
@@ -372,7 +371,7 @@ async function retryResume(targetPanel) {
   const requestId = ++requestSequence;
   const session = selectedSession;
   const generation = projectGeneration;
-  const client = appServerForSession(session, project.path, generation);
+  const client = executionProviderForSession(session, project.path, generation);
   const historyLoadId = ++historyLoadSequence;
   historyLoadingSessionId = session.sessionId;
   activeCodexRequestId = requestId;
@@ -435,9 +434,9 @@ function startNewSession(targetPanel) {
 }
 
 async function interruptRequest(requestId, targetPanel) {
-  if (requestId !== activeCodexRequestId || !appServer) return;
+  if (requestId !== activeCodexRequestId || !executionProvider) return;
   try {
-    const accepted = await appServer.interrupt();
+    const accepted = await executionProvider.interrupt();
     if (accepted && requestId === activeCodexRequestId) {
       postToPanel(targetPanel, { type: "interrupt-requested", requestId });
     }
@@ -448,8 +447,8 @@ async function interruptRequest(requestId, targetPanel) {
   }
 }
 
-function appServerForSession(session, cwd, generation) {
-  if (appServer && appServerSessionId === session.sessionId) return appServer;
+function executionProviderForSession(session, cwd, generation) {
+  if (executionProvider && executionProviderSessionId === session.sessionId) return executionProvider;
   disposeCurrentAppServer();
   const sessionId = session.sessionId;
   if (session.providerId !== "codex-app-server") {
@@ -457,7 +456,6 @@ function appServerForSession(session, cwd, generation) {
   }
   const client = createExecutionProvider({
     providerId: session.providerId,
-    clientFactory: (options) => new AppServerClient(options),
     clientOptions: {
       initialThreadId: session.providerConversationId,
       sandbox: "read-only",
@@ -478,7 +476,7 @@ function appServerForSession(session, cwd, generation) {
   });
   client.setApprovalHandler(async () => ({ choice: "decline" }));
   client.on("event", (event) => {
-    if (appServer !== client || appServerSessionId !== sessionId || projectGeneration !== generation ||
+    if (executionProvider !== client || executionProviderSessionId !== sessionId || projectGeneration !== generation ||
         selectedSession?.sessionId !== sessionId) return;
     if (event.type === "conversation-state" && event.state === "resuming") {
       setSessionView(panel, {
@@ -515,21 +513,21 @@ function appServerForSession(session, cwd, generation) {
       });
     }
   });
-  appServer = client;
-  appServerSessionId = sessionId;
+  executionProvider = client;
+  executionProviderSessionId = sessionId;
   return client;
 }
 
 function disposeCurrentAppServer() {
-  const previous = appServer;
-  appServer = undefined;
-  appServerSessionId = undefined;
+  const previous = executionProvider;
+  executionProvider = undefined;
+  executionProviderSessionId = undefined;
   previous?.dispose();
 }
 
 function isCurrentRequest(requestId, client, sessionId, generation) {
   const project = selectedProjectContext();
-  return activeCodexRequestId === requestId && appServer === client && appServerSessionId === sessionId &&
+  return activeCodexRequestId === requestId && executionProvider === client && executionProviderSessionId === sessionId &&
     projectGeneration === generation && selectedSession?.sessionId === sessionId && project.available;
 }
 
@@ -610,7 +608,7 @@ function loadSelectedSession() {
         blocked: false,
       };
     } else if (selectedSession.providerConversationId) {
-      sessionView = appServer?.getState().conversationReady && appServerSessionId === selectedSession.sessionId
+      sessionView = executionProvider?.getState().conversationReady && executionProviderSessionId === selectedSession.sessionId
         ? { state: "connected", text: "Connected · this Vesper session is saved.", blocked: false }
         : {
           state: "saved",
@@ -672,7 +670,7 @@ async function restoreSelectedHistory(targetPanel) {
   }
 
   const generation = projectGeneration;
-  const client = appServerForSession(session, project.path, generation);
+  const client = executionProviderForSession(session, project.path, generation);
   historyLoadingSessionId = session.sessionId;
   postHistoryState(targetPanel, {
     state: "loading",
@@ -754,7 +752,7 @@ function isCurrentHistoryLoad({ client, session, projectPath, generation, histor
   const project = selectedProjectContext();
   return historyLoadSequence === historyLoadId &&
     (requestId === undefined || activeCodexRequestId === requestId) &&
-    appServer === client && appServerSessionId === session?.sessionId &&
+    executionProvider === client && executionProviderSessionId === session?.sessionId &&
     selectedSession?.sessionId === session?.sessionId && projectGeneration === generation &&
     project.available && project.path === projectPath;
 }

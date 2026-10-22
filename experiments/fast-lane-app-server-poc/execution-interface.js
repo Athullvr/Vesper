@@ -69,14 +69,13 @@ function createExecutionEvent(type, fields = {}) {
   return Object.freeze(event);
 }
 
-function createExecutionError(code, message, { providerId = null, retryable = false, cause } = {}) {
+function createExecutionError(code, message, { providerId = null, retryable = false } = {}) {
   const safeCode = EXECUTION_ERROR_CODES.has(code) ? code : "TASK_FAILED";
   const error = new Error(boundText(message || "Execution failed."));
   error.name = "ExecutionError";
   error.code = safeCode;
-  error.providerId = typeof providerId === "string" ? providerId.slice(0, 80) : null;
+  error.providerId = typeof providerId === "string" ? boundText(providerId).slice(0, 80) : null;
   error.retryable = Boolean(retryable);
-  if (cause instanceof Error) error.cause = cause;
   return error;
 }
 
