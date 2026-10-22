@@ -528,15 +528,19 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     let terminal;
     const providerFactory = dependencies.executionProviderFactory || createExecutionProvider;
     const createProvider = (selectedSession) => {
-      if (selectedSession.providerId !== "codex-app-server") {
-        throw new Error(`This session belongs to unsupported provider ${safeCliField(selectedSession.providerId)}. Start an explicit new session to use Codex.`);
+      const providerId = selectedSession.providerId || (Object.hasOwn(selectedSession, "threadId") ? "codex-app-server" : null);
+      const conversationId = selectedSession.providerConversationId !== undefined
+        ? selectedSession.providerConversationId
+        : selectedSession.threadId || null;
+      if (providerId !== "codex-app-server") {
+        throw new Error(`This session belongs to unsupported provider ${safeCliField(providerId || "unknown")}. Start an explicit new session to use Codex.`);
       }
       return providerFactory({
-        providerId: selectedSession.providerId,
+        providerId,
         ...(dependencies.clientFactory ? { clientFactory: dependencies.clientFactory } : {}),
         clientOptions: {
           ...(dependencies.clientOptions || {}),
-          initialThreadId: selectedSession.providerConversationId,
+          initialThreadId: conversationId,
           onThreadId: async (threadId) => {
             const updated = store.update(selectedSession.sessionId, {
               providerConversationId: threadId,

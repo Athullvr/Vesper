@@ -1,7 +1,6 @@
 "use strict";
 
 const { EventEmitter } = require("node:events");
-const { AppServerClient, validateApprovalResult } = require("./app-server-client");
 const { approvalReview } = require("./approval-review");
 const { CommandActivityStore, MAX_COMMAND_LENGTH, MAX_CWD_LENGTH, redactSensitiveText } = require("./command-activity");
 const { projectConversationHistory } = require("./conversation-history");
@@ -27,7 +26,7 @@ const CODEX_CAPABILITIES = Object.freeze({
 });
 
 class CodexExecutionProvider extends EventEmitter {
-  constructor({ client, clientOptions, clientFactory = (options) => new AppServerClient(options), approvalHandler = null } = {}) {
+  constructor({ client, clientOptions, clientFactory = createDefaultAppServerClient, approvalHandler = null } = {}) {
     super();
     this.id = CODEX_PROVIDER_ID;
     this.capabilities = CODEX_CAPABILITIES;
@@ -220,7 +219,7 @@ class CodexExecutionProvider extends EventEmitter {
     }
     const response = codexApprovalResponse(method, choice, params);
     // Retain the existing app-server schema validation and one-time grant cap.
-    return validateApprovalResult(method, response);
+    return require("./app-server-client").validateApprovalResult(method, response);
   }
 
   handleClientProgress(event) {
@@ -342,6 +341,11 @@ class CodexExecutionProvider extends EventEmitter {
     this.client.dispose?.();
     this.removeAllListeners();
   }
+}
+
+function createDefaultAppServerClient(options) {
+  const { AppServerClient } = require("./app-server-client");
+  return new AppServerClient(options);
 }
 
 function createCodexExecutionProvider(options = {}) {

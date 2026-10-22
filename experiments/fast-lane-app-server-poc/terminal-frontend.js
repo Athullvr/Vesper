@@ -491,6 +491,8 @@ class TerminalFrontend {
     if (!event || typeof event !== "object") return;
     if (event.type === "turn_identity") {
       this.handleExecutionEvent({ type: "task-identity", conversationId: event.threadId, taskId: event.turnId, fileChanges: event.fileChanges });
+    } else if (event.type === "file_change_activity") {
+      this.handleExecutionEvent({ type: "file-change", activity: event.activity });
     } else if (event.type === "turn_diff_activity" || event.type === "turn_diff_updated") {
       this.handleExecutionEvent({ type: "task-progress", kind: "aggregate-diff", stage: event.type === "turn_diff_updated" ? "update" : "final", activity: event.activity });
     }
