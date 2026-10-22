@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const { execFile } = require("node:child_process");
 const path = require("node:path");
 const readline = require("node:readline/promises");
@@ -29,6 +30,8 @@ const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { createCapabilityPlan, renderCapabilityPlan } = require("./capability-planner");
 const { classifyRequest } = require("./routing-core");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
+const { escapeTerminalOutput, redactSensitiveText } = require("./command-activity");
+const { createPermissionedToolRuntime, renderToolApproval, renderToolDefinitions } = require("./permissioned-tool-runtime");
 
 const USAGE = `Vesper terminal frontend
 
@@ -54,6 +57,9 @@ Usage:
   vesper capabilities configure mcp <NAME> (--stdio <COMMAND> [--arg <ARG> ...] | --url <HTTPS_URL> [--bearer-token-env-var <NAME>])
   vesper capabilities enable|disable <ID> [PROJECT_DIRECTORY]
   vesper plan <TASK> [--project PROJECT_DIRECTORY]
+  vesper tools [list]
+  vesper tools preview <TOOL_ID> '<JSON>' [--project PROJECT_DIRECTORY]
+  vesper tools run <TOOL_ID> '<JSON>' [--project PROJECT_DIRECTORY] [--apply]
   vesper --help
 
 Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
@@ -63,6 +69,10 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 :new to start another session, :capabilities status|show ID to inspect local capability state,
 :plan TASK to preview an advisory plan, :routing to inspect current-session routing counts, and :quit to exit.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
+
+The tools command inspects or manually invokes the permissioned Vesper tool runtime. It never reads
+provider output as a tool request. Shell execution is disabled by default; tool file changes are
+proposed first and require a separate one-time approval before application.
 
 Codex remains the default provider. OpenAI Chat Completions sends task text and its locally stored
 conversation only; it does not read project files, run commands, apply code, or verify changes.
@@ -106,15 +116,68 @@ Standalone status inspection does not start or resume Codex; use :capabilities s
 an existing Vesper session to view passive MCP startup notifications from its current thread.
 `;
 
+const TOOLS_USAGE = `Vesper permissioned tool runtime
+
+Usage:
+  vesper tools [list]
+  vesper tools preview TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY]
+  vesper tools run TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY] [--apply]
+
+Preview validates a request without executing it. Manual run executes only the named registered tool.
+The request JSON must match that tool's schema. Paths are project-relative. File changes are
+proposals first; --apply requests one fresh approval and applies the proposal in this process only.
+Command execution is disabled by default. No provider output is interpreted as a tool call.
+`;
+
 function parseArgs(argv) {
   const args = [...argv];
   if (args[0] === "providers") return parseProvidersArgs(args.slice(1));
   if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
   if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
   if (args[0] === "plan") return parsePlanArgs(args.slice(1));
+  if (args[0] === "tools") return parseToolsArgs(args.slice(1));
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
   return parseRunArgs(args);
+}
+
+function parseToolsArgs(args) {
+  if (!args.length) return { command: "tools", action: "list", help: false };
+  if (["--help", "-h"].includes(args[0])) {
+    if (args.length !== 1) throw new Error("Usage: vesper tools --help.");
+    return { command: "tools", action: "list", help: true };
+  }
+  if (args[0] === "list") {
+    if (args.length !== 1) throw new Error("Usage: vesper tools [list].");
+    return { command: "tools", action: "list", help: false };
+  }
+  const action = args[0];
+  if (!(["preview", "run"].includes(action))) throw new Error("Usage: vesper tools [list] | tools preview|run TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY] [--apply].");
+  const toolId = args[1];
+  const json = args[2];
+  if (!toolId || !/^[a-z][a-z0-9_]{0,63}$/u.test(toolId) || typeof json !== "string") {
+    throw new Error(`Usage: vesper tools ${action} TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY]${action === "run" ? " [--apply]" : ""}.`);
+  }
+  if (Buffer.byteLength(json, "utf8") > 64 * 1024) throw new Error("Tool JSON input exceeds the 64 KiB command limit.");
+  let input;
+  try { input = JSON.parse(json); } catch { throw new Error("Tool input must be valid JSON. No operation was run."); }
+  let projectDirectory = null;
+  let apply = false;
+  for (let index = 3; index < args.length; index += 1) {
+    const option = args[index];
+    if (option === "--project") {
+      if (projectDirectory || !args[index + 1] || args[index + 1].startsWith("--")) throw new Error("--project requires one project directory.");
+      projectDirectory = args[index + 1];
+      index += 1;
+    } else if (option === "--apply") {
+      if (action !== "run" || apply) throw new Error("--apply is supported once with tools run propose_file_change.");
+      apply = true;
+    } else {
+      throw new Error(`Unknown tools option: ${safeTerminalText(option)}.`);
+    }
+  }
+  if (apply && toolId !== "propose_file_change") throw new Error("--apply can only follow a propose_file_change request.");
+  return { command: "tools", action, toolId, input, projectDirectory, apply, help: false };
 }
 
 function parseProvidersArgs(args) {
@@ -343,12 +406,13 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) supplies the key.\n  VESPER_OPENAI_MODEL selects the model; VESPER_OPENAI_BASE_URL optionally selects an OpenAI-compatible endpoint.\n  VESPER_PROVIDER selects the default for new sessions.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) supplies the key.\n  VESPER_OPENAI_MODEL selects the model; VESPER_OPENAI_BASE_URL optionally selects an OpenAI-compatible endpoint.\n  VESPER_PROVIDER selects the default for new sessions.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
   if (options.command === "providers") return runProviders(options, dependencies, output, errorOutput);
   if (options.command === "plan") return runPlan(options, dependencies, output, errorOutput);
+  if (options.command === "tools") return runTools(options, dependencies, output, errorOutput);
 
   if (options.command === "capabilities") {
     return runCapabilities(options, dependencies, output, errorOutput);
@@ -466,6 +530,106 @@ async function runPlan(options, dependencies, output, errorOutput) {
 
 function discoveryUsage(command) {
   return `Vesper ${command} discovery (read-only)\n\nUsage:\n  vesper ${command} [PROJECT_DIRECTORY]\n\nNo integration is installed, enabled, disabled, downloaded, or modified.\n`;
+}
+
+async function runTools(options, dependencies, output, errorOutput) {
+  if (options.action === "list") {
+    let runtime;
+    try {
+      const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+      runtime = await makeToolRuntime(cwd, { ...dependencies, output });
+      output.write(renderToolDefinitions(runtime.getDefinitions()));
+      return 0;
+    } catch (error) {
+      errorOutput.write(`[Vesper tools error] ${safeTerminalText(error?.message || error)}\n`);
+      return 1;
+    } finally { runtime?.dispose?.(); }
+  }
+
+  let runtime;
+  try {
+    const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    runtime = await makeToolRuntime(cwd, { ...dependencies, output });
+    const context = Object.freeze({ projectRoot: cwd, sessionId: runtime.sessionId || crypto.randomUUID() });
+    const request = Object.freeze({ toolId: options.toolId, input: options.input, context, requestId: crypto.randomUUID() });
+    if (options.action === "preview") {
+      const preview = await runtime.preview(request);
+      output.write(`Tool preview · validated only · not executed\n${renderBoundedToolJson(preview)}\n`);
+      return 0;
+    }
+
+    const result = await runtime.invoke(request);
+    output.write(`Tool operation · ${renderToolState(result)}\n${renderBoundedToolJson(result)}\n`);
+    if (result.state === "rejected" || result.state === "failed") return 1;
+
+    if (options.apply && result.state === "proposed") {
+      const applyRequest = Object.freeze({
+        toolId: "apply_file_change",
+        input: { proposalId: result.proposal.proposalId },
+        context,
+        requestId: crypto.randomUUID(),
+      });
+      const applied = await runtime.invoke(applyRequest);
+      output.write(`File change operation · ${renderToolState(applied)}\n${renderBoundedToolJson(applied)}\n`);
+      return applied.state === "rejected" || applied.state === "failed" ? 1 : 0;
+    }
+    return 0;
+  } catch (error) {
+    errorOutput.write(`[Vesper tools error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  } finally { runtime?.dispose?.(); }
+}
+
+async function makeToolRuntime(projectRoot, dependencies) {
+  const runtimeOptions = {
+    projectRoot,
+    sessionId: dependencies.toolSessionId || crypto.randomUUID(),
+    commandExecutionEnabled: dependencies.commandExecutionEnabled === true,
+    auditSink: dependencies.toolAuditSink,
+    approvalHandler: async (snapshot) => {
+      outputForApproval(dependencies.toolOutput || dependencies.output || process.stdout, snapshot);
+      if (typeof dependencies.confirmToolApproval === "function") return dependencies.confirmToolApproval(snapshot);
+      return requestToolApproval(snapshot, dependencies);
+    },
+  };
+  return typeof dependencies.toolRuntimeFactory === "function"
+    ? dependencies.toolRuntimeFactory(runtimeOptions)
+    : createPermissionedToolRuntime(runtimeOptions);
+}
+
+function outputForApproval(output, snapshot) {
+  output.write(`Operation state: awaiting approval\n${renderToolApproval(snapshot)}\n`);
+}
+
+function renderToolState(result) {
+  const states = [];
+  if (result.approved) states.push("approved");
+  if (result.executed) states.push("executed");
+  if (result.verified) states.push("verified");
+  if (["failed", "rejected"].includes(result.state)) states.push(result.state);
+  if (!states.length) states.push(result.state);
+  return states.map(safeTerminalText).join(" · ");
+}
+
+async function requestToolApproval(snapshot, dependencies) {
+  const input = dependencies.confirmationInput || process.stdin;
+  const output = dependencies.confirmationOutput || dependencies.output || process.stdout;
+  if (!input?.isTTY) {
+    output.write("This operation needs an interactive terminal for one-time approval; no change was made.\n");
+    return "cancel";
+  }
+  const terminal = readline.createInterface({ input, output });
+  try {
+    const answer = (await terminal.question('Type "approve-once", "decline", or "cancel": ')).trim();
+    return answer === "approve-once" || answer === "decline" || answer === "cancel" ? answer : "cancel";
+  } finally { terminal.close(); }
+}
+
+function renderBoundedToolJson(value) {
+  const maximum = 1024 * 1024 + 4_096;
+  let text = escapeTerminalOutput(redactSensitiveText(JSON.stringify(value, null, 2)));
+  if (text.length > maximum) text = `${text.slice(0, maximum)}\n[tool output omitted after the 1 MiB display limit]`;
+  return text;
 }
 
 async function runCapabilities(options, dependencies, output, errorOutput) {

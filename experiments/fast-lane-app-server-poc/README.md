@@ -227,6 +227,52 @@ The Codex adapter continues to wrap the existing `AppServerClient`, translates a
 
 An additional provider must implement `initialize`, `startConversation`, `resumeConversation`, `readConversationHistory`, `submitTask`, `interrupt`, `recover`, `getState`, and `dispose`; emit contract-versioned normalized `event` objects; and declare streaming, interruptions, resume, history, approvals, file changes, command execution, recovery, and persistence support explicitly. A declared-false operation must return a structured `UNSUPPORTED_OPERATION`. Local handlers still run before provider dispatch; capability-plan previews remain advisory and do not dispatch capabilities.
 
+## Permissioned tool runtime
+
+`permissioned-tool-runtime.js` is a provider-neutral API for explicit, typed tool requests. It is not wired to model output: the OpenAI adapter remains text-only, and Codex continues to use its existing app-server execution and native approval flow. A future provider adapter must call `preview()` or `invoke()` with a registered `toolId`, schema-checked `input`, the current canonical project/session context, and a unique request UUID. It cannot supply its own tool implementation or approval result.
+
+The Vesper host constructs the runtime for the active project/session and owns the interactive approval callback. A future adapter receives only the facade and submits a normalized request:
+
+```js
+const request = {
+  toolId: "read_file",
+  input: { path: "src/main.js" },
+  context: { projectRoot, sessionId },
+  requestId: crypto.randomUUID(),
+};
+const preview = await tools.preview(request);
+if (preview.state === "validated") {
+  const result = await tools.invoke(request);
+}
+```
+
+The same runtime validates the request again at invocation. Protected tools pause for the host approval callback, which receives an immutable operation snapshot. Providers cannot set `commandExecutionEnabled`, provide the approval handler, reuse a request UUID, or invoke internal executor methods through the facade.
+
+Inspect the registered tools and preview a request without running it:
+
+```sh
+vesper tools
+vesper tools preview read_file '{"path":"src/cli.js"}'
+vesper tools preview search_files '{"query":"approval","path":"src"}'
+```
+
+Manual requests can invoke bounded read-only operations directly. A file proposal is held only in the runtime process; `--apply` lets the same CLI invocation show the proposal and then request a separate one-time approval:
+
+```sh
+vesper tools run read_file '{"path":"README.md"}'
+vesper tools run git_status '{}'
+vesper tools run propose_file_change '{"path":"notes.txt","content":"Reviewed text\n"}'
+vesper tools run propose_file_change '{"path":"notes.txt","content":"Reviewed text\n"}' --apply
+```
+
+The initial tools are `read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, `run_command`, `propose_file_change`, and `apply_file_change`. File operations use canonical project-root descriptors with no-follow path traversal, reject hard links and cross-device mounts, and currently fail closed outside Linux with `/proc/self/fd` and `O_NOFOLLOW`. Same-device bind mounts are not distinguished from ordinary directories. Reads are limited to 1 MiB; directory lists to 100 entries; literal search to depth 5, 2,000 entries, 100 matches, 16 MiB scanned, and 16 KiB displayed; Git output to 16 KiB and five seconds. Git inspection rejects worktrees/external metadata, repositories rooted above the selected project, Git object alternates, and local config includes. Search skips symbolic links and non-text/oversized files.
+
+`propose_file_change` is a whole-file UTF-8 replacement proposal, not a patch engine. The existing file and proposed content must each fit in an 8 KiB review field, and the complete review must fit 20 KiB. `.git` and `.vesper` metadata paths are excluded. Existing files must be owned by the Vesper user and have the group the replacement would inherit. Applying a proposal requires a fresh `approve-once`, binds the approval to the proposal, session, project, original snapshot, and proposed content, then rechecks the target immediately before the atomic operation and verifies the resulting bytes. A concurrent change observed during revalidation invalidates the proposal. New files use atomic create-if-absent; existing files use an atomic same-directory replacement. Node does not expose a compare-and-swap rename, so a narrow race remains between the final existing-file check and replacement; a later native filesystem adapter should close that window. Replacement preserves basic mode and owner/group eligibility, but extended ACLs and xattrs are not preserved. Proposals and approvals do not survive runtime disposal. Secret-like text that the existing redactor would hide is refused for protected-operation approval so a reviewer is not asked to approve a partially hidden command or file.
+
+Shell execution is disabled by default. The API can expose it only when its host explicitly constructs the runtime with `commandExecutionEnabled: true` and an approval callback. It accepts an argv array and calls an executable with `shell: false`; every invocation still requires a fresh approval. It refuses to run as root, uses a five-second timeout, terminates the process group, limits stdout and stderr to 16 KiB each, and passes a minimal environment. This is an approval gate, not an OS sandbox: an approved executable can still access resources available to the Vesper user, including paths outside the project. Do not enable it for model-originated requests until a separate OS-level isolation policy exists. There is no CLI option that enables shell execution.
+
+Audit records retain at most 50 structured state events with tool ID, Vesper session ID, a hashed project identity, request/approval references, state, timestamp, result status, and stable error code. They omit request arguments, file content, task prompts, command output, environment values, and credentials. Read/search/Git results apply the existing sensitive-text redactor. Tool results distinguish `validated`, `proposed`, `awaiting-approval`, `approved`, `executed`, `verified`, `rejected`, and `failed`; approval is never reported as successful execution. The runtime does not execute downloaded code, invoke MCP tools, generate or apply patches automatically, or change provider behavior.
+
 ## VS Code extension
 
 This repository is directly loadable as a VS Code extension: `package.json` points to the existing `extension.js` entry point. No build step or VSIX is required. There is no checked-in `.vscode/launch.json`, so use the command below instead of relying on `F5` to select an extension-host configuration.
