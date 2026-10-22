@@ -60,6 +60,7 @@ const REASON_TEXT = Object.freeze({
   runtime_inspection_unsupported: "This runtime does not expose a supported status signal for this capability.",
   capability_state_uncertain: "Available evidence is insufficient to establish eligibility.",
   runtime_startup_in_progress: "Codex reported that MCP startup is still in progress.",
+  eligible_to_try: "Fresh runtime evidence supports an attempt; individual operation remains unverified.",
   operational_unverified: "No supported health check or tool call confirms operation; this plan does not claim operational status.",
   eligibility_confirmed: "Fresh runtime evidence confirms the capability is enabled, loaded, and available to try.",
   local_route_sufficient: "The deterministic local handler already covers this request, so no capability is recommended.",
@@ -129,7 +130,7 @@ function createCapabilityPlan({ task, catalog, routeDecision, projectContext, no
     malformedCatalogEntries: matches.malformedCount || 0,
     hasUncertainty,
     advisoryOnly: true,
-    explanation: makePlanExplanation(routeName, category, candidates, recommendedCapabilityIds, hasUncertainty),
+    explanation: makePlanExplanation(routeName, category, candidates, recommendedCapabilityIds),
   };
   plan.routingMetadata = createRoutingMetadata(plan);
   return plan;
@@ -170,7 +171,6 @@ function matchCapabilities(task, catalog, category = classifyTaskCategory(task))
     const sharedTopics = [...taskTopics].filter((topic) => metadataTopics.has(topic));
     const sharedTokens = [...taskTokens].filter((token) => metadataTokens.has(token) && !STOP_WORDS.has(token));
     let score = sharedTokens.length * 2 + sharedTopics.length * 4;
-    if (metadataTokens.has(normalizeToken(capability.type))) score += 0;
     if (category === "database" && metadataTopics.has("database")) score += 1;
     if (category === "source_control" && metadataTopics.has("source_control")) score += 1;
     if (category === "code_review" && metadataTopics.has("code_review")) score += 1;
@@ -390,7 +390,7 @@ function normalizeRouteDecision(decision) {
   };
 }
 
-function makePlanExplanation(routeName, category, candidates, recommendedIds, hasUncertainty) {
+function makePlanExplanation(routeName, category, candidates, recommendedIds) {
   const route = routeName === "local_handler" ? "the existing local handler" : routeName === "codex_fallback" ? "the existing Codex fallback" : "the route supplied by the caller";
   if (!candidates.length) return `No capability metadata matched ${topicLabel(category)}. The plan preserves ${route} and recommends no capability.`;
   const ready = recommendedIds.length;
@@ -431,6 +431,7 @@ function renderCapabilityPlan(plan) {
     `Existing route: ${safeLabel(plan?.routeDecision?.route || "unknown", 40)} · ${safeLabel(plan?.routeDecision?.reason || "unknown", 64)}`,
     `Execution path: ${safeLabel(plan?.executionPath?.kind || "route_unavailable", 40)}${plan?.executionPath?.intent ? ` · ${safeLabel(plan.executionPath.intent, 64)}` : ""}`,
     `Catalog scope: ${plan?.catalogScope === "selected_project" ? "selected project" : "unknown"}`,
+    `Plan uncertainty: ${plan?.hasUncertainty ? "present" : "none reported"}`,
     `Plan: ${safeLabel(plan?.explanation || "No plan explanation is available.", MAX_EXPLANATION_LENGTH)}`,
   ];
   const candidates = Array.isArray(plan?.relevantCapabilities) ? plan.relevantCapabilities.slice(0, MAX_CAPABILITY_CANDIDATES) : [];
@@ -438,7 +439,8 @@ function renderCapabilityPlan(plan) {
   else {
     lines.push("Relevant capabilities:");
     for (const candidate of candidates) {
-      lines.push(`- ${safeLabel(candidate.id, MAX_CAPABILITY_ID_LENGTH)} · ${safeLabel(candidate.type, 40)} · ${safeLabel(candidate.name, 120)} · ${safeLabel(candidate.eligibility, 20)}`);
+      const eligibilityLabel = candidate.eligibility === "usable" ? "usable to try" : candidate.eligibility;
+      lines.push(`- ${safeLabel(candidate.id, MAX_CAPABILITY_ID_LENGTH)} · ${safeLabel(candidate.type, 40)} · ${safeLabel(candidate.name, 120)} · ${safeLabel(eligibilityLabel, 20)}`);
       lines.push(`  Match: ${safeLabel(candidate.matchReason, MAX_EXPLANATION_LENGTH)}`);
       lines.push(`  Discovery source: ${safeLabel(candidate.discoverySource || "local capability catalog", 120)}`);
       const state = candidate.state || {};
@@ -509,8 +511,11 @@ function safeIdentifier(value) {
 function safeLabel(value, maxLength = 220) {
   return String(value ?? "unknown")
     .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/giu, "[redacted private key]")
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*$/giu, "[redacted private key]")
+    .replace(/\b(https?:\/\/)[^/@\s:]+:[^/@\s]+@/giu, "$1[redacted]@")
     .replace(/\b(?:sk-(?:proj-)?|gh[pousr]_|github_pat_|xox[baprs]-|AKIA)[A-Za-z0-9_-]{8,}\b/giu, "[redacted secret]")
-    .replace(/\b(authorization|bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|client[_-]?secret|private[_-]?key)\s*[:=]\s*[^\s,;]+/giu, "$1=[redacted]")
+    .replace(/\bBearer\s+[^\s,;]+/giu, "Bearer [redacted]")
+    .replace(/\b(authorization|bearer|api[_-]?key|(?:access|refresh|auth)?[_-]?token|password|passwd|secret|client[_-]?secret|private[_-]?key)\s*[:=]\s*[^\s,;]+/giu, "$1=[redacted]")
     .replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/gu, " ")
     .slice(0, maxLength);
 }

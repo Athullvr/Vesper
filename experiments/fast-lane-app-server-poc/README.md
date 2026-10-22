@@ -85,7 +85,7 @@ Vesper plan · advisory only · not executed
 Task category: database and SQL work
 Existing route: codex · codex_fallback
 Relevant capabilities:
-- mcp:postgres · mcp · PostgreSQL · usable
+- mcp:postgres · mcp · PostgreSQL · usable to try
   State: discovered yes; installed not_applicable; configured yes; enabled yes; available yes; loaded yes; operational unknown; ...
   Codex-reported MCP startup: ready; this is not a tool health check.
 Eligible to try: mcp:postgres
