@@ -14,17 +14,17 @@ function pluginCapability(item) {
   const id = marketplace
     ? `plugin:${encodeIdPart(marketplace)}/${encodeIdPart(item.name)}`
     : `plugin:${encodeIdPart(item.name)}`;
-  const cached = item.status === "installed";
+  const cached = item.installationStatus === "installed" || item.status === "installed";
   const availableForInstall = item.status === "available";
   return {
     id,
     type: "plugin",
     name: item.name,
-    displayName: item.name,
+    displayName: typeof item.displayName === "string" ? item.displayName : item.name,
     description: typeof item.description === "string" ? item.description : null,
     source: { name: item.source, location: normalizeLocations(item.location) },
     discoveryStatus: "discovered",
-    installationStatus: cached ? "installed" : availableForInstall ? "not_installed" : UNKNOWN,
+    installationStatus: item.installationStatus || (cached ? "installed" : availableForInstall ? "not_installed" : UNKNOWN),
     configurationStatus: UNKNOWN,
     availabilityStatus: availableForInstall ? "available_for_install" : UNKNOWN,
     operationalStatus: UNKNOWN,
@@ -45,7 +45,7 @@ function mcpCapability(item) {
     id: `mcp:${encodeIdPart(item.name)}`,
     type: "mcp",
     name: item.name,
-    displayName: item.name,
+    displayName: typeof item.displayName === "string" ? item.displayName : item.name,
     description: typeof item.description === "string" ? item.description : null,
     source: { name: item.source, location: normalizeLocations(item.location) },
     discoveryStatus: "discovered",
@@ -68,7 +68,7 @@ function skillCapability(item) {
     id: `skill:${String(sourceKey).split("/").map(encodeIdPart).join("/")}`,
     type: "skill",
     name: item.name,
-    displayName: item.name,
+    displayName: typeof item.displayName === "string" ? item.displayName : item.name,
     description: typeof item.description === "string" ? item.description : null,
     source: { name: item.source, location: normalizeLocations(item.location) },
     discoveryStatus: "discovered",
@@ -89,6 +89,24 @@ const defaultMappers = new Map([
   ["mcp", mcpCapability],
   ["skill", skillCapability],
 ]);
+const defaultSourceAdapters = new Map([
+  ["plugins", {
+    type: "plugin",
+    discover: ({ cwd, discoveryOptions }) => discoverPlugins({ cwd, ...discoveryOptions }),
+  }],
+  ["mcp", {
+    type: "mcp",
+    discover: ({ cwd, discoveryOptions, commandRunner }) => discoverMcp({
+      cwd,
+      codexHome: discoveryOptions.codexHome,
+      commandRunner,
+    }),
+  }],
+  ["skills", {
+    type: "skill",
+    discover: ({ cwd, discoveryOptions }) => discoverSkills({ cwd, ...discoveryOptions }),
+  }],
+]);
 
 function registerCapabilityType(type, mapper, registry = defaultMappers) {
   if (typeof type !== "string" || !/^[a-z][a-z0-9_-]{0,39}$/u.test(type)) {
@@ -99,57 +117,74 @@ function registerCapabilityType(type, mapper, registry = defaultMappers) {
   return registry;
 }
 
+function registerCapabilitySourceAdapter(sourceName, adapter, registry = defaultSourceAdapters) {
+  if (typeof sourceName !== "string" || !/^[a-z][a-z0-9_-]{0,39}$/u.test(sourceName)) {
+    throw new TypeError("Capability source names must be short lowercase identifiers.");
+  }
+  if (!adapter || typeof adapter !== "object" || typeof adapter.discover !== "function") {
+    throw new TypeError("A capability source adapter needs a discover function.");
+  }
+  if (typeof adapter.type !== "string" || !/^[a-z][a-z0-9_-]{0,39}$/u.test(adapter.type)) {
+    throw new TypeError("Capability source adapters need a capability type.");
+  }
+  registry.set(sourceName, Object.freeze({ type: adapter.type, discover: adapter.discover }));
+  return registry;
+}
+
 async function buildCapabilityCatalog({
   cwd,
   discoveryOptions = {},
   commandRunner,
   mapperRegistry = defaultMappers,
+  sourceAdapters = defaultSourceAdapters,
 } = {}) {
   if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required for capability discovery.");
-  const [plugins, mcp, skills] = await Promise.all([
-    Promise.resolve(discoverPlugins({ cwd, ...discoveryOptions })),
-    discoverMcp({
-      cwd,
-      codexHome: discoveryOptions.codexHome,
-      commandRunner,
-    }),
-    Promise.resolve(discoverSkills({ cwd, ...discoveryOptions })),
-  ]);
-  const sources = [plugins, mcp, skills];
+  const sources = await Promise.all([...sourceAdapters.entries()].map(async ([sourceName, adapter]) => {
+    let result;
+    try {
+      result = await adapter.discover({ cwd, discoveryOptions, commandRunner });
+    } catch {
+      result = { items: [], notes: ["Discovery source failed; related capability state is unknown."], failed: true };
+    }
+    return { sourceName, type: adapter.type, result };
+  }));
   const capabilities = [];
   const diagnostics = [];
 
-  for (const result of sources) {
+  for (const source of sources) {
+    const result = source.result;
     for (const note of result.notes || []) {
-      diagnostics.push({ type: result.category, message: String(note) });
+      diagnostics.push({ type: source.type, message: String(note) });
     }
     for (const item of result.items || []) {
       if (!item.name) {
-        if (item.detail) diagnostics.push({ type: result.category, message: String(item.detail) });
+        if (item.detail) diagnostics.push({ type: source.type, message: String(item.detail) });
         continue;
       }
-      const type = result.category === "plugins" ? "plugin" : result.category === "mcp" ? "mcp" : "skill";
-      const mapper = mapperRegistry.get(type);
+      const mapper = mapperRegistry.get(source.type);
       if (!mapper) {
-        diagnostics.push({ type, message: "No capability adapter is registered for this type." });
+        diagnostics.push({ type: source.type, message: "No capability adapter is registered for this type." });
         continue;
       }
       capabilities.push(mapper(item));
     }
-    if (result.failed) diagnostics.push({ type: result.category, message: "Discovery did not complete; related status remains unknown." });
+    if (result.failed) diagnostics.push({ type: source.type, message: "Discovery did not complete; related status remains unknown." });
   }
 
   capabilities.sort((left, right) => left.type.localeCompare(right.type) || left.id.localeCompare(right.id));
+  const discovery = {};
+  for (const source of sources) {
+    discovery[source.type] = {
+      failed: Boolean(source.result.failed),
+      count: (source.result.items || []).filter((item) => item.name).length,
+    };
+  }
   return {
     schemaVersion: 1,
     projectDirectory: cwd,
     capabilities,
     diagnostics,
-    discovery: {
-      plugins: { failed: Boolean(plugins.failed), count: plugins.items.filter((item) => item.name).length },
-      mcp: { failed: Boolean(mcp.failed), count: mcp.items.filter((item) => item.name).length },
-      skills: { failed: Boolean(skills.failed), count: skills.items.filter((item) => item.name).length },
-    },
+    discovery,
   };
 }
 
@@ -179,6 +214,7 @@ function createCapabilityProvider(options) {
           configured: capability.configurationStatus === "enabled" || capability.configurationStatus === "disabled"
             ? "yes"
             : capability.configurationStatus === "present" ? "unknown" : capability.configurationStatus === "unknown" ? "unknown" : "no",
+          installation: capability.installationStatus,
           availableForUse: capability.availabilityStatus === "available_for_use"
             ? "yes"
             : capability.availabilityStatus === "unavailable" || capability.availabilityStatus === "available_for_install"
@@ -221,7 +257,8 @@ function summarizeCatalog(catalog) {
     unknown: 0,
     byType: {},
   };
-  for (const type of CAPABILITY_TYPES) {
+  const types = new Set([...CAPABILITY_TYPES, ...catalog.capabilities.map((capability) => capability.type)]);
+  for (const type of [...types].sort()) {
     const entries = catalog.capabilities.filter((capability) => capability.type === type);
     summary.byType[type] = entries.length;
     for (const capability of entries) {
@@ -285,7 +322,7 @@ function renderCatalogStatus(catalog) {
     `Available to install: ${summary.availableForInstall}`,
     `Configured for use: ${summary.availableForUse} (operational state remains unknown)`,
     `Unknown availability: ${summary.unknown}`,
-    `By type: plugin ${summary.byType.plugin}, MCP ${summary.byType.mcp}, skill ${summary.byType.skill}`,
+    `By type: ${Object.entries(summary.byType).map(([type, count]) => `${safeText(type)} ${count}`).join(", ") || "none"}`,
   ];
   if (catalog.diagnostics.length) {
     lines.push("Discovery notes:");
@@ -303,7 +340,7 @@ function normalizeLocations(location) {
 }
 
 function normalizeSearch(value) {
-  return String(value ?? "").normalize("NFKC").toLocaleLowerCase().trim().replace(/\s+/gu, " ");
+  return String(value ?? "").normalize("NFKC").toLowerCase().trim().replace(/\s+/gu, " ");
 }
 
 function safeText(value) {
@@ -319,6 +356,7 @@ module.exports = {
   findCapability,
   normalizeLocations,
   registerCapabilityType,
+  registerCapabilitySourceAdapter,
   renderCapability,
   renderCapabilityList,
   renderCatalogStatus,

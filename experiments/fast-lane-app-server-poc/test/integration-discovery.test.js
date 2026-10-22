@@ -54,6 +54,26 @@ test("plugin discovery distinguishes cached, locally available, and unknown mark
   assert.match(output, /Remote, universal, and managed marketplace state is unknown/u);
 });
 
+test("an incompletely inspected plugin cache keeps cache-dependent state unknown", (t) => {
+  const root = fixture(t);
+  const project = path.join(root, "project");
+  const home = path.join(root, "home");
+  const codexHome = path.join(home, ".codex");
+  fs.mkdirSync(path.join(project, ".agents", "plugins"), { recursive: true });
+  fs.mkdirSync(path.join(root, "external-cache"), { recursive: true });
+  fs.mkdirSync(path.join(codexHome, "plugins"), { recursive: true });
+  fs.symlinkSync(path.join(root, "external-cache"), path.join(codexHome, "plugins", "cache"), "dir");
+  writeJson(path.join(project, ".agents", "plugins", "marketplace.json"), {
+    name: "repo-market",
+    plugins: [{ name: "possibly-cached", policy: { installation: "AVAILABLE" } }],
+  });
+
+  const result = discoverPlugins({ cwd: project, home, codexHome });
+  assert.equal(result.items[0].status, "unknown");
+  assert.match(result.items[0].detail, /cache state could not be fully checked/u);
+  assert.match(result.notes.join(" "), /cache-dependent installation state remains unknown/u);
+});
+
 test("skill discovery reports manifest availability without printing skill instructions", (t) => {
   const root = fixture(t);
   const project = path.join(root, "project");
@@ -128,4 +148,15 @@ test("MCP discovery reports unknown and a useful error without exposing process 
   assert.equal(result.items[0].status, "unknown");
   assert.match(output, /Codex CLI was not found on PATH/u);
   assert.doesNotMatch(output, /secret-token/u);
+});
+
+test("MCP discovery reports malformed JSON as unknown without echoing it", async () => {
+  const result = await discoverMcp({
+    cwd: "/workspace/project",
+    commandRunner: async () => "not-json private-token=secret",
+  });
+  const output = renderDiscovery(result);
+  assert.equal(result.failed, true);
+  assert.match(output, /malformed JSON/u);
+  assert.doesNotMatch(output, /private-token|secret/u);
 });

@@ -18,9 +18,11 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
   ];
   const uniqueFiles = new Map(marketplaceFiles.map((entry) => [path.resolve(entry.filePath), entry]));
   const cacheRoot = path.join(codexHome, "plugins", "cache");
-  const cachedPlugins = readPluginCache(cacheRoot, filesystem);
+  const cacheRead = readPluginCache(cacheRoot, filesystem);
+  const cachedPlugins = cacheRead.plugins;
   const entries = new Map();
   const notes = [];
+  if (!cacheRead.complete) notes.push("CODEX_HOME plugin cache could not be completely inspected; cache-dependent installation state remains unknown.");
 
   for (const marketplace of uniqueFiles.values()) {
     const result = readJsonFile(marketplace.filePath, filesystem);
@@ -43,17 +45,24 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
       const cached = cachedPlugins.get(key);
       const installed = Boolean(cached);
       const installation = plugin?.policy?.installation;
-      const status = installed ? "installed" : installation === "AVAILABLE" ? "available" : "unknown";
-      const detail = installed
-        ? "cached plugin copy found; enabled or loaded state is unknown"
-        : installation === "AVAILABLE"
-          ? "listed as available by this local marketplace"
-          : "marketplace entry exists, but its availability policy is not known";
+      let status = "unknown";
+      let detail = "marketplace entry exists, but its availability policy is not known";
+      if (installed) {
+        status = "installed";
+        detail = "cached plugin copy found; enabled or loaded state is unknown";
+      } else if (!cacheRead.complete) {
+        detail = "the plugin is listed, but cache state could not be fully checked";
+      } else if (installation === "AVAILABLE") {
+        status = "available";
+        detail = "listed as available by this local marketplace";
+      }
       entries.set(key, {
         name: pluginName,
+        displayName: safeName(plugin?.interface?.displayName) || safeName(plugin?.displayName) || pluginName,
         description: safeDescription(plugin?.description),
         marketplace: marketplaceName,
         status,
+        installationStatus: installed ? "installed" : cacheRead.complete ? "not_installed" : "unknown",
         source: installed ? `${marketplace.source}; CODEX_HOME plugin cache` : marketplace.source,
         location: installed ? [marketplace.filePath, cached.location] : [marketplace.filePath],
         detail,
@@ -67,9 +76,11 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
     if (entries.has(key)) continue;
     entries.set(key, {
       name: cached.name,
+      displayName: null,
       description: null,
       marketplace: cached.marketplace,
       status: "installed",
+      installationStatus: "installed",
       source: "CODEX_HOME/plugins/cache",
       location: [cached.location],
       detail: "cached plugin copy found; enabled or loaded state is unknown",
@@ -96,8 +107,25 @@ async function discoverMcp({ cwd, codexHome = defaultCodexHome(), commandRunner 
       encoding: "utf8",
     });
     const raw = typeof result === "string" ? result : result?.stdout;
-    const servers = JSON.parse(raw);
-    if (!Array.isArray(servers)) throw new Error("Codex returned an unexpected MCP list format.");
+    let servers;
+    try {
+      servers = JSON.parse(raw);
+    } catch {
+      return {
+        category: "mcp",
+        items: [{ name: null, status: "unknown", source, location, detail: "Codex returned malformed JSON for MCP discovery; server state is unknown." }],
+        notes: ["No server names or configuration values were printed."],
+        failed: true,
+      };
+    }
+    if (!Array.isArray(servers)) {
+      return {
+        category: "mcp",
+        items: [{ name: null, status: "unknown", source, location, detail: "Codex returned an unexpected MCP list format; server state is unknown." }],
+        notes: ["No server names or configuration values were printed."],
+        failed: true,
+      };
+    }
     const items = [];
     for (const server of servers.slice(0, MAX_SCAN_ENTRIES)) {
       const name = safeName(server?.name);
@@ -108,7 +136,7 @@ async function discoverMcp({ cwd, codexHome = defaultCodexHome(), commandRunner 
         : server.enabled === false
           ? "configured but disabled in Codex"
           : "configured; enabled state was not reported";
-      items.push({ name, description: safeDescription(server?.description), status, source, location, detail });
+      items.push({ name, displayName: safeName(server?.displayName), description: safeDescription(server?.description), status, source, location, detail });
     }
     items.sort(compareDiscoveryItems);
     const notes = [
@@ -169,16 +197,37 @@ function renderDiscovery(result) {
 function readPluginCache(cacheRoot, filesystem) {
   const results = new Map();
   const marketplaceDirectories = readDirectory(cacheRoot, filesystem);
-  if (marketplaceDirectories.status !== "ok") return results;
+  if (marketplaceDirectories.status === "missing") return { plugins: results, complete: true };
+  if (marketplaceDirectories.status !== "ok") return { plugins: results, complete: false };
   let scanned = 0;
+  let complete = true;
   for (const marketplace of marketplaceDirectories.entries) {
-    if (!marketplace.isDirectory() || marketplace.isSymbolicLink()) continue;
+    if (marketplace.isSymbolicLink()) {
+      complete = false;
+      continue;
+    }
+    if (!marketplace.isDirectory()) continue;
+    if (scanned >= MAX_SCAN_ENTRIES) return { plugins: results, complete: false };
+    scanned += 1;
     const pluginDirectories = readDirectory(path.join(cacheRoot, marketplace.name), filesystem);
-    if (pluginDirectories.status !== "ok") continue;
+    if (pluginDirectories.status !== "ok") {
+      complete = false;
+      continue;
+    }
     for (const plugin of pluginDirectories.entries) {
-      if (!plugin.isDirectory() || plugin.isSymbolicLink()) continue;
+      if (plugin.isSymbolicLink()) {
+        complete = false;
+        continue;
+      }
+      if (!plugin.isDirectory()) continue;
+      if (scanned >= MAX_SCAN_ENTRIES) return { plugins: results, complete: false };
+      scanned += 1;
       const versionDirectories = readDirectory(path.join(cacheRoot, marketplace.name, plugin.name), filesystem);
-      if (versionDirectories.status !== "ok" || !versionDirectories.entries.some((version) => version.isDirectory() && !version.isSymbolicLink())) continue;
+      if (versionDirectories.status !== "ok") {
+        complete = false;
+        continue;
+      }
+      if (!versionDirectories.entries.some((version) => version.isDirectory() && !version.isSymbolicLink())) continue;
       const marketplaceName = safeName(marketplace.name);
       const pluginName = safeName(plugin.name);
       if (!marketplaceName || !pluginName) continue;
@@ -187,11 +236,9 @@ function readPluginCache(cacheRoot, filesystem) {
         name: pluginName,
         location: path.join(cacheRoot, marketplace.name, plugin.name),
       });
-      scanned += 1;
-      if (scanned >= MAX_SCAN_ENTRIES) return results;
     }
   }
-  return results;
+  return { plugins: results, complete };
 }
 
 function readJsonFile(filePath, filesystem) {
@@ -225,7 +272,7 @@ function readSkillName(filePath, filesystem) {
     const frontmatter = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u)?.[1];
     const value = frontmatter?.match(/^\s*name\s*:\s*([^\r\n#]+?)\s*$/mu)?.[1]?.replace(/^["']|["']$/gu, "").trim();
     const rawDescription = frontmatter?.match(/^\s*description\s*:\s*([^\r\n]+?)\s*$/mu)?.[1]?.trim();
-    const description = rawDescription && !["|", ">", "|-", ">-"] .includes(rawDescription)
+    const description = rawDescription && !["|", ">", "|-", ">-"].includes(rawDescription)
       ? safeDescription(rawDescription.replace(/^["']|["']$/gu, ""))
       : null;
     const name = safeName(value);
@@ -263,6 +310,7 @@ function scanSkillDirectory(root, directory, depth, filesystem, entries, scan) {
         const relativeSkillPath = path.relative(root.directory, skillPath).split(path.sep).join("/");
         entries.push({
           name,
+          displayName: null,
           description: skill.description || null,
           status: skill.status === "ok" ? "available" : "unknown",
           source: `${root.source}/${relativeSkillPath}`,
@@ -313,7 +361,7 @@ function compareDiscoveryItems(left, right) {
   return left.name.localeCompare(right.name) || left.status.localeCompare(right.status);
 }
 
-function defaultCodexHome(home) {
+function defaultCodexHome(home = os.homedir()) {
   return path.resolve(process.env.CODEX_HOME || path.join(home, ".codex"));
 }
 

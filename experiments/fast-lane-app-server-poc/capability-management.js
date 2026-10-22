@@ -66,6 +66,7 @@ function parseMcpConfiguration(name, options) {
 async function runCapabilityOperation({
   operation,
   capabilityId,
+  capabilityType,
   mcpConfiguration,
   cwd,
   catalog,
@@ -93,7 +94,7 @@ async function runCapabilityOperation({
     }
     planned = planner({ capability, catalog, discoveryOptions });
   } else {
-    planned = planOperation({ operation, capabilityId, mcpConfiguration, catalog, discoveryOptions, adapterRegistry });
+    planned = planOperation({ operation, capabilityId, capabilityType, mcpConfiguration, catalog, discoveryOptions, adapterRegistry });
   }
 
   if (!planned.supported) {
@@ -132,7 +133,10 @@ async function runCapabilityOperation({
   try {
     backup = createConfigBackup(backupPlan, filesystem);
   } catch (error) {
-    errorOutput.write(`[Vesper capability error] Could not create the planned configuration backup: ${safeError(error)} No Codex command was run.\n`);
+    const partialBackup = backupPlan.path
+      ? ` Planned backup path: ${backupPlan.path}; verify it before using it for recovery.`
+      : "";
+    errorOutput.write(`[Vesper capability error] Could not create the planned configuration backup: ${safeError(error)} No Codex command was run.${partialBackup}\n`);
     return 1;
   }
 
@@ -158,7 +162,9 @@ async function runCapabilityOperation({
     errorOutput.write(`[Vesper capability error] Codex returned success, but Vesper could not verify the resulting state. No success is reported.${backup?.path ? ` Configuration backup: ${backup.path}` : ""}\n`);
     return 1;
   }
-  const verified = verifyOperation(planned, after);
+  const verified = typeof planned.verify === "function"
+    ? await planned.verify(after)
+    : verifyOperation(planned, after);
   if (!verified) {
     errorOutput.write(`[Vesper capability error] Codex returned success, but discovery did not confirm the requested state. No success is reported.${backup?.path ? ` Configuration backup: ${backup.path}` : ""}\n`);
     return 1;
@@ -170,10 +176,10 @@ async function runCapabilityOperation({
   return 0;
 }
 
-function planOperation({ operation, capabilityId, mcpConfiguration, catalog, discoveryOptions, adapterRegistry = defaultManagementAdapters }) {
+function planOperation({ operation, capabilityId, capabilityType = "mcp", mcpConfiguration, catalog, discoveryOptions, adapterRegistry = defaultManagementAdapters }) {
   if (operation === "configure") {
-    const planner = adapterRegistry.get("mcp")?.configure;
-    if (!planner) return { supported: false, reason: "No MCP configuration adapter is registered. No changes were made." };
+    const planner = adapterRegistry.get(capabilityType)?.configure;
+    if (!planner) return { supported: false, reason: `No ${safeTerminalText(capabilityType)} configuration adapter is registered. No changes were made.` };
     return planner({ mcpConfiguration, catalog, discoveryOptions });
   }
 
@@ -243,7 +249,7 @@ function planPluginRemoval({ capability }) {
     args: ["plugin", "remove", capability.marketplace ? `${capability.codexName}@${capability.marketplace}` : capability.codexName, "--json"],
     timeout: 30_000,
     recovery: `Reinstall it with "vesper capabilities install ${capability.id}" if the marketplace still provides it.`,
-    expectedState: "absent",
+    expectedState: "not_installed",
   };
 }
 
@@ -266,6 +272,7 @@ function verifyOperation(planned, catalog) {
   const matching = catalog.capabilities.find((capability) => capability.id === planned.id);
   if (planned.expectedState === "installed") return matching?.installationStatus === "installed";
   if (planned.expectedState === "configured") return matching?.type === "mcp" && matching.configurationStatus === "enabled";
+  if (planned.expectedState === "not_installed") return !matching || matching.installationStatus === "not_installed";
   if (planned.expectedState === "absent") return !matching;
   return false;
 }

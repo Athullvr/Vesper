@@ -34,7 +34,7 @@ Usage:
   vesper skills [PROJECT_DIRECTORY]
   vesper capabilities [list] [PROJECT_DIRECTORY]
   vesper capabilities show <ID> [PROJECT_DIRECTORY]
-  vesper capabilities search <QUERY>
+  vesper capabilities search <QUERY> [--project PROJECT_DIRECTORY]
   vesper capabilities status [PROJECT_DIRECTORY]
   vesper capabilities install <ID> [PROJECT_DIRECTORY]
   vesper capabilities remove <ID> [PROJECT_DIRECTORY]
@@ -71,7 +71,7 @@ const CAPABILITIES_USAGE = `Vesper capability catalog and management
 Usage:
   vesper capabilities [list] [PROJECT_DIRECTORY]
   vesper capabilities show ID [PROJECT_DIRECTORY]
-  vesper capabilities search QUERY
+  vesper capabilities search QUERY [--project PROJECT_DIRECTORY]
   vesper capabilities status [PROJECT_DIRECTORY]
   vesper capabilities install PLUGIN_ID [PROJECT_DIRECTORY]
   vesper capabilities remove PLUGIN_OR_MCP_ID [PROJECT_DIRECTORY]
@@ -109,9 +109,18 @@ function parseCapabilityArgs(args) {
   if (rest.length === 1 && ["--help", "-h"].includes(rest[0])) return { command: "capabilities", action, help: true };
 
   if (action === "search") {
+    let projectDirectory = null;
+    const projectOption = rest.indexOf("--project");
+    if (projectOption >= 0) {
+      if (projectOption !== rest.length - 2 || !rest[projectOption + 1]) {
+        throw new Error("Usage: vesper capabilities search QUERY [--project PROJECT_DIRECTORY].");
+      }
+      projectDirectory = rest[projectOption + 1];
+      rest = rest.slice(0, projectOption);
+    }
     const query = rest.join(" ").trim();
-    if (!query || query.startsWith("-")) throw new Error("Usage: vesper capabilities search QUERY.");
-    return { command: "capabilities", action, query, projectDirectory: null, help: false };
+    if (!query || query.startsWith("-")) throw new Error("Usage: vesper capabilities search QUERY [--project PROJECT_DIRECTORY].");
+    return { command: "capabilities", action, query, projectDirectory, help: false };
   }
 
   if (action === "configure") return parseCapabilityConfigureArgs(rest);
@@ -164,6 +173,7 @@ function parseCapabilityConfigureArgs(args) {
   return {
     command: "capabilities",
     action: "configure",
+    capabilityType: "mcp",
     projectDirectory: null,
     mcpConfiguration: { name, transport, command, url, args: mcpArgs, bearerTokenEnvVar },
     help: false,
@@ -345,6 +355,7 @@ async function runCapabilities(options, dependencies, output, errorOutput) {
     return runCapabilityOperation({
       operation: options.action,
       capabilityId: options.capabilityId,
+      capabilityType: options.capabilityType,
       mcpConfiguration: options.mcpConfiguration,
       cwd,
       catalog,
