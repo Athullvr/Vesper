@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { execFile } = require("node:child_process");
+const { inspectProjectPluginConfig, isSafePluginIdentity } = require("./plugin-project-config");
 
 const MAX_DISCOVERY_ITEMS = 100;
 const MAX_SCAN_ENTRIES = 2_000;
@@ -13,16 +14,18 @@ const MAX_SKILL_FILE_BYTES = 32_768;
 
 function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHome(home), filesystem = fs } = {}) {
   const marketplaceFiles = [
-    { filePath: path.join(cwd, ".agents", "plugins", "marketplace.json"), source: "project .agents/plugins/marketplace.json" },
-    { filePath: path.join(home, ".agents", "plugins", "marketplace.json"), source: "user ~/.agents/plugins/marketplace.json" },
+    { filePath: path.join(cwd, ".agents", "plugins", "marketplace.json"), source: "project .agents/plugins/marketplace.json", scope: "project" },
+    { filePath: path.join(home, ".agents", "plugins", "marketplace.json"), source: "user ~/.agents/plugins/marketplace.json", scope: "user" },
   ];
   const uniqueFiles = new Map(marketplaceFiles.map((entry) => [path.resolve(entry.filePath), entry]));
   const cacheRoot = path.join(codexHome, "plugins", "cache");
   const cacheRead = readPluginCache(cacheRoot, filesystem);
+  const projectConfig = inspectProjectPluginConfig(cwd, filesystem);
   const cachedPlugins = cacheRead.plugins;
   const entries = new Map();
   const notes = [];
   if (!cacheRead.complete) notes.push("CODEX_HOME plugin cache could not be completely inspected; cache-dependent installation state remains unknown.");
+  if (projectConfig.status !== "ok") notes.push("Project plugin settings could not be read safely; project configuration state remains unknown.");
 
   for (const marketplace of uniqueFiles.values()) {
     const result = readJsonFile(marketplace.filePath, filesystem);
@@ -42,8 +45,15 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
       const pluginName = safeName(plugin?.name);
       if (!pluginName) continue;
       const key = `${marketplaceName}\u0000${pluginName}`;
+      const previous = entries.get(key);
+      if (previous?.projectMarketplace && marketplace.scope !== "project") continue;
       const cached = cachedPlugins.get(key);
       const installed = Boolean(cached);
+      const projectMarketplace = marketplace.scope === "project";
+      const projectConfigIdentity = `${pluginName}@${marketplaceName}`;
+      const configurationStatus = projectMarketplace && projectConfig.status === "ok"
+        ? projectConfig.settings.get(projectConfigIdentity) || "unknown"
+        : "unknown";
       const installation = plugin?.policy?.installation;
       let status = "unknown";
       let detail = "marketplace entry exists, but its availability policy is not known";
@@ -56,11 +66,19 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
         status = "available";
         detail = "listed as available by this local marketplace";
       }
+      if (configurationStatus === "enabled_project") detail = "the project Codex config enables this plugin; effective enablement and runtime loading remain unknown";
+      if (configurationStatus === "disabled_project") detail = "the project Codex config disables this plugin; whether that project setting applies remains unknown";
       entries.set(key, {
         name: pluginName,
         displayName: safeName(plugin?.interface?.displayName) || safeName(plugin?.displayName) || pluginName,
         description: safeDescription(plugin?.description),
         marketplace: marketplaceName,
+        projectMarketplace,
+        projectConfigIdentity: projectMarketplace ? projectConfigIdentity : null,
+        projectConfigPath: projectMarketplace ? projectConfig.configPath : null,
+        projectConfigEditable: projectMarketplace && projectConfig.status === "ok" && projectConfig.safeToEdit &&
+          !projectConfig.blockedIdentities?.has(projectConfigIdentity) && isSafePluginIdentity(projectConfigIdentity),
+        configurationStatus,
         status,
         installationStatus: installed ? "installed" : cacheRead.complete ? "not_installed" : "unknown",
         source: installed ? `${marketplace.source}; CODEX_HOME plugin cache` : marketplace.source,
@@ -79,6 +97,11 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
       displayName: null,
       description: null,
       marketplace: cached.marketplace,
+      projectMarketplace: false,
+      projectConfigIdentity: null,
+      projectConfigPath: null,
+      projectConfigEditable: false,
+      configurationStatus: "unknown",
       status: "installed",
       installationStatus: "installed",
       source: "CODEX_HOME/plugins/cache",
@@ -92,7 +115,7 @@ function discoverPlugins({ cwd, home = os.homedir(), codexHome = defaultCodexHom
     notes.push("No local marketplace catalog or plugin cache entries were found; remote, universal, and managed plugin state is unknown.");
   }
   if (entries.size > MAX_DISCOVERY_ITEMS) notes.push(`Plugin output capped at ${MAX_DISCOVERY_ITEMS} entries.`);
-  notes.push("Remote, universal, and managed marketplace state is unknown; Codex enabled or runtime-loaded plugin state is also unknown. Vesper does not read plugin settings or query remote marketplaces.");
+  notes.push("Remote, universal, and managed marketplace state is unknown. Vesper reads only project .codex/config.toml for plugin overrides; user, cloud, system, trust, effective enablement, and runtime state remain unknown.");
   return { category: "plugins", items, notes };
 }
 

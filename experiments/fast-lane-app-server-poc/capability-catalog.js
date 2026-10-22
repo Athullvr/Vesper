@@ -16,6 +16,14 @@ function pluginCapability(item) {
     : `plugin:${encodeIdPart(item.name)}`;
   const cached = item.installationStatus === "installed" || item.status === "installed";
   const availableForInstall = item.status === "available";
+  const configurationStatus = item.configurationStatus === "enabled_project" || item.configurationStatus === "disabled_project"
+    ? item.configurationStatus
+    : UNKNOWN;
+  const actions = cached ? ["show", "remove"] : availableForInstall ? ["show", "install"] : ["show"];
+  if (cached && item.projectMarketplace && item.projectConfigEditable) {
+    if (configurationStatus !== "enabled_project") actions.push("enable");
+    if (configurationStatus !== "disabled_project") actions.push("disable");
+  }
   return {
     id,
     type: "plugin",
@@ -25,16 +33,20 @@ function pluginCapability(item) {
     source: { name: item.source, location: normalizeLocations(item.location) },
     discoveryStatus: "discovered",
     installationStatus: item.installationStatus || (cached ? "installed" : availableForInstall ? "not_installed" : UNKNOWN),
-    configurationStatus: UNKNOWN,
+    configurationStatus,
     availabilityStatus: availableForInstall ? "available_for_install" : UNKNOWN,
     operationalStatus: UNKNOWN,
     requirementsStatus: UNKNOWN,
     requiredPermissions: { status: UNKNOWN, items: [] },
     declaredCapabilities: { status: UNKNOWN, items: [] },
-    actions: cached ? ["show", "remove"] : availableForInstall ? ["show", "install"] : ["show"],
+    actions,
     detail: String(item.detail || "Capability metadata is unavailable."),
     marketplace,
     codexName: item.name,
+    projectMarketplace: item.projectMarketplace === true,
+    projectConfigIdentity: typeof item.projectConfigIdentity === "string" ? item.projectConfigIdentity : null,
+    projectConfigPath: typeof item.projectConfigPath === "string" ? item.projectConfigPath : null,
+    projectConfigEditable: item.projectConfigEditable === true,
   };
 }
 
@@ -51,7 +63,7 @@ function mcpCapability(item) {
     discoveryStatus: "discovered",
     installationStatus: "not_applicable",
     configurationStatus: configured ? (enabled ? "enabled" : "disabled") : UNKNOWN,
-    availabilityStatus: enabled === true ? "available_for_use" : enabled === false ? "unavailable" : UNKNOWN,
+    availabilityStatus: enabled === false ? "unavailable" : UNKNOWN,
     operationalStatus: UNKNOWN,
     requirementsStatus: UNKNOWN,
     requiredPermissions: { status: UNKNOWN, items: [] },
@@ -211,7 +223,7 @@ function createCapabilityProvider(options) {
           type: capability.type,
           name: capability.name,
           discovered: true,
-          configured: capability.configurationStatus === "enabled" || capability.configurationStatus === "disabled"
+          configured: ["enabled", "disabled", "enabled_project", "disabled_project"].includes(capability.configurationStatus)
             ? "yes"
             : capability.configurationStatus === "present" ? "unknown" : capability.configurationStatus === "unknown" ? "unknown" : "no",
           installation: capability.installationStatus,
@@ -252,6 +264,7 @@ function summarizeCatalog(catalog) {
     discovered: catalog.capabilities.length,
     configured: 0,
     disabled: 0,
+    enabledConfiguration: 0,
     availableForInstall: 0,
     availableForUse: 0,
     unknown: 0,
@@ -262,8 +275,9 @@ function summarizeCatalog(catalog) {
     const entries = catalog.capabilities.filter((capability) => capability.type === type);
     summary.byType[type] = entries.length;
     for (const capability of entries) {
-      if (capability.configurationStatus === "enabled" || capability.configurationStatus === "disabled") summary.configured += 1;
-      if (capability.configurationStatus === "disabled") summary.disabled += 1;
+      if (["enabled", "disabled", "enabled_project", "disabled_project"].includes(capability.configurationStatus)) summary.configured += 1;
+      if (capability.configurationStatus === "disabled" || capability.configurationStatus === "disabled_project") summary.disabled += 1;
+      if (capability.configurationStatus === "enabled" || capability.configurationStatus === "enabled_project") summary.enabledConfiguration += 1;
       if (capability.availabilityStatus === "available_for_install") summary.availableForInstall += 1;
       if (capability.availabilityStatus === "available_for_use") summary.availableForUse += 1;
       if (capability.availabilityStatus === UNKNOWN) summary.unknown += 1;
@@ -320,7 +334,8 @@ function renderCatalogStatus(catalog) {
     `Configured: ${summary.configured}`,
     `Disabled: ${summary.disabled}`,
     `Available to install: ${summary.availableForInstall}`,
-    `Configured for use: ${summary.availableForUse} (operational state remains unknown)`,
+    `Enabled configuration: ${summary.enabledConfiguration}`,
+    `Available for use: ${summary.availableForUse}`,
     `Unknown availability: ${summary.unknown}`,
     `By type: ${Object.entries(summary.byType).map(([type, count]) => `${safeText(type)} ${count}`).join(", ") || "none"}`,
   ];

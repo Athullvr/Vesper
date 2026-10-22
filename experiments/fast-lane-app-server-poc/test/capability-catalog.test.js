@@ -56,7 +56,7 @@ test("unified catalog assigns stable ids and separates discovery, configuration,
   const skill = findCapability(catalog, "skill:project/review/SKILL.md");
 
   assert.equal(active.configurationStatus, "enabled");
-  assert.equal(active.availabilityStatus, "available_for_use");
+  assert.equal(active.availabilityStatus, "unknown");
   assert.equal(active.operationalStatus, "unknown");
   assert.equal(plugin.installationStatus, "not_installed");
   assert.equal(plugin.availabilityStatus, "available_for_install");
@@ -68,7 +68,8 @@ test("unified catalog assigns stable ids and separates discovery, configuration,
   assert.deepEqual(skill.actions, ["show"]);
   assert.match(renderCapability(skill), /Location:|Locations:/u);
   const status = renderCatalogStatus(catalog);
-  assert.match(status, /Configured for use: 1 \(operational state remains unknown\)/u);
+  assert.match(status, /Enabled configuration: 1/u);
+  assert.match(status, /Available for use: 0/u);
   assert.doesNotMatch(status, /private-command|secret-token|private instruction body/u);
 });
 
@@ -279,4 +280,183 @@ test("confirmed MCP configuration uses the documented Codex add command without 
   assert.match(output.text(), /values omitted/u);
   assert.doesNotMatch(output.text() + errors.text(), /server-bin|argument-secret-value/u);
   assert.equal(errors.text(), "");
+});
+
+test("project plugin enable and disable preserve config, create private backups, and verify only the project setting", async (t) => {
+  const root = fixture(t);
+  const { project, home, codexHome } = createDiscoveryFixture(root);
+  const cached = path.join(codexHome, "plugins", "cache", "local-market", "candidate", "1.0.0");
+  fs.mkdirSync(cached, { recursive: true });
+  const projectCodex = path.join(project, ".codex");
+  fs.mkdirSync(projectCodex);
+  const config = path.join(projectCodex, "config.toml");
+  const original = '# preserve this comment\r\n[tool]\r\nvalue = "keep this value"\r\n';
+  fs.writeFileSync(config, original, { mode: 0o640 });
+  let listCalls = 0;
+
+  const run = async (action) => {
+    const output = capture();
+    const errors = capture();
+    const status = await runVesper(["capabilities", action, "plugin:local-market/candidate", project], {
+      output: output.stream,
+      errorOutput: errors.stream,
+      discoveryOptions: { home, codexHome },
+      codexCommandRunner: async (_command, args) => {
+        assert.deepEqual(args, ["mcp", "list", "--json"]);
+        listCalls += 1;
+        return "[]";
+      },
+      confirmCapabilityAction: async (request) => {
+        assert.equal(request.id, "plugin:local-market/candidate");
+        assert.match(request.summary, /project-scoped Codex override/u);
+        assert.equal(request.configPath, config);
+        return true;
+      },
+    });
+    assert.equal(errors.text(), "");
+    return { status, output: output.text() };
+  };
+
+  const enabled = await run("enable");
+  assert.equal(enabled.status, 0, `${enabled.output}`);
+  assert.match(enabled.output, /Completed and verified/u);
+  assert.match(enabled.output, /\.codex\/config\.toml/u);
+  const afterEnable = fs.readFileSync(config, "utf8");
+  assert.ok(afterEnable.startsWith(original));
+  assert.match(afterEnable, /\[plugins\."candidate@local-market"\]\r?\nenabled = true/u);
+  assert.equal(fs.statSync(config).mode & 0o777, 0o640);
+  let backups = fs.readdirSync(projectCodex).filter((name) => name.includes("config.toml.vesper-backup-"));
+  assert.equal(backups.length, 1);
+  assert.equal(fs.readFileSync(path.join(projectCodex, backups[0]), "utf8"), original);
+  assert.equal(fs.statSync(path.join(projectCodex, backups[0])).mode & 0o777, 0o600);
+
+  const catalog = await buildCapabilityCatalog({
+    cwd: project,
+    discoveryOptions: { home, codexHome },
+    commandRunner: async () => "[]",
+  });
+  const plugin = findCapability(catalog, "plugin:local-market/candidate");
+  assert.equal(plugin.configurationStatus, "enabled_project");
+  assert.equal(plugin.availabilityStatus, "unknown");
+  assert.ok(plugin.actions.includes("disable"));
+
+  const disabled = await run("disable");
+  assert.equal(disabled.status, 0);
+  assert.match(fs.readFileSync(config, "utf8"), /enabled = false/u);
+  backups = fs.readdirSync(projectCodex).filter((name) => name.includes("config.toml.vesper-backup-"));
+  assert.equal(backups.length, 2);
+  const backupContents = backups.map((name) => fs.readFileSync(path.join(projectCodex, name), "utf8"));
+  assert.ok(backupContents.includes(original));
+  assert.ok(backupContents.includes(afterEnable));
+  assert.equal(listCalls, 4);
+  assert.doesNotMatch(enabled.output + disabled.output, /keep this value|preserve this comment/u);
+});
+
+test("enabling a project plugin in a project without Codex config states and applies the new file modes", async (t) => {
+  const root = fixture(t);
+  const { project, home, codexHome } = createDiscoveryFixture(root);
+  fs.mkdirSync(path.join(codexHome, "plugins", "cache", "local-market", "candidate", "1.0.0"), { recursive: true });
+  const config = path.join(project, ".codex", "config.toml");
+  const output = capture();
+  const errors = capture();
+  const status = await runVesper(["capabilities", "enable", "plugin:local-market/candidate", project], {
+    output: output.stream,
+    errorOutput: errors.stream,
+    discoveryOptions: { home, codexHome },
+    codexCommandRunner: async () => "[]",
+    confirmCapabilityAction: async (request) => {
+      assert.match(request.summary, /new config file uses mode 0600/u);
+      assert.match(request.summary, /requested mode 0700/u);
+      return true;
+    },
+  });
+
+  assert.equal(status, 0);
+  assert.equal(errors.text(), "");
+  assert.match(fs.readFileSync(config, "utf8"), /enabled = true/u);
+  assert.equal(fs.statSync(config).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.dirname(config)).mode & 0o077, 0);
+  assert.match(output.text(), /no existing .*config.toml is present/u);
+});
+
+test("project plugin toggle refuses a cache-only plugin before confirmation or backup", async (t) => {
+  const root = fixture(t);
+  const { project, home, codexHome } = createDiscoveryFixture(root);
+  fs.mkdirSync(path.join(codexHome, "plugins", "cache", "local-market", "candidate", "1.0.0"), { recursive: true });
+  fs.unlinkSync(path.join(project, ".agents", "plugins", "marketplace.json"));
+  let confirmations = 0;
+  let listCalls = 0;
+  const output = capture();
+  const errors = capture();
+  const status = await runVesper(["capabilities", "enable", "plugin:local-market/candidate", project], {
+    output: output.stream,
+    errorOutput: errors.stream,
+    discoveryOptions: { home, codexHome },
+    codexCommandRunner: async () => {
+      listCalls += 1;
+      return "[]";
+    },
+    confirmCapabilityAction: async () => { confirmations += 1; return true; },
+  });
+
+  assert.equal(status, 1);
+  assert.equal(listCalls, 1);
+  assert.equal(confirmations, 0);
+  assert.equal(fs.existsSync(path.join(project, ".codex", "config.toml")), false);
+  assert.match(errors.text(), /installed plugin listed in this project's local marketplace/u);
+});
+
+test("project plugin toggle refuses a duplicate plugin table before confirmation and preserves config", async (t) => {
+  const root = fixture(t);
+  const { project, home, codexHome } = createDiscoveryFixture(root);
+  fs.mkdirSync(path.join(codexHome, "plugins", "cache", "local-market", "candidate", "1.0.0"), { recursive: true });
+  const projectCodex = path.join(project, ".codex");
+  fs.mkdirSync(projectCodex);
+  const config = path.join(projectCodex, "config.toml");
+  const original = '[plugins."candidate@local-market"]\nenabled = false\n[plugins."candidate@local-market"]\nenabled = true\n';
+  fs.writeFileSync(config, original, { mode: 0o600 });
+  let confirmations = 0;
+  const output = capture();
+  const errors = capture();
+  const status = await runVesper(["capabilities", "enable", "plugin:local-market/candidate", project], {
+    output: output.stream,
+    errorOutput: errors.stream,
+    discoveryOptions: { home, codexHome },
+    codexCommandRunner: async () => "[]",
+    confirmCapabilityAction: async () => { confirmations += 1; return true; },
+  });
+
+  assert.equal(status, 1);
+  assert.equal(confirmations, 0);
+  assert.equal(fs.readFileSync(config, "utf8"), original);
+  assert.deepEqual(fs.readdirSync(projectCodex), ["config.toml"]);
+  assert.match(errors.text(), /cannot safely edit the project Codex config/u);
+});
+
+test("project plugin toggle detects a config created after confirmation instead of changing it without a backup", async (t) => {
+  const root = fixture(t);
+  const { project, home, codexHome } = createDiscoveryFixture(root);
+  fs.mkdirSync(path.join(codexHome, "plugins", "cache", "local-market", "candidate", "1.0.0"), { recursive: true });
+  const projectCodex = path.join(project, ".codex");
+  const config = path.join(projectCodex, "config.toml");
+  const externalConfig = '# created while the operation was awaiting confirmation\n';
+  const output = capture();
+  const errors = capture();
+  const status = await runVesper(["capabilities", "enable", "plugin:local-market/candidate", project], {
+    output: output.stream,
+    errorOutput: errors.stream,
+    discoveryOptions: { home, codexHome },
+    codexCommandRunner: async () => "[]",
+    confirmCapabilityAction: async () => {
+      fs.mkdirSync(projectCodex);
+      fs.writeFileSync(config, externalConfig, { mode: 0o600 });
+      return true;
+    },
+  });
+
+  assert.equal(status, 1);
+  assert.equal(fs.readFileSync(config, "utf8"), externalConfig);
+  assert.deepEqual(fs.readdirSync(projectCodex), ["config.toml"]);
+  assert.match(errors.text(), /appeared after confirmation/u);
+  assert.doesNotMatch(output.text(), /Completed and verified/u);
 });

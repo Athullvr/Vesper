@@ -5,6 +5,7 @@ const path = require("node:path");
 const { randomBytes } = require("node:crypto");
 const { buildCapabilityCatalog, findCapability } = require("./capability-catalog");
 const { defaultCodexHome, runCodexCommand } = require("./integration-discovery");
+const { configFingerprint, inspectProjectPluginConfig, isSafePluginIdentity, setProjectPluginEnabled } = require("./plugin-project-config");
 
 const MAX_BACKUP_BYTES = 4 * 1024 * 1024;
 const VALID_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u;
@@ -89,12 +90,12 @@ async function runCapabilityOperation({
     const planner = capability && adapterRegistry.get(capability.type)?.[operation];
     if (!planner) {
       output.write(`Unsupported action: Vesper cannot ${operation} ${target} through a documented provider interface. No changes were made.\n`);
-      output.write("Codex exposes no enable/disable operation for these discovered capability types. MCP can be removed and configured again; plugin and skill runtime activation remains unknown.\n");
+      output.write("Project enable/disable is limited to installed plugins from this project's local marketplace. Standalone MCP and skill toggles are unsupported.\n");
       return 1;
     }
-    planned = planner({ capability, catalog, discoveryOptions });
+    planned = planner({ capability, catalog, discoveryOptions, cwd, filesystem, operation });
   } else {
-    planned = planOperation({ operation, capabilityId, capabilityType, mcpConfiguration, catalog, discoveryOptions, adapterRegistry });
+    planned = planOperation({ operation, capabilityId, capabilityType, mcpConfiguration, catalog, discoveryOptions, adapterRegistry, cwd, filesystem });
   }
 
   if (!planned.supported) {
@@ -103,9 +104,10 @@ async function runCapabilityOperation({
   }
 
   const codexHome = discoveryOptions.codexHome || defaultCodexHome(discoveryOptions.home);
+  const configPath = planned.configPath || path.join(codexHome, "config.toml");
   let backupPlan;
   try {
-    backupPlan = planConfigBackup(codexHome, filesystem);
+    backupPlan = planConfigBackupAtPath(configPath, filesystem);
   } catch (error) {
     errorOutput.write(`[Vesper capability error] Cannot safely prepare a Codex configuration backup: ${safeError(error)} No changes were made.\n`);
     return 1;
@@ -120,6 +122,7 @@ async function runCapabilityOperation({
       id: expectedConfirmation,
       summary: planned.summary,
       backupPath: backupPlan.path,
+      configPath: backupPlan.configPath,
     }) === true;
   } catch {
     approved = false;
@@ -141,16 +144,22 @@ async function runCapabilityOperation({
   }
 
   try {
-    await commandRunner("codex", planned.args, {
-      cwd,
-      timeout: planned.timeout,
-      maxBuffer: 1_048_576,
-      encoding: "utf8",
-    });
+    if (typeof planned.apply === "function") {
+      await planned.apply({ cwd, filesystem, backup });
+    } else {
+      await commandRunner("codex", planned.args, {
+        cwd,
+        timeout: planned.timeout,
+        maxBuffer: 1_048_576,
+        encoding: "utf8",
+      });
+    }
   } catch (error) {
-    const reason = error?.code === "ENOENT"
-      ? "Codex CLI was not found on PATH."
-      : "The Codex command failed; its raw output was suppressed to avoid exposing configuration values.";
+    const reason = typeof planned.apply === "function"
+      ? `The project configuration change failed: ${safeError(error)}.`
+      : error?.code === "ENOENT"
+        ? "Codex CLI was not found on PATH."
+        : "The Codex command failed; its raw output was suppressed to avoid exposing configuration values.";
     errorOutput.write(`[Vesper capability error] ${reason}${backup?.path ? ` Configuration backup: ${backup.path}` : ""}\n`);
     return 1;
   }
@@ -176,11 +185,11 @@ async function runCapabilityOperation({
   return 0;
 }
 
-function planOperation({ operation, capabilityId, capabilityType = "mcp", mcpConfiguration, catalog, discoveryOptions, adapterRegistry = defaultManagementAdapters }) {
+function planOperation({ operation, capabilityId, capabilityType = "mcp", mcpConfiguration, catalog, discoveryOptions, adapterRegistry = defaultManagementAdapters, cwd, filesystem = fs }) {
   if (operation === "configure") {
     const planner = adapterRegistry.get(capabilityType)?.configure;
     if (!planner) return { supported: false, reason: `No ${safeTerminalText(capabilityType)} configuration adapter is registered. No changes were made.` };
-    return planner({ mcpConfiguration, catalog, discoveryOptions });
+    return planner({ mcpConfiguration, catalog, discoveryOptions, cwd, filesystem, operation });
   }
 
   if (!new Set(["install", "remove"]).has(operation)) {
@@ -190,7 +199,7 @@ function planOperation({ operation, capabilityId, capabilityType = "mcp", mcpCon
   if (!capability) return { supported: false, reason: `Capability ${safeTerminalText(capabilityId)} was not found in the current local catalog. No changes were made.` };
   const planner = adapterRegistry.get(capability.type)?.[operation];
   if (!planner) return { supported: false, reason: `No ${safeTerminalText(operation)} adapter is registered for ${capability.type}; no changes were made.` };
-  return planner({ capability, catalog, discoveryOptions });
+  return planner({ capability, catalog, discoveryOptions, cwd, filesystem, operation });
 }
 
 function planMcpConfiguration({ mcpConfiguration, catalog }) {
@@ -253,6 +262,44 @@ function planPluginRemoval({ capability }) {
   };
 }
 
+function planPluginToggle({ capability, operation, cwd, filesystem = fs }) {
+  if (!capability.projectMarketplace || capability.installationStatus !== "installed") {
+    return { supported: false, reason: `Project enable/disable is supported only for an installed plugin listed in this project's local marketplace. No changes were made.` };
+  }
+  if (!capability.projectConfigEditable || !capability.projectConfigPath || !capability.projectConfigIdentity) {
+    return { supported: false, reason: `Vesper cannot safely edit the project Codex config for ${capability.id}. No changes were made.` };
+  }
+  const expectedConfigPath = path.resolve(cwd, ".codex", "config.toml");
+  if (path.resolve(capability.projectConfigPath) !== expectedConfigPath || !isSafePluginIdentity(capability.projectConfigIdentity)) {
+    return { supported: false, reason: `The project config target for ${capability.id} could not be verified. No changes were made.` };
+  }
+  const inspected = inspectProjectPluginConfig(cwd, filesystem);
+  if (inspected.status !== "ok" || !inspected.safeToEdit || inspected.blockedIdentities?.has(capability.projectConfigIdentity)) {
+    return { supported: false, reason: `Project .codex/config.toml is not safe to edit. No changes were made.` };
+  }
+  const enabled = operation === "enable";
+  const targetState = enabled ? "enabled_project" : "disabled_project";
+  if (inspected.settings.get(capability.projectConfigIdentity) === targetState) {
+    return { supported: false, reason: `The project plugin setting is already ${enabled ? "enabled" : "disabled"}. No changes were made.` };
+  }
+  const setting = `[plugins.${JSON.stringify(capability.projectConfigIdentity)}].enabled`;
+  const recoveryOperation = enabled ? "disable" : "enable";
+  const projectConfigPath = inspected.configPath;
+  const permissionSummary = inspected.exists
+    ? "The existing config file mode is preserved."
+    : `A new config file uses mode 0600${inspected.directoryExists ? "" : "; a missing .codex directory is created with requested mode 0700, subject to the process umask"}.`;
+  return {
+    supported: true,
+    operation,
+    id: capability.id,
+    configPath: projectConfigPath,
+    summary: `Set ${setting} = ${enabled} in ${projectConfigPath}. ${permissionSummary} This is a project-scoped Codex override; project trust, effective enablement, and runtime loading remain unknown.`,
+    apply: ({ filesystem: targetFilesystem, backup }) => setProjectPluginEnabled(cwd, capability.projectConfigIdentity, enabled, targetFilesystem, backup),
+    recovery: `Set the same project plugin setting back with "vesper capabilities ${recoveryOperation} ${capability.id}".`,
+    expectedState: targetState,
+  };
+}
+
 function planMcpRemoval({ capability }) {
   if (!capability.actions.includes("remove")) return { supported: false, reason: `Remove is not supported for ${capability.id}. No changes were made.` };
   return {
@@ -272,18 +319,31 @@ function verifyOperation(planned, catalog) {
   const matching = catalog.capabilities.find((capability) => capability.id === planned.id);
   if (planned.expectedState === "installed") return matching?.installationStatus === "installed";
   if (planned.expectedState === "configured") return matching?.type === "mcp" && matching.configurationStatus === "enabled";
+  if (planned.expectedState === "enabled_project" || planned.expectedState === "disabled_project") return matching?.configurationStatus === planned.expectedState;
   if (planned.expectedState === "not_installed") return !matching || matching.installationStatus === "not_installed";
   if (planned.expectedState === "absent") return !matching;
   return false;
 }
 
 function planConfigBackup(codexHome, filesystem) {
-  const configPath = path.join(codexHome, "config.toml");
+  return planConfigBackupAtPath(path.join(codexHome, "config.toml"), filesystem);
+}
+
+function planConfigBackupAtPath(configPath, filesystem) {
+  const directoryPath = path.dirname(configPath);
+  let directory;
+  try {
+    directory = filesystem.lstatSync(directoryPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return { configPath, directoryPath, path: null, missing: true };
+    throw error;
+  }
+  if (directory.isSymbolicLink() || !directory.isDirectory()) throw new Error("the configuration directory is not a regular directory.");
   let stat;
   try {
     stat = filesystem.lstatSync(configPath);
   } catch (error) {
-    if (error.code === "ENOENT") return { configPath, path: null, missing: true };
+    if (error.code === "ENOENT") return { configPath, directoryPath, path: null, missing: true };
     throw error;
   }
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("config.toml is not a regular file.");
@@ -291,28 +351,47 @@ function planConfigBackup(codexHome, filesystem) {
   const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
   return {
     configPath,
-    path: path.join(codexHome, `config.toml.vesper-backup-${stamp}-${randomBytes(4).toString("hex")}.bak`),
+    directoryPath,
+    path: path.join(directoryPath, `config.toml.vesper-backup-${stamp}-${randomBytes(4).toString("hex")}.bak`),
     missing: false,
   };
 }
 
 function createConfigBackup(plan, filesystem) {
-  if (plan.missing) return { path: null, missing: true };
+  if (plan.missing) {
+    let directory;
+    try {
+      directory = filesystem.lstatSync(plan.directoryPath);
+      if (directory.isSymbolicLink() || !directory.isDirectory()) throw new Error("the configuration directory changed and is not a regular directory.");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    try {
+      filesystem.lstatSync(plan.configPath);
+      throw new Error("config.toml appeared after confirmation; no unbacked change was made.");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    return { path: null, missing: true };
+  }
   const noFollow = filesystem.constants?.O_NOFOLLOW || 0;
   const sourceFd = filesystem.openSync(plan.configPath, filesystem.constants.O_RDONLY | noFollow);
   let backupFd;
+  let backupFingerprint;
   try {
     const stat = filesystem.fstatSync(sourceFd);
-    if (!stat.isFile() || stat.size > MAX_BACKUP_BYTES) throw new Error("config.toml changed or is no longer a regular file.");
+    if (!stat.isFile() || stat.size > MAX_BACKUP_BYTES) throw new Error("the configuration changed or is no longer a regular file.");
     const content = filesystem.readFileSync(sourceFd);
+    backupFingerprint = configFingerprint(stat, content);
     backupFd = filesystem.openSync(plan.path, "wx", 0o600);
     filesystem.writeFileSync(backupFd, content);
     filesystem.fchmodSync(backupFd, 0o600);
+    filesystem.fsyncSync(backupFd);
   } finally {
     filesystem.closeSync(sourceFd);
     if (backupFd !== undefined) filesystem.closeSync(backupFd);
   }
-  return { path: plan.path, missing: false };
+  return { path: plan.path, missing: false, fingerprint: backupFingerprint };
 }
 
 function renderOperationPlan(planned, backupPlan) {
@@ -322,8 +401,8 @@ function renderOperationPlan(planned, backupPlan) {
     `Operation: ${planned.operation}`,
     `Changes: ${safeTerminalText(planned.summary)}`,
   ];
-  if (backupPlan.path) lines.push(`Backup: copy the existing CODEX_HOME/config.toml to ${safeTerminalText(backupPlan.path)} with mode 0600.`);
-  else lines.push("Backup: no existing CODEX_HOME/config.toml is present; Vesper will use the inverse Codex command for recovery.");
+  if (backupPlan.path) lines.push(`Backup: copy the existing ${safeTerminalText(backupPlan.configPath)} to ${safeTerminalText(backupPlan.path)} with mode 0600.`);
+  else lines.push(`Backup: no existing ${safeTerminalText(backupPlan.configPath)} is present; use the recovery instruction if the operation needs to be reversed.`);
   lines.push(`Recovery: ${safeTerminalText(planned.recovery)}`);
   lines.push(`Confirmation required: type the exact identifier ${safeTerminalText(planned.id)}.`);
   return `${lines.join("\n")}\n`;
@@ -351,6 +430,8 @@ function safeError(error) {
 registerCapabilityManagementAdapter("plugin", {
   install: planPluginInstall,
   remove: planPluginRemoval,
+  enable: planPluginToggle,
+  disable: planPluginToggle,
 });
 registerCapabilityManagementAdapter("mcp", {
   configure: planMcpConfiguration,
@@ -361,6 +442,7 @@ module.exports = {
   createConfigBackup,
   parseMcpConfiguration,
   planConfigBackup,
+  planConfigBackupAtPath,
   planOperation,
   registerCapabilityManagementAdapter,
   renderOperationPlan,

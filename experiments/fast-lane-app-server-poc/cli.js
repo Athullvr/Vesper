@@ -39,7 +39,7 @@ Usage:
   vesper capabilities install <ID> [PROJECT_DIRECTORY]
   vesper capabilities remove <ID> [PROJECT_DIRECTORY]
   vesper capabilities configure mcp <NAME> (--stdio <COMMAND> [--arg <ARG> ...] | --url <HTTPS_URL> [--bearer-token-env-var <NAME>])
-  vesper capabilities enable|disable <ID>
+  vesper capabilities enable|disable <ID> [PROJECT_DIRECTORY]
   vesper --help
 
 Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
@@ -77,12 +77,13 @@ Usage:
   vesper capabilities remove PLUGIN_OR_MCP_ID [PROJECT_DIRECTORY]
   vesper capabilities configure mcp NAME --stdio COMMAND [--arg ARG ...]
   vesper capabilities configure mcp NAME --url HTTPS_URL [--bearer-token-env-var NAME]
-  vesper capabilities enable|disable ID
+  vesper capabilities enable|disable ID [PROJECT_DIRECTORY]
 
 Management operations show their target, intended change, backup/recovery guidance, and require
-typing the exact capability ID. Vesper uses documented Codex CLI commands and does not accept
+typing the exact capability ID. Vesper uses documented Codex CLI commands and the documented
+project plugin setting. Project enable/disable is supported for installed plugins from this project's
+local marketplace; standalone MCP and skill toggles remain unsupported. Vesper does not accept
 environment-variable values. Discovery never proves that Codex loaded or can operate a capability.
-Enable/disable is currently unsupported by the inspected provider interfaces.
 `;
 
 function parseArgs(argv) {
