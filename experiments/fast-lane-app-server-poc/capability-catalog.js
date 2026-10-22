@@ -1,9 +1,11 @@
 "use strict";
 
 const { discoverMcp, discoverPlugins, discoverSkills } = require("./integration-discovery");
+const { RUNTIME_SOURCE, createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 
 const CAPABILITY_TYPES = Object.freeze(["plugin", "mcp", "skill"]);
 const UNKNOWN = "unknown";
+const RUNTIME_INSPECTION_TIMEOUT_MS = 2_000;
 
 function encodeIdPart(value) {
   return encodeURIComponent(String(value)).replace(/%[0-9a-f]{2}/giu, (escape) => escape.toUpperCase());
@@ -34,8 +36,11 @@ function pluginCapability(item) {
     discoveryStatus: "discovered",
     installationStatus: item.installationStatus || (cached ? "installed" : availableForInstall ? "not_installed" : UNKNOWN),
     configurationStatus,
+    enabledStatus: statusFromConfiguration(configurationStatus),
     availabilityStatus: availableForInstall ? "available_for_install" : UNKNOWN,
+    runtimeLoadedStatus: UNKNOWN,
     operationalStatus: UNKNOWN,
+    runtimeEvidence: unknownRuntimeEvidence(),
     requirementsStatus: UNKNOWN,
     requiredPermissions: { status: UNKNOWN, items: [] },
     declaredCapabilities: { status: UNKNOWN, items: [] },
@@ -63,8 +68,11 @@ function mcpCapability(item) {
     discoveryStatus: "discovered",
     installationStatus: "not_applicable",
     configurationStatus: configured ? (enabled ? "enabled" : "disabled") : UNKNOWN,
+    enabledStatus: enabled === true ? "yes" : enabled === false ? "no" : UNKNOWN,
     availabilityStatus: enabled === false ? "unavailable" : UNKNOWN,
+    runtimeLoadedStatus: UNKNOWN,
     operationalStatus: UNKNOWN,
+    runtimeEvidence: unknownRuntimeEvidence(),
     requirementsStatus: UNKNOWN,
     requiredPermissions: { status: UNKNOWN, items: [] },
     declaredCapabilities: { status: UNKNOWN, items: [] },
@@ -86,8 +94,11 @@ function skillCapability(item) {
     discoveryStatus: "discovered",
     installationStatus: "not_applicable",
     configurationStatus: item.status === "available" ? "present" : UNKNOWN,
+    enabledStatus: UNKNOWN,
     availabilityStatus: UNKNOWN,
+    runtimeLoadedStatus: UNKNOWN,
     operationalStatus: UNKNOWN,
+    runtimeEvidence: unknownRuntimeEvidence(),
     requirementsStatus: UNKNOWN,
     requiredPermissions: { status: UNKNOWN, items: [] },
     declaredCapabilities: { status: UNKNOWN, items: [] },
@@ -149,6 +160,7 @@ async function buildCapabilityCatalog({
   commandRunner,
   mapperRegistry = defaultMappers,
   sourceAdapters = defaultSourceAdapters,
+  runtimeStatusAdapter = createCodexRuntimeStatusAdapter(),
 } = {}) {
   if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required for capability discovery.");
   const sources = await Promise.all([...sourceAdapters.entries()].map(async ([sourceName, adapter]) => {
@@ -184,6 +196,8 @@ async function buildCapabilityCatalog({
   }
 
   capabilities.sort((left, right) => left.type.localeCompare(right.type) || left.id.localeCompare(right.id));
+  const runtimeInspection = await inspectRuntimeStatus(runtimeStatusAdapter, createRuntimeStatusContext(cwd, capabilities));
+  applyRuntimeInspection(capabilities, runtimeInspection);
   const discovery = {};
   for (const source of sources) {
     discovery[source.type] = {
@@ -195,6 +209,7 @@ async function buildCapabilityCatalog({
     schemaVersion: 1,
     projectDirectory: cwd,
     capabilities,
+    runtimeInspection,
     diagnostics,
     discovery,
   };
@@ -215,29 +230,229 @@ function createCapabilityProvider(options) {
       return load();
     },
     async getRouterContext() {
-      const catalog = await load();
+      let catalog = await load();
+      if (options?.runtimeStatusAdapter) {
+        const base = {
+          ...catalog,
+          capabilities: catalog.capabilities.map((capability) => ({
+            ...capability,
+            availabilityStatus: capability.type === "mcp"
+              ? capability.configurationStatus === "disabled" ? "unavailable" : UNKNOWN
+              : capability.type === "plugin" && capability.availabilityStatus === "available_for_install"
+                ? "available_for_install"
+                : UNKNOWN,
+            runtimeLoadedStatus: UNKNOWN,
+            operationalStatus: UNKNOWN,
+            runtimeEvidence: unknownRuntimeEvidence("unknown", "No runtime evidence is available.", catalog.runtimeInspection.source),
+          })),
+        };
+        const runtimeInspection = await inspectRuntimeStatus(
+          options.runtimeStatusAdapter,
+          createRuntimeStatusContext(base.projectDirectory, base.capabilities),
+        );
+        applyRuntimeInspection(base.capabilities, runtimeInspection);
+        base.runtimeInspection = runtimeInspection;
+        catalog = base;
+      }
       return {
         schemaVersion: 1,
+        runtimeInspection: catalog.runtimeInspection.status,
         items: catalog.capabilities.map((capability) => ({
-          id: capability.id,
-          type: capability.type,
-          name: capability.name,
+          id: safeText(capability.id).slice(0, 240),
+          type: safeText(capability.type).slice(0, 40),
+          name: safeText(capability.name).slice(0, 120),
           discovered: true,
-          configured: ["enabled", "disabled", "enabled_project", "disabled_project"].includes(capability.configurationStatus)
-            ? "yes"
-            : capability.configurationStatus === "present" ? "unknown" : capability.configurationStatus === "unknown" ? "unknown" : "no",
-          installation: capability.installationStatus,
+          enabled: normalizeYesNoUnknown(capability.enabledStatus),
+          configured: normalizeConfiguredStatus(capability.configurationStatus),
+          installation: ["installed", "not_installed", "not_applicable", UNKNOWN].includes(capability.installationStatus) ? capability.installationStatus : UNKNOWN,
           availableForUse: capability.availabilityStatus === "available_for_use"
             ? "yes"
             : capability.availabilityStatus === "unavailable" || capability.availabilityStatus === "available_for_install"
               ? "no"
               : "unknown",
-          requirements: capability.requirementsStatus,
-          operational: capability.operationalStatus,
+          requirements: ["missing", "satisfied", "not_applicable", UNKNOWN].includes(capability.requirementsStatus) ? capability.requirementsStatus : UNKNOWN,
+          runtimeLoaded: normalizeYesNoUnknown(capability.runtimeLoadedStatus),
+          runtimeEvidence: ["observed", "unsupported", "error", "unknown"].includes(capability.runtimeEvidence.status) ? capability.runtimeEvidence.status : UNKNOWN,
+          operational: normalizeYesNoUnknown(capability.operationalStatus),
         })),
       };
     },
   });
+}
+
+function statusFromConfiguration(configurationStatus) {
+  if (configurationStatus === "enabled" || configurationStatus === "enabled_project") return "yes";
+  if (configurationStatus === "disabled" || configurationStatus === "disabled_project") return "no";
+  return UNKNOWN;
+}
+
+function normalizeYesNoUnknown(value) {
+  return ["yes", "no", UNKNOWN].includes(value) ? value : UNKNOWN;
+}
+
+function normalizeConfiguredStatus(configurationStatus) {
+  if (["enabled", "enabled_project"].includes(configurationStatus)) return "yes";
+  if (["disabled", "disabled_project"].includes(configurationStatus)) return "no";
+  return UNKNOWN;
+}
+
+function createRuntimeStatusContext(cwd, capabilities) {
+  return {
+    cwd: typeof cwd === "string" ? safeText(cwd).slice(0, 2_048) : "",
+    capabilities: capabilities.slice(0, 100).map((capability) => ({
+      id: safeText(capability.id).slice(0, 240),
+      type: safeText(capability.type).slice(0, 40),
+      name: safeText(capability.codexName || capability.name).slice(0, 120),
+    })),
+  };
+}
+
+function unknownRuntimeEvidence(status = "unknown", detail = "No runtime evidence is available.", source = RUNTIME_SOURCE) {
+  return { status, source, observedAt: null, detail };
+}
+
+async function inspectRuntimeStatus(adapter, context) {
+  const checkedAt = new Date().toISOString();
+  if (!adapter || typeof adapter.inspect !== "function") {
+    return makeRuntimeInspection("unsupported", checkedAt);
+  }
+  const adapterProvider = normalizeProvider(adapter.provider);
+
+  let timer;
+  try {
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), RUNTIME_INSPECTION_TIMEOUT_MS);
+    });
+    const result = await Promise.race([Promise.resolve().then(() => adapter.inspect(context)), timeout]);
+    if (!result || typeof result !== "object" || Array.isArray(result) || !Array.isArray(result.items)) {
+      return makeRuntimeInspection("error", checkedAt, adapterProvider);
+    }
+    let status = ["unsupported", "available", "observed", "partial", "error"].includes(result.status) ? result.status : "error";
+    const provider = normalizeProvider(result.provider || adapter.provider);
+    const source = normalizeRuntimeSource(result.source) || (provider === "codex-app-server" ? RUNTIME_SOURCE : "runtime status adapter");
+    const rawItems = result.items.slice(0, 100);
+    const items = rawItems.map((item) => normalizeRuntimeItem(item, provider, source)).filter(Boolean);
+    const malformedCount = Math.min(100, (Number.isSafeInteger(result.malformedCount) ? Math.max(0, result.malformedCount) : 0) + rawItems.length - items.length);
+    if (malformedCount > 0 && ["observed", "available"].includes(status)) status = items.length ? "partial" : "error";
+    if (status === "observed" && !items.length) return makeRuntimeInspection("error", checkedAt, provider);
+    return {
+      status,
+      provider,
+      source,
+      checkedAt: normalizeTimestamp(result.checkedAt) || checkedAt,
+      items,
+      omittedItems: Math.min(100_000, (Number.isSafeInteger(result.omittedItems) ? Math.max(0, result.omittedItems) : 0) + Math.max(0, result.items.length - rawItems.length)),
+      malformedCount,
+      detail: runtimeInspectionDetail(status, provider, malformedCount),
+    };
+  } catch {
+    return makeRuntimeInspection("error", checkedAt, adapterProvider);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function normalizeRuntimeItem(item, provider, defaultSource) {
+  if (!item || typeof item !== "object" ||
+      typeof item.type !== "string" || !/^[a-z][a-z0-9_-]{0,39}$/u.test(item.type) ||
+      typeof item.name !== "string" || !item.name || item.name.length > 120 ||
+      /[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(item.name) ||
+      !["yes", "no", UNKNOWN].includes(item.runtimeLoadedStatus) ||
+      !["yes", "no", UNKNOWN].includes(item.operationalStatus) ||
+      ![UNKNOWN, "available_for_use", "unavailable", "available_for_install"].includes(item.availabilityStatus)) return null;
+  const startupStatus = ["starting", "ready", "failed", "cancelled"].includes(item.startupStatus) ? item.startupStatus : null;
+  return {
+    type: item.type,
+    name: item.name,
+    startupStatus,
+    runtimeLoadedStatus: item.runtimeLoadedStatus,
+    availabilityStatus: item.availabilityStatus,
+    operationalStatus: item.operationalStatus,
+    observedAt: normalizeTimestamp(item.observedAt),
+    source: normalizeRuntimeSource(item.source) || defaultSource,
+    detail: provider === "codex-app-server" && startupStatus ? runtimeItemDetail(startupStatus) : `Runtime status reported by ${provider}.`,
+  };
+}
+
+function normalizeProvider(value) {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,39}$/u.test(value) ? value : "unknown-provider";
+}
+
+function normalizeRuntimeSource(value) {
+  return typeof value === "string" && value.length <= 120 && /^[a-zA-Z0-9 ._:/-]+$/u.test(value) ? value : null;
+}
+
+function normalizeTimestamp(value) {
+  if (typeof value !== "string" || value.length > 40 || !Number.isFinite(Date.parse(value))) return null;
+  return new Date(value).toISOString();
+}
+
+function makeRuntimeInspection(status, checkedAt, provider = "codex-app-server") {
+  return {
+    status,
+    provider,
+    source: provider === "codex-app-server" ? RUNTIME_SOURCE : "runtime status adapter",
+    checkedAt,
+    items: [],
+    omittedItems: 0,
+    malformedCount: 0,
+    detail: runtimeInspectionDetail(status, provider),
+  };
+}
+
+function runtimeInspectionDetail(status, provider = "codex-app-server", malformedCount = 0) {
+  if (malformedCount > 0 && status === "partial") {
+    return "Some MCP startup notifications were malformed and ignored. Valid observations remain visible; raw error text is withheld.";
+  }
+  if (provider !== "codex-app-server") return `Runtime inspection ${status} through the ${provider} adapter.`;
+  switch (status) {
+    case "observed": return "Read only MCP startup notifications already observed by this Codex app-server thread; no RPC, health probe, or server launch was performed.";
+    case "partial": return "Some MCP startup notifications were malformed and ignored. Valid observations remain visible; raw error text is withheld.";
+    case "available": return "Passive MCP startup status is supported by the existing runtime, but no notification was observed. Absence does not establish unavailability.";
+    case "error": return "Codex runtime status could not be read safely; runtime state remains unknown.";
+    default: return "No already-connected Codex app-server thread is available. Vesper does not start a runtime for status inspection.";
+  }
+}
+
+function runtimeItemDetail(status) {
+  switch (status) {
+    case "ready": return "Codex reported MCP startup ready; Vesper did not run a health check or tool call.";
+    case "failed": return "Codex reported MCP startup failure; raw runtime error text is withheld.";
+    case "cancelled": return "Codex reported MCP startup cancellation.";
+    default: return "Codex reported MCP startup in progress.";
+  }
+}
+
+function applyRuntimeInspection(capabilities, inspection) {
+  const runtimeItems = new Map((inspection.items || []).map((item) => [`${item.type}\u0000${item.name}`, item]));
+  for (const capability of capabilities) {
+    capability.enabledStatus ||= statusFromConfiguration(capability.configurationStatus);
+    capability.availabilityStatus ||= UNKNOWN;
+    capability.runtimeLoadedStatus ||= UNKNOWN;
+    capability.operationalStatus ||= UNKNOWN;
+    const runtimeItem = runtimeItems.get(`${capability.type}\u0000${capability.codexName || capability.name}`);
+    if (runtimeItem) {
+      if (runtimeItem.runtimeLoadedStatus !== UNKNOWN) capability.runtimeLoadedStatus = runtimeItem.runtimeLoadedStatus;
+      if (runtimeItem.availabilityStatus !== UNKNOWN) capability.availabilityStatus = runtimeItem.availabilityStatus;
+      if (runtimeItem.operationalStatus !== UNKNOWN) capability.operationalStatus = runtimeItem.operationalStatus;
+      capability.runtimeEvidence = {
+        status: "observed",
+        source: runtimeItem.source,
+        observedAt: runtimeItem.observedAt,
+        detail: runtimeItem.detail,
+      };
+      continue;
+    }
+    if (inspection.provider === "codex-app-server" && ["plugin", "skill"].includes(capability.type)) {
+      capability.runtimeEvidence = unknownRuntimeEvidence(
+        "unsupported",
+        "The inspected Codex app-server protocol has no passive runtime-loaded signal for this capability type.",
+      );
+      continue;
+    }
+    const evidenceStatus = inspection.status === "unsupported" ? "unsupported" : ["error", "partial"].includes(inspection.status) ? "error" : "unknown";
+    capability.runtimeEvidence = unknownRuntimeEvidence(evidenceStatus, inspection.detail, inspection.source);
+  }
 }
 
 function findCapability(catalog, id) {
@@ -265,9 +480,20 @@ function summarizeCatalog(catalog) {
     configured: 0,
     disabled: 0,
     enabledConfiguration: 0,
+    enabledYes: 0,
+    enabledNo: 0,
+    enabledUnknown: 0,
+    installed: 0,
+    installationUnknown: 0,
     availableForInstall: 0,
     availableForUse: 0,
     unknown: 0,
+    runtimeLoadedYes: 0,
+    runtimeLoadedNo: 0,
+    runtimeLoadedUnknown: 0,
+    operationalYes: 0,
+    operationalNo: 0,
+    operationalUnknown: 0,
     byType: {},
   };
   const types = new Set([...CAPABILITY_TYPES, ...catalog.capabilities.map((capability) => capability.type)]);
@@ -278,9 +504,20 @@ function summarizeCatalog(catalog) {
       if (["enabled", "disabled", "enabled_project", "disabled_project"].includes(capability.configurationStatus)) summary.configured += 1;
       if (capability.configurationStatus === "disabled" || capability.configurationStatus === "disabled_project") summary.disabled += 1;
       if (capability.configurationStatus === "enabled" || capability.configurationStatus === "enabled_project") summary.enabledConfiguration += 1;
+      if (capability.enabledStatus === "yes") summary.enabledYes += 1;
+      else if (capability.enabledStatus === "no") summary.enabledNo += 1;
+      else summary.enabledUnknown += 1;
+      if (capability.installationStatus === "installed") summary.installed += 1;
+      else if (capability.installationStatus === UNKNOWN) summary.installationUnknown += 1;
       if (capability.availabilityStatus === "available_for_install") summary.availableForInstall += 1;
       if (capability.availabilityStatus === "available_for_use") summary.availableForUse += 1;
       if (capability.availabilityStatus === UNKNOWN) summary.unknown += 1;
+      if (capability.runtimeLoadedStatus === "yes") summary.runtimeLoadedYes += 1;
+      else if (capability.runtimeLoadedStatus === "no") summary.runtimeLoadedNo += 1;
+      else summary.runtimeLoadedUnknown += 1;
+      if (capability.operationalStatus === "yes") summary.operationalYes += 1;
+      else if (capability.operationalStatus === "no") summary.operationalNo += 1;
+      else summary.operationalUnknown += 1;
     }
   }
   return summary;
@@ -308,8 +545,14 @@ function renderCapability(capability) {
     `Discovery source: ${safeText(capability.source.name)}`,
     `Installation: ${safeText(capability.installationStatus)}`,
     `Configuration: ${safeText(capability.configurationStatus)}`,
+    `Enabled: ${safeText(capability.enabledStatus)}`,
     `Available for use: ${safeText(capability.availabilityStatus)}`,
-    `Operational: ${safeText(capability.operationalStatus)} (Vesper does not perform a live health check)`,
+    `Runtime loaded: ${safeText(capability.runtimeLoadedStatus)}`,
+    `Operational: ${safeText(capability.operationalStatus)}`,
+    `Runtime evidence: ${safeText(capability.runtimeEvidence?.status || UNKNOWN)}`,
+    `Runtime source: ${safeText(capability.runtimeEvidence?.source || "unknown")}`,
+    `Runtime observed at: ${safeText(capability.runtimeEvidence?.observedAt || "unknown")}`,
+    `Runtime detail: ${safeText(capability.runtimeEvidence?.detail || "unknown")}`,
     `Requirements: ${safeText(capability.requirementsStatus)}`,
     `Required permissions: ${capability.requiredPermissions.status === "unknown" ? "unknown (not declared by the inspected source)" : safeText(capability.requiredPermissions.items.join(", "))}`,
     `Declared capabilities: ${capability.declaredCapabilities.status === "unknown" ? "unknown (not declared by the inspected source)" : safeText(capability.declaredCapabilities.items.join(", "))}`,
@@ -333,10 +576,20 @@ function renderCatalogStatus(catalog) {
     `Discovered: ${summary.discovered}`,
     `Configured: ${summary.configured}`,
     `Disabled: ${summary.disabled}`,
+    `Installed: ${summary.installed} · installation unknown: ${summary.installationUnknown}`,
+    `Enabled: yes ${summary.enabledYes} · no ${summary.enabledNo} · unknown ${summary.enabledUnknown}`,
     `Available to install: ${summary.availableForInstall}`,
     `Enabled configuration: ${summary.enabledConfiguration}`,
     `Available for use: ${summary.availableForUse}`,
     `Unknown availability: ${summary.unknown}`,
+    `Runtime loaded: yes ${summary.runtimeLoadedYes} · no ${summary.runtimeLoadedNo} · unknown ${summary.runtimeLoadedUnknown}`,
+    `Operational: yes ${summary.operationalYes} · no ${summary.operationalNo} · unknown ${summary.operationalUnknown}`,
+    `Runtime inspection: ${safeText(catalog.runtimeInspection?.status || "unsupported")}`,
+    `Runtime source: ${safeText(catalog.runtimeInspection?.source || "unknown")}`,
+    `Runtime checked at: ${safeText(catalog.runtimeInspection?.checkedAt || "unknown")}`,
+    `Runtime observations omitted: ${safeText(catalog.runtimeInspection?.omittedItems || 0)}`,
+    `Malformed runtime notifications: ${safeText(catalog.runtimeInspection?.malformedCount || 0)}`,
+    `Runtime note: ${safeText(catalog.runtimeInspection?.detail || "No runtime status adapter is available.")}`,
     `By type: ${Object.entries(summary.byType).map(([type, count]) => `${safeText(type)} ${count}`).join(", ") || "none"}`,
   ];
   if (catalog.diagnostics.length) {

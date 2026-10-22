@@ -9,6 +9,7 @@ const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core"
 const { SessionStore } = require("./session-store");
 const { resolveProjectDirectory } = require("./cli");
 const { createCapabilityProvider } = require("./capability-catalog");
+const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
@@ -280,7 +281,12 @@ async function handlePrompt(prompt, targetPanel = panel) {
 
 function capabilityProviderFor(cwd) {
   if (typeof cwd !== "string" || !cwd) return null;
-  if (!capabilityProviders.has(cwd)) capabilityProviders.set(cwd, createCapabilityProvider({ cwd }));
+  if (!capabilityProviders.has(cwd)) capabilityProviders.set(cwd, createCapabilityProvider({
+    cwd,
+    runtimeStatusAdapter: createCodexRuntimeStatusAdapter({
+      getRuntimeClient: () => selectedSession?.cwd === cwd && appServerSessionId === selectedSession.sessionId ? appServer : null,
+    }),
+  }));
   return capabilityProviders.get(cwd);
 }
 

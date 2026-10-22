@@ -86,7 +86,7 @@ class TerminalFrontend {
   async run() {
     this.write("Vesper · local routing with Codex app-server fallback\n");
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :routing for session counts, and :quit to exit. Local answers do not start Codex turns.\n\n");
+    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :capabilities status|show ID to inspect local status, :routing for session counts, and :quit to exit. Local answers do not start Codex turns.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -122,7 +122,7 @@ class TerminalFrontend {
         this.write(`[Vesper command error] ${safeTerminalText(error?.message || error)}\n`);
         return;
       }
-      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :routing, or :quit.\n`);
+      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :capabilities, :routing, or :quit.\n`);
       return;
     }
 

@@ -18,6 +18,7 @@ const {
   searchCapabilities,
 } = require("./capability-catalog");
 const { runCapabilityOperation } = require("./capability-management");
+const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
 
 const USAGE = `Vesper terminal frontend
@@ -46,7 +47,8 @@ Without --new or --resume, Vesper resumes the most recently updated session for 
 or creates one when no session exists. The default project is the current working directory.
 Session listings are project-scoped and show at most ${MAX_SESSION_LIST_ENTRIES} recent metadata records.
 Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID to resume one,
-:new to start another session, :routing to inspect current-session routing counts, and :quit to exit.
+:new to start another session, :capabilities status|show ID to inspect local capability state,
+:routing to inspect current-session routing counts, and :quit to exit.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
 The plugins, mcp, and skills commands are read-only. Capabilities combines their local discovery
@@ -84,6 +86,8 @@ typing the exact capability ID. Vesper uses documented Codex CLI commands and th
 project plugin setting. Project enable/disable is supported for installed plugins from this project's
 local marketplace; standalone MCP and skill toggles remain unsupported. Vesper does not accept
 environment-variable values. Discovery never proves that Codex loaded or can operate a capability.
+Standalone status inspection does not start or resume Codex; use :capabilities status|show ID inside
+an existing Vesper session to view passive MCP startup notifications from its current thread.
 `;
 
 function parseArgs(argv) {
@@ -320,7 +324,12 @@ async function runCapabilities(options, dependencies, output, errorOutput) {
     cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
     const discoveryOptions = dependencies.discoveryOptions || {};
     const commandRunner = dependencies.codexCommandRunner || runCodexCommand;
-    const catalog = await buildCapabilityCatalog({ cwd, discoveryOptions, commandRunner });
+    const catalog = await buildCapabilityCatalog({
+      cwd,
+      discoveryOptions,
+      commandRunner,
+      runtimeStatusAdapter: dependencies.runtimeStatusAdapter,
+    });
 
     if (options.action === "list") {
       output.write(renderCapabilityList(catalog.capabilities));
@@ -507,7 +516,34 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     const handleWorkspaceCommand = async (command) => {
       const [name, ...args] = command.trim().split(/\s+/u);
       if (name === ":help" && args.length === 0) {
-        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :routing, :quit\n");
+        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :capabilities [list|status|show ID], :routing, :quit\n");
+        return true;
+      }
+      if (name === ":capabilities") {
+        if (args.length > 2 || (args[0] === "show" && args.length !== 2) ||
+            (args.length === 2 && args[0] !== "show") || ![undefined, "list", "status", "show"].includes(args[0])) {
+          output.write("Usage: :capabilities [list|status|show ID]\n");
+          return true;
+        }
+        if (!capabilityProvider || typeof capabilityProvider.getCatalog !== "function") {
+          output.write("[Vesper] Capability catalog is unavailable in this session.\n");
+          return true;
+        }
+        const catalog = await capabilityProvider.getCatalog({ refresh: true });
+        if (args[0] === "status") {
+          output.write(renderCatalogStatus(catalog));
+          return true;
+        }
+        if (args[0] === "show") {
+          const capability = findCapability(catalog, args[1]);
+          if (!capability) {
+            output.write(`[Vesper] Capability ${safeTerminalText(args[1])} was not found in the local catalog.\n`);
+            return true;
+          }
+          output.write(renderCapability(capability));
+          return true;
+        }
+        output.write(renderCapabilityList(catalog.capabilities));
         return true;
       }
       if (name === ":sessions" && args.length === 0) {
@@ -539,7 +575,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         await activateSession(selected, "Session switched");
         return true;
       }
-      output.write("Usage: :sessions | :switch SESSION_ID | :new | :routing | :help | :quit\n");
+      output.write("Usage: :sessions | :switch SESSION_ID | :new | :capabilities [list|status|show ID] | :routing | :help | :quit\n");
       return true;
     };
 
@@ -548,6 +584,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       cwd,
       discoveryOptions: dependencies.discoveryOptions || {},
       commandRunner: dependencies.codexCommandRunner,
+      runtimeStatusAdapter: createCodexRuntimeStatusAdapter({ getRuntimeClient: () => appServer }),
     });
     terminal = new TerminalFrontend({
       cwd,

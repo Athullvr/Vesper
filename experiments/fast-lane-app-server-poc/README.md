@@ -53,7 +53,20 @@ vesper capabilities show skill:project/review/SKILL.md
 vesper capabilities status
 ```
 
-IDs are stable for a source identity: plugins use `plugin:MARKETPLACE/NAME`, MCP servers use `mcp:NAME`, and skills use `skill:project/RELATIVE_PATH` or `skill:user/RELATIVE_PATH`. Capability details show a bounded source description when present, the source location, and explicit `unknown` states. An enabled MCP entry establishes only its Codex configuration; authentication, connectivity, and runtime availability remain unknown. A cached plugin does not establish that Codex enabled or loaded it; a skill manifest does not establish that Codex loaded the skill. The terminal and extension expose a lazy capability provider through routing context so future planning code can inspect discovered, configured, and use availability separately. Vesper does not pass catalog metadata into Codex and does not change routing heuristics.
+IDs are stable for a source identity: plugins use `plugin:MARKETPLACE/NAME`, MCP servers use `mcp:NAME`, and skills use `skill:project/RELATIVE_PATH` or `skill:user/RELATIVE_PATH`. Capability details show installation, configuration, enabled state, runtime-loaded state, operational state, source, and observation time separately. Unknown values remain explicit.
+
+The Codex runtime adapter uses only `mcpServer/startupStatus/updated` notifications already received by an existing Vesper app-server thread. A `ready` event confirms that Codex completed MCP startup in that thread and marks it available for use; it does not prove tool health, so operational status stays unknown. `failed` or `cancelled` startup is shown as unavailable, with raw runtime error text withheld. Malformed notifications are ignored and counted; valid observations are retained separately. The adapter does not start or resume a thread, call `mcpServerStatus/list`, execute an MCP tool, or contact a remote server. Consequently, the standalone `vesper capabilities status` command has no active app-server thread and reports runtime inspection as unsupported; it does not attach to or resume saved sessions. Terminal and VS Code expose passive observations through the existing routing-context provider; the current routing heuristics do not consume them. Plugin and skill runtime-loaded state remains unknown because the inspected local protocol has no passive runtime-loaded signal for those types.
+
+For example, a standalone status command may report:
+
+```text
+Runtime inspection: unsupported
+Runtime loaded: yes 0 · no 0 · unknown 3
+Operational: yes 0 · no 0 · unknown 3
+Runtime note: No already-connected Codex app-server thread is available. Vesper does not start a runtime for status inspection.
+```
+
+The installed `codex-cli 0.162.1` schema also contains a richer MCP status RPC, but it can inspect server state and is not called here. Codex `plugin/list` may include remote marketplace data and is not used. The catalog provider exposes only bounded status enums and stable capability IDs to routing context; Vesper does not pass source details, runtime errors, environment values, or credentials into Codex, and it does not change routing heuristics.
 
 Vesper can manage only operations with a documented Codex CLI interface. Each operation prints the exact target, intended change, backup/recovery guidance, then requires typing the capability ID:
 
@@ -98,10 +111,14 @@ The interactive workspace shows the canonical project path and active Vesper ses
 :sessions              list this project's recent sessions
 :switch SESSION_ID     switch to a saved session in this project
 :new                   create and select a separate session
+:capabilities status   show current catalog and passive runtime observations
+:capabilities show ID  inspect one capability in this session
 :routing               show routing outcome counts for the active session
 :help                  show workspace commands
 :quit                  exit and keep saved sessions
 ```
+
+The interactive `:capabilities status` and `:capabilities show ID` commands inspect the current process's catalog and any MCP startup events already observed on its active Codex thread. They do not start a thread or perform a status RPC. The standalone `vesper capabilities status` command remains read-only and reports runtime inspection as unsupported because it has no attached thread.
 
 Session lists show at most 50 ids, update times, and whether a saved Codex thread exists; they do not show prompts or conversation text. Switching verifies the saved thread through Codex `thread/resume` before restoring bounded history. A reconnect failure leaves that session selected and saved, reports the error, and retries on a later task. `Ctrl+C` during a Codex turn requests interruption and returns to the prompt when the turn ends; `Ctrl+C` at an idle prompt exits cleanly. EOF also exits. TTY output uses the existing bounded live diff view and cleans up its resize listener; redirected input/output stays line based with no cursor-mode changes.
 

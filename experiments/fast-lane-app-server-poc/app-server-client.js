@@ -10,6 +10,8 @@ const { MAX_HISTORY_TURNS } = require("./conversation-history");
 const RPC_TIMEOUT_MS = 20_000;
 const TURN_TIMEOUT_MS = 5 * 60_000;
 const INTERRUPT_GRACE_MS = 10_000;
+const MAX_MCP_STARTUP_STATUS_ENTRIES = 100;
+const MCP_STARTUP_STATUSES = new Set(["starting", "ready", "failed", "cancelled"]);
 const CLIENT_INFO = Object.freeze({
   name: "vesper_terminal",
   title: "Vesper Terminal Frontend",
@@ -53,6 +55,8 @@ class AppServerClient extends EventEmitter {
     this.pendingInterrupt = false;
     this.disposed = false;
     this.connectionGeneration = 0;
+    this.mcpStartupStatuses = new Map();
+    this.mcpStartupStatusMalformedCount = 0;
   }
 
   connect(cwd) {
@@ -75,6 +79,8 @@ class AppServerClient extends EventEmitter {
     this.child = child;
     this.threadReady = false;
     this.stdoutBuffer = "";
+    this.mcpStartupStatuses.clear();
+    this.mcpStartupStatusMalformedCount = 0;
     const generation = ++this.connectionGeneration;
     child.stdout?.setEncoding?.("utf8");
     child.stderr?.setEncoding?.("utf8");
@@ -192,6 +198,18 @@ class AppServerClient extends EventEmitter {
     return true;
   }
 
+  getMcpStartupStatusSnapshot() {
+    if (this.disposed || !this.child || !this.threadReady || !this.threadId) {
+      return { supported: false, items: [] };
+    }
+    const statuses = this.mcpStartupStatuses.get(this.threadId);
+    return {
+      supported: true,
+      items: statuses ? [...statuses.values()].slice(0, MAX_MCP_STARTUP_STATUS_ENTRIES) : [],
+      malformedCount: this.mcpStartupStatusMalformedCount,
+    };
+  }
+
   async resumeThread(cwd) {
     if (!this.threadId) throw new Error("There is no saved Codex thread to resume.");
     if (this.activeTurn || this.startingTurn) throw new Error("Cannot reconnect while a Codex turn is active or starting.");
@@ -239,6 +257,9 @@ class AppServerClient extends EventEmitter {
 
   async ensureThread(cwd) {
     if (this.threadReady) return;
+
+    this.mcpStartupStatuses.clear();
+    this.mcpStartupStatusMalformedCount = 0;
 
     if (this.threadId) {
       this.emit("progress", { type: "thread_resuming" });
@@ -508,6 +529,7 @@ class AppServerClient extends EventEmitter {
   }
 
   handleNotification(method, params) {
+    if (method === "mcpServer/startupStatus/updated") this.recordMcpStartupStatus(params);
     const active = this.activeTurn;
     if (!active) return;
     const turnDiffUpdate = method === "turn/diff/updated" ? active.turnDiff.record(params) : null;
@@ -590,6 +612,35 @@ class AppServerClient extends EventEmitter {
     }
   }
 
+  recordMcpStartupStatus(params) {
+    if (!params || typeof params !== "object" || Array.isArray(params)) {
+      this.mcpStartupStatusMalformedCount = Math.min(100, this.mcpStartupStatusMalformedCount + 1);
+      return;
+    }
+    // The local schema permits a null thread id. Without an exact thread
+    // identity, keep the event out of the per-thread capability snapshot.
+    if (params.threadId === null || params.threadId === undefined) return;
+    if (!isSafeProtocolIdentity(params.threadId)) {
+      this.mcpStartupStatusMalformedCount = Math.min(100, this.mcpStartupStatusMalformedCount + 1);
+      return;
+    }
+    if (this.threadId && params.threadId !== this.threadId) return;
+    const name = typeof params.name === "string" ? params.name.trim() : "";
+    if (!MCP_STARTUP_STATUSES.has(params.status) || !name || name.length > 120 ||
+        /[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(name)) {
+      this.mcpStartupStatusMalformedCount = Math.min(100, this.mcpStartupStatusMalformedCount + 1);
+      return;
+    }
+    let statuses = this.mcpStartupStatuses.get(params.threadId);
+    if (!statuses) {
+      if (this.mcpStartupStatuses.size >= 2) return;
+      statuses = new Map();
+      this.mcpStartupStatuses.set(params.threadId, statuses);
+    }
+    if (!statuses.has(name) && statuses.size >= MAX_MCP_STARTUP_STATUS_ENTRIES) return;
+    statuses.set(name, { name, status: params.status, observedAt: new Date().toISOString() });
+  }
+
   finishFromStatus(active, turn) {
     if (active.settled) return;
     this.emit("progress", {
@@ -662,6 +713,8 @@ class AppServerClient extends EventEmitter {
     this.child = undefined;
     this.readyPromise = undefined;
     this.threadReady = false;
+    this.mcpStartupStatuses.clear();
+    this.mcpStartupStatusMalformedCount = 0;
     for (const [id, pending] of this.pending) {
       this.pending.delete(id);
       pending.reject(error);
@@ -675,6 +728,8 @@ class AppServerClient extends EventEmitter {
     this.child = undefined;
     this.readyPromise = undefined;
     this.threadReady = false;
+    this.mcpStartupStatuses.clear();
+    this.mcpStartupStatusMalformedCount = 0;
     if (child && !child.killed) child.kill();
   }
 
