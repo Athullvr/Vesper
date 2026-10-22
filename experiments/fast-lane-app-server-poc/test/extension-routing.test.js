@@ -38,6 +38,25 @@ test("VS Code keeps local routing local and persists only the Vesper session and
   assert.equal(panel.last("session-state").state, "connected");
 });
 
+test("VS Code Plan preview uses the panel bridge without starting a Codex thread or logging task text", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-plan-preview-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }]);
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const task = "Query the PostgreSQL database using token sk-proj-1234567890abcdef";
+  await panel.send({ type: "plan-preview", text: task });
+
+  assert.match(panel.html, /id="preview-plan"/u);
+  assert.match(panel.last("plan-preview")?.text || "", /Vesper plan · advisory only · not executed/u);
+  assert.equal(harness.state.children.length, 0);
+  assert.equal(harness.requests.length, 0);
+  assert.doesNotMatch(harness.logs.join("\n"), /Query the PostgreSQL database|sk-proj-1234567890abcdef/u);
+  assert.doesNotMatch(panel.last("plan-preview")?.text || "", /sk-proj-1234567890abcdef/u);
+});
+
 test("panel reopen and extension restart restore the same persisted Vesper session and Codex thread", async (t) => {
   const root = makeTempDirectory("vesper-vscode-resume-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

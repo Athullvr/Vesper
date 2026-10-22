@@ -5,6 +5,7 @@ const { RouteMetrics, ROUTING_REASON_COUNT_CODES, classifyRequest, createRouting
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
+const { getPlanningMetadata } = require("./capability-planner");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
 const { LiveTurnDiffView } = require("./live-turn-diff-view");
 
@@ -86,7 +87,7 @@ class TerminalFrontend {
   async run() {
     this.write("Vesper · local routing with Codex app-server fallback\n");
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :capabilities status|show ID to inspect local status, :routing for session counts, and :quit to exit. Local answers do not start Codex turns.\n\n");
+    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :capabilities status|show ID to inspect local status, :plan TASK for an advisory preview, :routing for session counts, and :quit to exit. Local answers do not start Codex turns.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -149,6 +150,15 @@ class TerminalFrontend {
       return;
     }
 
+    // The planner is an advisory catalog consumer. It does not alter the
+    // already-selected route or cause runtime inspection beyond the provider's
+    // existing passive/local discovery behavior.
+    const planning = await getPlanningMetadata({
+      task: prompt,
+      capabilityProvider: this.capabilityProvider,
+      routeDecision: decision,
+    });
+
     let routingDecision;
     this.activeRequest = true;
     this.interruptPending = false;
@@ -169,7 +179,7 @@ class TerminalFrontend {
       const routed = await routeRequest(prompt, {
         decision,
         handlers: this.handlers,
-        context: { cwd: this.cwd, capabilities: this.capabilityProvider },
+        context: { cwd: this.cwd, capabilities: this.capabilityProvider, planning },
         onRoutingDecision: (record) => {
           routingDecision = record;
           this.writeRoutingDecision(record);

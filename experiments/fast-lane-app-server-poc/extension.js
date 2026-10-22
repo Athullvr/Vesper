@@ -10,6 +10,7 @@ const { SessionStore } = require("./session-store");
 const { resolveProjectDirectory } = require("./cli");
 const { createCapabilityProvider } = require("./capability-catalog");
 const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
+const { createCapabilityPlan, getPlanningMetadata, renderCapabilityPlan } = require("./capability-planner");
 const { projectConversationHistory, unavailableHistory } = require("./conversation-history");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
@@ -87,6 +88,11 @@ function openPanel(context) {
 
     if (message?.type === "submit" && typeof message.text === "string") {
       await handlePrompt(message.text, currentPanel);
+      return;
+    }
+
+    if (message?.type === "plan-preview" && typeof message.text === "string") {
+      await previewPlan(message.text, currentPanel);
       return;
     }
 
@@ -218,10 +224,15 @@ async function handlePrompt(prompt, targetPanel = panel) {
   };
   let routingDecision;
   try {
+    const planning = await getPlanningMetadata({
+      task: prompt,
+      capabilityProvider: capabilityProviderFor(cwd),
+      routeDecision: decision,
+    });
     const routed = await routeRequest(prompt, {
       decision,
       handlers: localHandlers,
-      context: { cwd, capabilities: capabilityProviderFor(cwd) },
+      context: { cwd, capabilities: capabilityProviderFor(cwd), planning },
       onRoutingDecision: (record) => { routingDecision = record; },
       fallback: () => client.runTurn({ prompt, cwd, onDelta }),
     });
@@ -276,6 +287,31 @@ async function handlePrompt(prompt, targetPanel = panel) {
       deferredHistoryRestore = false;
       if (panel && selectedSession?.sessionId === session.sessionId) void restoreSelectedHistory(panel);
     }
+  }
+}
+
+async function previewPlan(task, targetPanel = panel) {
+  if (!task.trim() || task.length > MAX_PROMPT_LENGTH) {
+    postToPanel(targetPanel, {
+      type: "plan-preview",
+      text: `Enter a task between 1 and ${MAX_PROMPT_LENGTH.toLocaleString()} characters to preview a plan.`,
+      error: true,
+    });
+    return;
+  }
+  const project = selectedProjectContext();
+  if (!project.available || typeof project.path !== "string") {
+    postToPanel(targetPanel, { type: "plan-preview", text: "Choose an available project folder before previewing a capability plan.", error: true });
+    return;
+  }
+  try {
+    const provider = capabilityProviderFor(project.path);
+    const catalog = await provider.getCatalog({ refresh: true });
+    const decision = classifyRequest(task);
+    const plan = createCapabilityPlan({ task, catalog, routeDecision: decision });
+    postToPanel(targetPanel, { type: "plan-preview", text: renderCapabilityPlan(plan), error: false });
+  } catch {
+    postToPanel(targetPanel, { type: "plan-preview", text: "Capability discovery did not complete; Vesper could not build a plan. No task was executed.", error: true });
   }
 }
 
@@ -826,6 +862,7 @@ function getHtml(webview) {
     <section id="messages" aria-live="polite"></section>
     <form id="form">
       <textarea id="prompt" aria-label="Prompt" placeholder="Ask a developer question…" maxlength="32768" required></textarea>
+      <button id="preview-plan" type="button">Plan</button>
       <button id="send" type="submit">Send</button>
       <button id="stop" type="button" hidden>Stop</button>
     </form>
@@ -838,6 +875,7 @@ function getHtml(webview) {
     const form = document.getElementById('form');
     const prompt = document.getElementById('prompt');
     const send = document.getElementById('send');
+    const previewPlan = document.getElementById('preview-plan');
     const stop = document.getElementById('stop');
     const chooseProject = document.getElementById('choose-project');
     const projectName = document.getElementById('project-name');
@@ -869,6 +907,7 @@ function getHtml(webview) {
 
     function setBusy(busy) {
       send.disabled = busy || sessionBlocked || recoveryLoading;
+      previewPlan.disabled = busy;
       prompt.disabled = busy || sessionBlocked || recoveryLoading;
       chooseProject.disabled = busy;
       if (!busy && !sessionBlocked) prompt.focus();
@@ -882,6 +921,13 @@ function getHtml(webview) {
       prompt.value = '';
       setBusy(true);
       vscode.postMessage({ type: 'submit', text });
+    });
+
+    previewPlan.addEventListener('click', () => {
+      const text = prompt.value.trim();
+      if (!text || previewPlan.disabled) return;
+      previewPlan.disabled = true;
+      vscode.postMessage({ type: 'plan-preview', text });
     });
 
     prompt.addEventListener('keydown', (event) => {
@@ -979,6 +1025,10 @@ function getHtml(webview) {
         }
       }
       if (message.type === 'user-message') return;
+      if (message.type === 'plan-preview') {
+        addMessage(message.error ? 'error' : 'assistant', 'Vesper plan · advisory · not executed', message.text || 'No plan output is available.');
+        previewPlan.disabled = false;
+      }
       if (message.type === 'local-answer') {
         const state = message.result?.status || 'confirmed';
         addMessage('assistant', 'Fast Lane local · ' + state + ' · no Codex turn · ' + message.elapsedMs + ' ms', message.text);

@@ -51,6 +51,7 @@ vesper capabilities
 vesper capabilities search git
 vesper capabilities show skill:project/review/SKILL.md
 vesper capabilities status
+vesper plan "Query the configured PostgreSQL database for the latest migration state"
 ```
 
 IDs are stable for a source identity: plugins use `plugin:MARKETPLACE/NAME`, MCP servers use `mcp:NAME`, and skills use `skill:project/RELATIVE_PATH` or `skill:user/RELATIVE_PATH`. Capability details show installation, configuration, enabled state, runtime-loaded state, operational state, source, and observation time separately. Unknown values remain explicit.
@@ -67,6 +68,43 @@ Runtime note: No already-connected Codex app-server thread is available. Vesper 
 ```
 
 The installed `codex-cli 0.162.1` schema also contains a richer MCP status RPC, but it can inspect server state and is not called here. Codex `plugin/list` may include remote marketplace data and is not used. The catalog provider exposes only bounded status enums and stable capability IDs to routing context; Vesper does not pass source details, runtime errors, environment values, or credentials into Codex, and it does not change routing heuristics.
+
+## Advisory capability plans
+
+`vesper plan TASK [--project PROJECT_DIRECTORY]` prints a deterministic, read-only preview based on the normalized local catalog and the existing router decision. In the terminal workspace, use `:plan TASK`. The VS Code panel's **Plan** button previews the text currently in the prompt box without sending it. Plan output is labeled advisory and not executed; it never starts or resumes Codex, activates a skill/plugin, launches an MCP server, or calls an MCP tool.
+
+The planner uses bounded topic and metadata matching over capability IDs, names, descriptions, declared capabilities, and supported command names when present. It does not use a model. Local Git and test handlers remain authoritative for their existing local routes, and the planner does not suggest capabilities for those routes. On Codex routes it adds only a bounded category, relevant IDs, eligibility states, and reason codes to the existing in-process routing context. This metadata is not included in routing diagnostics or telemetry and does not change the route.
+
+Eligibility is deliberately stricter than discovery. A fresh, timestamped Codex `ready` startup observation for a configured and enabled MCP server can make it **usable to try**; its separate `operational` field remains `unknown` because Vesper does not call tools or run health checks. A failed or cancelled startup, explicit disablement, uninstalled plugin, or missing requirements is unavailable. A runtime observation older than 15 minutes is stale; missing timestamps, unsupported inspection, and unknown states stay uncertain. Plugin and skill runtime loading remain unknown with the currently inspected Codex signal. “Usable to try” is not a claim that a server tool, plugin, or skill worked.
+
+Example plan outcomes:
+
+```text
+$ vesper plan "Query the configured PostgreSQL database"
+Vesper plan · advisory only · not executed
+Task category: database and SQL work
+Existing route: codex · codex_fallback
+Relevant capabilities:
+- mcp:postgres · mcp · PostgreSQL · usable
+  State: discovered yes; installed not_applicable; configured yes; enabled yes; available yes; loaded yes; operational unknown; ...
+  Codex-reported MCP startup: ready; this is not a tool health check.
+Eligible to try: mcp:postgres
+Vesper does not automatically select or execute capabilities from this advisory plan.
+
+$ vesper plan "Review the database migration plan"
+Vesper plan · advisory only · not executed
+Relevant capabilities:
+- mcp:postgres · mcp · PostgreSQL · unavailable
+  Recommendation declined: Codex reported that MCP startup failed; it is not recommended as available.
+Eligible to try: none
+
+$ vesper plan "Draft a short release announcement"
+Vesper plan · advisory only · not executed
+Relevant capabilities: none
+Execution path: codex_fallback
+```
+
+The second example depends on matching local metadata and a failed observation; the third shows the valid no-match case. Plans list at most eight relevant capabilities and truncate display output at a fixed limit. Full task text is not copied into the plan object or routing metadata.
 
 Vesper can manage only operations with a documented Codex CLI interface. Each operation prints the exact target, intended change, backup/recovery guidance, then requires typing the capability ID:
 
@@ -113,6 +151,7 @@ The interactive workspace shows the canonical project path and active Vesper ses
 :new                   create and select a separate session
 :capabilities status   show current catalog and passive runtime observations
 :capabilities show ID  inspect one capability in this session
+:plan TASK             preview an advisory plan without executing it
 :routing               show routing outcome counts for the active session
 :help                  show workspace commands
 :quit                  exit and keep saved sessions

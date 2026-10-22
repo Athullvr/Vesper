@@ -225,35 +225,18 @@ function createCapabilityProvider(options) {
     return snapshotPromise;
   };
   return Object.freeze({
-    async getCatalog({ refresh = false } = {}) {
+    async getCatalog({ refresh = false, refreshRuntime = false } = {}) {
       if (refresh) snapshotPromise = null;
-      return load();
+      const catalog = await load();
+      return refreshRuntime && options?.runtimeStatusAdapter
+        ? refreshRuntimeCatalog(catalog, options.runtimeStatusAdapter)
+        : catalog;
     },
     async getRouterContext() {
-      let catalog = await load();
-      if (options?.runtimeStatusAdapter) {
-        const base = {
-          ...catalog,
-          capabilities: catalog.capabilities.map((capability) => ({
-            ...capability,
-            availabilityStatus: capability.type === "mcp"
-              ? capability.configurationStatus === "disabled" ? "unavailable" : UNKNOWN
-              : capability.type === "plugin" && capability.availabilityStatus === "available_for_install"
-                ? "available_for_install"
-                : UNKNOWN,
-            runtimeLoadedStatus: UNKNOWN,
-            operationalStatus: UNKNOWN,
-            runtimeEvidence: unknownRuntimeEvidence("unknown", "No runtime evidence is available.", catalog.runtimeInspection.source),
-          })),
-        };
-        const runtimeInspection = await inspectRuntimeStatus(
-          options.runtimeStatusAdapter,
-          createRuntimeStatusContext(base.projectDirectory, base.capabilities),
-        );
-        applyRuntimeInspection(base.capabilities, runtimeInspection);
-        base.runtimeInspection = runtimeInspection;
-        catalog = base;
-      }
+      const baseCatalog = await load();
+      const catalog = options?.runtimeStatusAdapter
+        ? await refreshRuntimeCatalog(baseCatalog, options.runtimeStatusAdapter)
+        : baseCatalog;
       return {
         schemaVersion: 1,
         runtimeInspection: catalog.runtimeInspection.status,
@@ -278,6 +261,30 @@ function createCapabilityProvider(options) {
       };
     },
   });
+}
+
+async function refreshRuntimeCatalog(catalog, runtimeStatusAdapter) {
+  const base = {
+    ...catalog,
+    capabilities: catalog.capabilities.map((capability) => ({
+      ...capability,
+      availabilityStatus: capability.type === "mcp"
+        ? capability.configurationStatus === "disabled" || capability.configurationStatus === "disabled_project" ? "unavailable" : UNKNOWN
+        : capability.type === "plugin" && capability.availabilityStatus === "available_for_install"
+          ? "available_for_install"
+          : UNKNOWN,
+      runtimeLoadedStatus: UNKNOWN,
+      operationalStatus: UNKNOWN,
+      runtimeEvidence: unknownRuntimeEvidence("unknown", "No runtime evidence is available.", catalog.runtimeInspection.source),
+    })),
+  };
+  const runtimeInspection = await inspectRuntimeStatus(
+    runtimeStatusAdapter,
+    createRuntimeStatusContext(base.projectDirectory, base.capabilities),
+  );
+  applyRuntimeInspection(base.capabilities, runtimeInspection);
+  base.runtimeInspection = runtimeInspection;
+  return base;
 }
 
 function statusFromConfiguration(configurationStatus) {
@@ -439,6 +446,7 @@ function applyRuntimeInspection(capabilities, inspection) {
         status: "observed",
         source: runtimeItem.source,
         observedAt: runtimeItem.observedAt,
+        startupStatus: runtimeItem.startupStatus,
         detail: runtimeItem.detail,
       };
       continue;

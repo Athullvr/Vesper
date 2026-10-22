@@ -19,6 +19,8 @@ const {
 } = require("./capability-catalog");
 const { runCapabilityOperation } = require("./capability-management");
 const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
+const { createCapabilityPlan, renderCapabilityPlan } = require("./capability-planner");
+const { classifyRequest } = require("./routing-core");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
 
 const USAGE = `Vesper terminal frontend
@@ -41,6 +43,7 @@ Usage:
   vesper capabilities remove <ID> [PROJECT_DIRECTORY]
   vesper capabilities configure mcp <NAME> (--stdio <COMMAND> [--arg <ARG> ...] | --url <HTTPS_URL> [--bearer-token-env-var <NAME>])
   vesper capabilities enable|disable <ID> [PROJECT_DIRECTORY]
+  vesper plan <TASK> [--project PROJECT_DIRECTORY]
   vesper --help
 
 Without --new or --resume, Vesper resumes the most recently updated session for the selected project,
@@ -48,7 +51,7 @@ or creates one when no session exists. The default project is the current workin
 Session listings are project-scoped and show at most ${MAX_SESSION_LIST_ENTRIES} recent metadata records.
 Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID to resume one,
 :new to start another session, :capabilities status|show ID to inspect local capability state,
-:routing to inspect current-session routing counts, and :quit to exit.
+:plan TASK to preview an advisory plan, :routing to inspect current-session routing counts, and :quit to exit.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
 The plugins, mcp, and skills commands are read-only. Capabilities combines their local discovery
@@ -94,9 +97,31 @@ function parseArgs(argv) {
   const args = [...argv];
   if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
   if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
+  if (args[0] === "plan") return parsePlanArgs(args.slice(1));
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
   return parseRunArgs(args);
+}
+
+function parsePlanArgs(args) {
+  if (!args.length || args.length === 1 && ["--help", "-h"].includes(args[0])) {
+    return { command: "plan", help: true };
+  }
+  const rest = [...args];
+  let projectDirectory = null;
+  const projectOption = rest.indexOf("--project");
+  if (projectOption >= 0) {
+    if (projectOption !== rest.length - 2 || !rest[projectOption + 1]) {
+      throw new Error("Usage: vesper plan TASK [--project PROJECT_DIRECTORY].");
+    }
+    projectDirectory = rest[projectOption + 1];
+    rest.splice(projectOption, 2);
+  }
+  const task = rest.join(" ").trim();
+  if (!task || task === "--help" || task === "-h" || task.startsWith("--")) {
+    throw new Error("Usage: vesper plan TASK [--project PROJECT_DIRECTORY].");
+  }
+  return { command: "plan", task, projectDirectory, help: false };
 }
 
 function parseCapabilityArgs(args) {
@@ -276,9 +301,11 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
+
+  if (options.command === "plan") return runPlan(options, dependencies, output, errorOutput);
 
   if (options.command === "capabilities") {
     return runCapabilities(options, dependencies, output, errorOutput);
@@ -312,6 +339,30 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   return runInteractiveVesper(options, dependencies, output, errorOutput);
+}
+
+async function runPlan(options, dependencies, output, errorOutput) {
+  try {
+    const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    let catalog;
+    if (dependencies.capabilityProvider && typeof dependencies.capabilityProvider.getCatalog === "function") {
+      catalog = await dependencies.capabilityProvider.getCatalog({ refreshRuntime: true });
+    } else {
+      catalog = await buildCapabilityCatalog({
+        cwd,
+        discoveryOptions: dependencies.discoveryOptions || {},
+        commandRunner: dependencies.codexCommandRunner || runCodexCommand,
+        runtimeStatusAdapter: dependencies.runtimeStatusAdapter,
+      });
+    }
+    const decision = classifyRequest(options.task);
+    const plan = createCapabilityPlan({ task: options.task, catalog, routeDecision: decision, now: dependencies.planningNow });
+    output.write(renderCapabilityPlan(plan));
+    return 0;
+  } catch (error) {
+    errorOutput.write(`[Vesper plan error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  }
 }
 
 function discoveryUsage(command) {
@@ -516,7 +567,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     const handleWorkspaceCommand = async (command) => {
       const [name, ...args] = command.trim().split(/\s+/u);
       if (name === ":help" && args.length === 0) {
-        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :capabilities [list|status|show ID], :routing, :quit\n");
+        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new, :capabilities [list|status|show ID], :plan TASK, :routing, :quit\n");
         return true;
       }
       if (name === ":capabilities") {
@@ -544,6 +595,21 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
           return true;
         }
         output.write(renderCapabilityList(catalog.capabilities));
+        return true;
+      }
+      if (name === ":plan") {
+        const task = command.slice(":plan".length).trim();
+        if (!task) {
+          output.write("Usage: :plan TASK\n");
+          return true;
+        }
+        if (!capabilityProvider || typeof capabilityProvider.getCatalog !== "function") {
+          output.write("[Vesper] Capability catalog is unavailable; no plan could be generated.\n");
+          return true;
+        }
+        const catalog = await capabilityProvider.getCatalog({ refresh: true });
+        const decision = classifyRequest(task);
+        output.write(renderCapabilityPlan(createCapabilityPlan({ task, catalog, routeDecision: decision })));
         return true;
       }
       if (name === ":sessions" && args.length === 0) {
@@ -575,7 +641,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         await activateSession(selected, "Session switched");
         return true;
       }
-      output.write("Usage: :sessions | :switch SESSION_ID | :new | :capabilities [list|status|show ID] | :routing | :help | :quit\n");
+      output.write("Usage: :sessions | :switch SESSION_ID | :new | :capabilities [list|status|show ID] | :plan TASK | :routing | :help | :quit\n");
       return true;
     };
 
@@ -637,5 +703,6 @@ module.exports = {
   parseArgs,
   resolveProjectDirectory,
   runGitCommand,
+  parsePlanArgs,
   runVesper,
 };
