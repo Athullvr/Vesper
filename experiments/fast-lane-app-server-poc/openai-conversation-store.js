@@ -99,13 +99,17 @@ class OpenAIConversationStore {
     return next;
   }
 
-  completeTask(conversationId, projectPath, taskId, assistantText) {
+  completeTask(conversationId, projectPath, taskId, assistantText, additionalMessages = []) {
     const current = this.load(conversationId, projectPath);
     assertPendingTask(current, taskId);
-    if (current.messages.length >= MAX_CONVERSATION_MESSAGES) {
+    if (!Array.isArray(additionalMessages) || additionalMessages.some((message) => !isValidConversationMessage(message) || message.role === "user")) {
+      throw new Error("The saved provider tool transcript is malformed.");
+    }
+    if (current.messages.length + additionalMessages.length + 1 > MAX_CONVERSATION_MESSAGES) {
       throw new Error("The saved OpenAI conversation reached its message limit; start a new Vesper session to continue.");
     }
-    const messages = [...current.messages, { role: "assistant", content: validateMessage(assistantText, "assistant") }];
+    const messages = [...current.messages, ...additionalMessages.map((message) => structuredClone(message)),
+      { role: "assistant", content: validateMessage(assistantText, "assistant") }];
     const next = { ...current, status: "ready", pendingTaskId: null, messages, updatedAt: new Date().toISOString() };
     this.write(next);
     return next;
@@ -198,14 +202,36 @@ function isValidRecord(record, providerId = OPENAI_PROVIDER_ID, conversationPref
   if (record.status === "ready" && record.pendingTaskId !== null) return false;
   if (["pending", "uncertain", "unsupported"].includes(record.status) && !record.pendingTaskId) return false;
   if (!Array.isArray(record.messages) || record.messages.length > MAX_CONVERSATION_MESSAGES) return false;
-  for (const message of record.messages) {
-    if (!message || typeof message !== "object" || Array.isArray(message) ||
-        Object.keys(message).length !== 2 || !["user", "assistant"].includes(message.role) ||
-        typeof message.content !== "string" || message.content.length > MAX_CONVERSATION_MESSAGE_LENGTH || /[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(message.content)) return false;
-  }
+  for (const message of record.messages) if (!isValidConversationMessage(message)) return false;
   const createdAt = Date.parse(record.createdAt);
   const updatedAt = Date.parse(record.updatedAt);
   return Number.isFinite(createdAt) && Number.isFinite(updatedAt) && createdAt <= updatedAt;
+}
+
+function isValidConversationMessage(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  const cleanText = (value) => typeof value === "string" && value.length <= MAX_CONVERSATION_MESSAGE_LENGTH &&
+    !/[\u0000\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(value);
+  if (["user", "assistant"].includes(message.role) && Object.keys(message).length === 2) return cleanText(message.content);
+  if (message.role === "assistant" && Object.keys(message).length === 3 &&
+      (message.content === null || cleanText(message.content)) && Array.isArray(message.tool_calls) &&
+      message.tool_calls.length > 0 && message.tool_calls.length <= 8) {
+    const ids = new Set();
+    return message.tool_calls.every((call) => {
+      if (!call || typeof call !== "object" || Array.isArray(call) || Object.keys(call).length !== 3 ||
+          call.type !== "function" || typeof call.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(call.id) || ids.has(call.id) ||
+          !call.function || typeof call.function !== "object" || Array.isArray(call.function) || Object.keys(call.function).length !== 2 ||
+          typeof call.function.name !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(call.function.name) ||
+          typeof call.function.arguments !== "string" || Buffer.byteLength(call.function.arguments, "utf8") > 64 * 1024 ||
+          /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(call.function.arguments)) return false;
+      ids.add(call.id);
+      return true;
+    });
+  }
+  if (message.role === "tool" && Object.keys(message).length === 3) {
+    return typeof message.tool_call_id === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(message.tool_call_id) && cleanText(message.content);
+  }
+  return false;
 }
 
 function validateConversationId(value, conversationPrefix = "oai") {

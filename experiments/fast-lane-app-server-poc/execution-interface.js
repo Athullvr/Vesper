@@ -14,6 +14,8 @@ const EXECUTION_EVENT_TYPES = Object.freeze(new Set([
   "approval-decided",
   "file-change",
   "task-progress",
+  "tool-call",
+  "tool-result",
   "task-state",
   "interrupt-requested",
   "connection-lost",

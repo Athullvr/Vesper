@@ -41,6 +41,7 @@ test("tool definitions are explicit, and the public runtime exposes only the inv
   const definitions = runtime.getDefinitions();
   assert.deepEqual(definitions.map((entry) => entry.id), ["read_file", "list_files", "search_files", "git_status", "git_diff", "git_log", "run_command", "propose_file_change", "apply_file_change"]);
   assert.equal(definitions.find((entry) => entry.id === "run_command").enabled, false);
+  assert.equal(definitions.find((entry) => entry.id === "apply_file_change").enabled, false);
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.properties.path.format, "project-relative-path");
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.additionalProperties, false);
   assert.equal(definitions.find((entry) => entry.id === "run_command").requiresApproval, true);
@@ -304,6 +305,34 @@ test("disposing while approval is pending prevents the protected operation from 
   assert.equal(result.state, "rejected");
   assert.equal(result.error.code, "RUNTIME_DISPOSED");
   assert.equal(fs.readFileSync(target, "utf8"), "before\n");
+});
+
+test("interrupting an approval wait cancels a model-style file apply before any write", async (t) => {
+  const { root } = fixture(t);
+  fs.writeFileSync(path.join(root, "target.txt"), "before\n");
+  let approvalStarted;
+  const started = new Promise((resolve) => { approvalStarted = resolve; });
+  const { runtime, sessionId } = makeRuntime(root, {
+    approvalHandler: (_snapshot, { signal } = {}) => new Promise((resolve) => {
+      approvalStarted();
+      if (signal?.aborted) return resolve("cancel");
+      signal?.addEventListener("abort", () => resolve("cancel"), { once: true });
+    }),
+  });
+  t.after(() => runtime.dispose());
+  const proposal = await runtime.invoke(request(root, sessionId, "propose_file_change", {
+    path: "target.txt", content: "after\n",
+  }));
+  assert.equal(proposal.state, "proposed");
+  const applying = runtime.invoke(request(root, sessionId, "apply_file_change", {
+    proposalId: proposal.proposal.proposalId,
+  }));
+  await started;
+  assert.equal(runtime.interrupt(), true);
+  const result = await applying;
+  assert.equal(result.state, "interrupted");
+  assert.equal(result.verified, false);
+  assert.equal(fs.readFileSync(path.join(root, "target.txt"), "utf8"), "before\n");
 });
 
 test("a staged atomic-write failure is not reported as success and preserves existing content", async (t) => {

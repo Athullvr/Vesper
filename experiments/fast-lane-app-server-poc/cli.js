@@ -74,15 +74,18 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 :plan TASK to preview an advisory plan, :routing to inspect current-session routing counts, and :quit to exit.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
-The tools command inspects or manually invokes the permissioned Vesper tool runtime. It never reads
-provider output as a tool request. Command execution is disabled by default; when enabled by the host,
+The tools command inspects or manually invokes the permissioned Vesper tool runtime. Compatible
+providers can request only registered tools through the same schema and project checks. Command
+execution is never exposed to provider tool calls. Command execution is disabled by default; when enabled by the host,
 it requires rootless Podman, a local image, fresh approval, and verified container restrictions.
 Vesper never falls back to host execution. Tool file changes are proposed first and require a separate
 one-time approval before application.
 
 Codex remains the default provider. OpenAI Chat Completions and NVIDIA NIM send task text and their
-locally stored conversation only; they do not read project files, run commands, apply code, or verify
-changes. NVIDIA settings use VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY), VESPER_NVIDIA_MODEL, and
+locally stored conversation by default. Exact-model structured tool calling is opt-in; it sends tool
+definitions and bounded tool results to the selected remote provider. Providers can request project
+inspection and file proposals; applying a proposal requires an interactive terminal and a fresh
+one-time approval. Provider requests never run commands or execute generated code. NVIDIA settings use VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY), VESPER_NVIDIA_MODEL, and
 optionally VESPER_NVIDIA_BASE_URL.
 
 The plugins, mcp, and skills commands are read-only. Capabilities combines their local discovery
@@ -133,12 +136,13 @@ Usage:
   vesper tools run TOOL_ID '<JSON>' [--project PROJECT_DIRECTORY] [--apply]
 
 Preview validates a request without executing it. Manual run executes only the named registered tool.
-The request JSON must match that tool's schema. Paths are project-relative. File changes are
-proposals first; --apply requests one fresh approval and applies the proposal in this process only.
+OpenAI/NIM structured tool calls are disabled by default; exact-model opt-in enables bounded registered
+project tools. Paths are project-relative. File changes are proposals first; --apply requests one fresh
+approval and applies the proposal in this process only. Model-requested apply is available only in an
+interactive terminal and requires the same exact one-time review. Provider calls never run commands.
 Command execution is disabled by default. When enabled by the host, run_command requires a local
 rootless Podman image and verified isolation controls. Configure it with VESPER_SANDBOX_IMAGE and
 VESPER_ENABLE_ISOLATED_COMMANDS=1. Writable mounts also require VESPER_ENABLE_SANDBOX_WRITES=1.
-No provider output is interpreted as a tool call.
 `;
 
 function parseArgs(argv) {
@@ -433,7 +437,7 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
@@ -487,6 +491,9 @@ async function runProviders(options, dependencies, output, errorOutput) {
       output.write(`- ${safeCliField(provider.id)} · ${safeCliField(provider.name)}${marker}\n`);
       output.write(`  ${safeCliField(provider.description)}\n`);
       output.write(`  Configured model: ${safeCliField(status.model || "none")}${status.model ? " (not live-verified)" : ""}\n`);
+      if (typeof status.toolCallingEnabled === "boolean") {
+        output.write(`  Structured tool calls: ${status.toolCallingEnabled ? "enabled by exact-model opt-in; support unverified" : "disabled"}\n`);
+      }
     }
     output.write("Listing providers does not contact any provider. Use vesper providers status --provider <ID> --check for an explicit GET /models check where supported.\n");
     return 0;
@@ -500,6 +507,13 @@ async function runProviders(options, dependencies, output, errorOutput) {
     output.write(`Selected for new sessions: ${status.id === selectedProviderId ? "yes" : "no"}\n`);
     output.write(`Configured: ${status.configured === null ? "unknown (Codex CLI status not checked)" : status.configured ? "yes" : "no"}\n`);
     output.write(`Model: ${safeCliField(status.model || "not configured or not exposed")} ${status.model ? `(${safeCliField(status.modelFreshness || "not verified")})` : ""}\n`);
+    if (typeof status.toolCallingEnabled === "boolean") {
+      output.write(`Structured tool calls: ${status.toolCallingEnabled ? "enabled for this exact model by host opt-in; compatibility unverified" : "disabled"}\n`);
+      if (status.toolCallingModel && status.toolCallingModel !== status.model) {
+        output.write(`Tool-calling model setting does not match the configured model (${safeCliField(status.toolCallingModel)}).\n`);
+      }
+      output.write(`Agent limits: ${status.maxToolCalls} calls · ${status.maxToolIterations} tool rounds · ${status.maxAgentElapsedMs} ms · ${status.maxToolResultBytes} result bytes\n`);
+    }
     if (status.baseUrl) output.write(`API base URL: ${safeCliField(status.baseUrl)}\n`);
     if (status.apiKeyEnvVar) output.write(`API key: ${status.apiKeyConfigured ? "present" : "missing"} (${safeCliField(status.apiKeyEnvVar)}; value hidden)\n`);
     output.write(`Reachability: ${options.check ? "check requested" : status.reachability}\n`);

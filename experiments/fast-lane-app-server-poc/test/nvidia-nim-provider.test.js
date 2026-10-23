@@ -55,7 +55,7 @@ test("NVIDIA NIM is an explicit provider with configuration-only model status an
   assert.equal(status.modelFreshness, "configured; not verified");
   assert.equal(status.reachability, "not checked");
   assert.doesNotMatch(JSON.stringify(status), new RegExp(API_KEY, "u"));
-  assert.equal(status.modelFeatures.toolCalling.includes("not enabled"), true);
+  assert.equal(status.modelFeatures.toolCalling.includes("exact-model opt-in required"), true);
 
   const invalid = getProviderStatus(NVIDIA_PROVIDER_ID, fixtureEnvironment({ VESPER_NVIDIA_BASE_URL: "http://nim.example.test/v1" }));
   assert.equal(invalid.configured, false);
@@ -77,7 +77,7 @@ test("provider listing and configuration status stay offline and never reveal th
   assert.match(listing.text(), /Selected provider for new sessions: nvidia-nim/u);
   assert.match(listing.text(), /fixture\/nim-model \(not live-verified\)/u);
   assert.match(status.text(), /Reachability: not checked/u);
-  assert.match(status.text(), /toolCalling: not enabled in Vesper/u);
+  assert.match(status.text(), /toolCalling: disabled by default; exact-model opt-in required/u);
   assert.doesNotMatch(`${listing.text()}${status.text()}${listingErrors.text()}${statusErrors.text()}`, new RegExp(API_KEY, "u"));
   assert.equal(listingErrors.text(), "");
   assert.equal(statusErrors.text(), "");

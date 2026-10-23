@@ -116,13 +116,15 @@ class PermissionedToolRuntime {
     this.proposals = new Map();
     this.proposalStates = new Map();
     this.commandAbortController = null;
+    this.approvalAbortController = null;
   }
 
   getDefinitions() {
     return TOOL_DEFINITIONS.map((entry) => ({
       ...entry,
       limits: { ...entry.limits },
-      enabled: entry.id !== "run_command" || this.commandExecutionEnabled && Boolean(this.approvalHandler),
+      enabled: (!entry.requiresApproval || Boolean(this.approvalHandler)) &&
+        (entry.id !== "run_command" || this.commandExecutionEnabled && Boolean(this.approvalHandler)),
     }));
   }
 
@@ -150,7 +152,8 @@ class PermissionedToolRuntime {
       state: "validated",
       executes: false,
       requiresApproval: entry.requiresApproval,
-      enabled: normalized.toolId !== "run_command" || this.commandExecutionEnabled,
+      enabled: (!entry.requiresApproval || Boolean(this.approvalHandler)) &&
+        (normalized.toolId !== "run_command" || this.commandExecutionEnabled && Boolean(this.approvalHandler)),
       summary: this.describeRequest(normalized),
       ...(normalized.toolId === "run_command" ? { isolation: await this.previewCommandPolicy(normalized) } : {}),
     });
@@ -174,6 +177,7 @@ class PermissionedToolRuntime {
     if (this.disposed) return rejected("RUNTIME_DISPOSED", "This tool runtime has been disposed.");
     if (this.busy) return rejected("BUSY", "Another tool operation is still active.");
     this.busy = true;
+    this.approvalAbortController = new AbortController();
     let normalized;
     let approvalId = null;
     let state = "requested";
@@ -202,8 +206,11 @@ class PermissionedToolRuntime {
         state = "awaiting-approval";
         this.recordAudit(normalized.toolId, state, normalized.requestId, approvalId);
         if (!this.approvalHandler) return this.finishRejected(normalized, "APPROVAL_REQUIRED", "This operation requires a one-time approval handler.", approvalId);
-        const decision = await this.approvalHandler(snapshot);
-        if (this.interruptionRequested && normalized.toolId === "run_command") throw toolError("COMMAND_INTERRUPTED", "The isolated command was cancelled before it started.", true);
+        const decision = await this.approvalHandler(snapshot, { signal: this.approvalAbortController.signal });
+        if (this.interruptionRequested) {
+          throw toolError(normalized.toolId === "run_command" ? "COMMAND_INTERRUPTED" : "TOOL_INTERRUPTED",
+            "The approved operation was cancelled before it started.", true);
+        }
         this.assertLive();
         if (!this.isSnapshotCurrent(snapshot, normalized, commandPlan)) return this.finishRejected(normalized, "STALE_APPROVAL", "The reviewed operation changed before approval.", approvalId);
         if (decision !== "approve-once") {
@@ -272,6 +279,7 @@ class PermissionedToolRuntime {
     } finally {
       this.busy = false;
       this.interruptionRequested = false;
+      this.approvalAbortController = null;
     }
   }
 
@@ -624,9 +632,13 @@ class PermissionedToolRuntime {
     this.setProposalState(proposalId, "awaiting-approval");
     this.recordAudit("apply_file_change", "awaiting-approval", request.requestId, approvalId);
     let decision;
-    try { decision = await this.approvalHandler(snapshot); } catch (error) {
+    try { decision = await this.approvalHandler(snapshot, { signal: this.approvalAbortController?.signal }); } catch (error) {
       if (!this.disposed) this.setProposalState(proposalId, "failed");
       throw error;
+    }
+    if (this.interruptionRequested) {
+      this.setProposalState(proposalId, "cancelled");
+      throw toolError("TOOL_INTERRUPTED", "The file change approval was cancelled before application.", true);
     }
     this.assertLive();
     if (decision !== "approve-once") {
@@ -847,11 +859,12 @@ class PermissionedToolRuntime {
     if (!this.busy) return false;
     this.interruptionRequested = true;
     this.commandAbortController?.abort();
+    this.approvalAbortController?.abort();
     return true;
   }
 }
 
-const AUDIT_STATES = new Set(["requested", "validated", "awaiting-approval", "approved", "executed", "verified", "proposed", "rejected", "failed",
+const AUDIT_STATES = new Set(["requested", "validated", "awaiting-approval", "approved", "executed", "verified", "proposed", "rejected", "failed", "interrupted",
   "timed-out", "interrupted", "isolation-unavailable", "uncertain"]);
 
 function createPermissionedToolRuntime(options) {
@@ -874,14 +887,14 @@ function listToolDefinitions({ commandExecutionEnabled = false } = {}) {
 }
 
 function renderToolDefinitions(definitions = listToolDefinitions()) {
-  const lines = ["Vesper permissioned tool runtime (manual invocation only)", "", "Tool                 Permission          Approval  Availability"];
+  const lines = ["Vesper permissioned tool runtime", "", "Tool                 Permission          Approval  Availability"];
   for (const entry of definitions) {
     lines.push(`${entry.id.padEnd(21)} ${entry.permission.padEnd(19)} ${String(entry.requiresApproval).padEnd(9)} ${entry.enabled ? "enabled" : "disabled"}`);
     lines.push(`  ${entry.description}`);
     lines.push(`  Input: ${JSON.stringify(entry.inputSchema)}`);
     lines.push(`  Limits: ${JSON.stringify(entry.limits)}`);
   }
-  lines.push("", "No provider invokes tools automatically. OpenAI remains text-only; Codex keeps its native tool and approval path.");
+  lines.push("", "Manual and compatible-provider requests use the same schema, project, session, approval, and audit checks. Command execution is not exposed to model calls. Codex keeps its native tool and approval path.");
   return `${lines.join("\n")}\n`;
 }
 
@@ -1116,7 +1129,7 @@ function normalizeToolError(error) {
     "ISOLATION_UNAVAILABLE", "ISOLATION_RUNTIME_MISSING", "ISOLATION_RUNTIME_UNAVAILABLE", "ISOLATION_RUNTIME_TIMEOUT", "ISOLATION_REQUIREMENTS_UNAVAILABLE",
     "ISOLATION_IMAGE_UNCONFIGURED", "ISOLATION_IMAGE_INVALID", "ISOLATION_IMAGE_UNAVAILABLE", "ISOLATION_IMAGE_UNVERIFIABLE", "ISOLATION_IMAGE_UNSUPPORTED",
     "ISOLATION_STATUS_UNVERIFIABLE", "ISOLATION_POLICY_CHANGED", "ISOLATION_VERIFY_FAILED", "COMMAND_OUTCOME_UNCERTAIN", "COMMAND_INTERRUPTED",
-    "SANDBOX_CLEANUP_FAILED", "BACKEND_DISPOSED"]);
+    "SANDBOX_CLEANUP_FAILED", "BACKEND_DISPOSED", "TOOL_INTERRUPTED"]);
   const code = known.has(error?.code) ? error.code : "TOOL_FAILED";
   const messages = {
     NOT_FOUND: "The requested project resource was not found.",
@@ -1130,7 +1143,7 @@ function normalizeToolError(error) {
 
 function operationFailureState(error) {
   if (error.code === "COMMAND_TIMEOUT") return "timed-out";
-  if (error.code === "COMMAND_INTERRUPTED") return "interrupted";
+  if (error.code === "COMMAND_INTERRUPTED" || error.code === "TOOL_INTERRUPTED") return "interrupted";
   if (["COMMAND_OUTCOME_UNCERTAIN", "SANDBOX_CLEANUP_FAILED"].includes(error.code)) return "uncertain";
   if (error.code.startsWith("ISOLATION_") && error.code !== "ISOLATION_POLICY_CHANGED") return "isolation-unavailable";
   return error.rejected ? "rejected" : "failed";

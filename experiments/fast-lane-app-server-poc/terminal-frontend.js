@@ -8,6 +8,7 @@ const { unavailableHistory } = require("./conversation-history");
 const { approvalReview } = require("./approval-review");
 const { createExecutionProvider, listProviders } = require("./execution-provider");
 const { assertExecutionProvider } = require("./execution-interface");
+const { createPermissionedToolRuntime, renderToolApproval } = require("./permissioned-tool-runtime");
 const { codexApprovalResponse, normalizeApprovalRequest } = require("./codex-execution-provider");
 const { getPlanningMetadata } = require("./capability-planner");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
@@ -52,6 +53,7 @@ class TerminalFrontend {
     this.savedConversationId = savedConversationId || savedThreadId || null;
     this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
     this.sessionId = sessionId;
+    this.toolRuntime = null;
     this.onWorkspaceCommand = onWorkspaceCommand;
     this.onTask = onTask;
     this.onExecutionState = onExecutionState;
@@ -59,6 +61,9 @@ class TerminalFrontend {
     this.routingDiagnostics = Boolean(routingDiagnostics);
     this.output = output;
     this.lineIO = lineIO || createLineIO(input, output);
+    // Plain TTYs remain suitable for an exact text approval review; redirected
+    // input/output never receives approval-capable model tools.
+    this.canReviewToolChanges = Boolean(input?.isTTY && output?.isTTY);
     this.metrics = metrics;
     this.activeRequest = false;
     this.exitAfterTurn = false;
@@ -90,6 +95,7 @@ class TerminalFrontend {
     this.executionProvider.setApprovalHandler?.((request) => this.requestApproval(request));
     this.executionProvider.on("event", this.handleExecutionEvent);
     this.lineIO.onInterrupt?.(() => this.handleInterrupt());
+    this.attachPermissionedToolRuntime(this.executionProvider, this.sessionId);
   }
 
   async run() {
@@ -117,6 +123,7 @@ class TerminalFrontend {
       this.closed = true;
       this.lineIO.close?.();
       this.executionProvider.off("event", this.handleExecutionEvent);
+      await this.toolRuntime?.dispose?.();
     }
   }
 
@@ -209,7 +216,10 @@ class TerminalFrontend {
         : { status: "active", recovery: null });
       this.finishStream();
       if (result?.status === "completed" && isTextOnlyProvider(this.executionProvider.id)) {
-        this.write(`\n\n[${safeTerminalText(this.providerShortName())} text generated · not executed · files unchanged${result.truncated ? " · response truncated" : ""} · ${elapsedMs} ms]\n`);
+        const actionStatus = result.changedFiles
+          ? "text generated · approved file change applied and verified"
+          : "text generated · commands not executed · files unchanged";
+        this.write(`\n\n[${safeTerminalText(this.providerShortName())} ${actionStatus}${result.truncated ? " · response truncated" : ""} · ${elapsedMs} ms]\n`);
       } else if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
       else if (result?.status === "interrupted" && uncertainInterrupt) this.write(`\n\n[${safeTerminalText(this.providerShortName())} request interrupted locally · remote completion unknown · start a new conversation to continue]\n`);
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
@@ -254,7 +264,10 @@ class TerminalFrontend {
     const name = descriptor?.name || this.executionProvider.id;
     const model = state.model ? ` · ${safeTerminalText(state.model)}` : "";
     const textOnly = this.executionProvider.id === "openai-chat-completions" || this.executionProvider.id === "nvidia-nim";
-    return `${name}${model}${textOnly ? " (text only; generated text is not executed)" : ""}`;
+    const toolCalling = state.toolCallingEnabled
+      ? ` (${this.canReviewToolChanges ? "project inspection and approved file changes" : "project inspection and proposals"} enabled for configured model; model support unverified; commands unavailable)`
+      : "";
+    return `${name}${model}${textOnly && !state.toolCallingEnabled ? " (text only; generated text is not executed)" : toolCalling}`;
   }
 
   requestApproval(request, params, context) {
@@ -386,8 +399,12 @@ class TerminalFrontend {
   replaceExecutionProvider(executionProvider, { sessionId = null, savedConversationId = null, savedThreadId = null } = {}) {
     if (this.activeRequest || this.pendingApprovals.size) throw new Error("A Vesper session can only be switched while the terminal is idle.");
     assertExecutionProvider(executionProvider);
+    const nextRuntime = this.createPermissionedToolRuntime(executionProvider, sessionId);
     this.executionProvider.off("event", this.handleExecutionEvent);
+    const previousRuntime = this.toolRuntime;
     this.executionProvider = executionProvider;
+    this.toolRuntime = nextRuntime;
+    executionProvider.setToolRuntime?.(nextRuntime);
     this.executionProvider.setApprovalHandler?.((request) => this.requestApproval(request));
     this.executionProvider.on("event", this.handleExecutionEvent);
     this.sessionId = sessionId;
@@ -398,6 +415,47 @@ class TerminalFrontend {
     this.pendingTurnDiffFinal = null;
     this.commandActivity = null;
     this.metrics = new RouteMetrics();
+    void previousRuntime?.dispose?.();
+  }
+
+  createPermissionedToolRuntime(provider, sessionId) {
+    if (typeof provider?.setToolRuntime !== "function" || provider.getState?.().toolCallingEnabled !== true) return null;
+    if (typeof sessionId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(sessionId)) {
+      throw new Error("Structured tool calling requires the active Vesper session UUID.");
+    }
+    const runtime = createPermissionedToolRuntime({
+      projectRoot: this.cwd,
+      sessionId,
+      approvalHandler: this.canReviewToolChanges ? (snapshot) => this.requestToolApproval(snapshot) : undefined,
+      commandExecutionEnabled: false,
+      commandWorkspaceWriteEnabled: false,
+    });
+    if (runtime.sessionId !== sessionId) {
+      void runtime.dispose();
+      throw new Error("Vesper could not bind the read-only tool runtime to the active session.");
+    }
+    return runtime;
+  }
+
+  async requestToolApproval(snapshot, { signal } = {}) {
+    if (!this.canReviewToolChanges || !snapshot || snapshot.toolId !== "apply_file_change") return "decline";
+    if (signal?.aborted) return "cancel";
+    const review = renderToolApproval(snapshot);
+    if (review.includes("[review truncated; approval refused]")) return "decline";
+    this.write(`\n\n${review}\n`);
+    this.write("This is a model-requested file change. Type yes to approve this exact change once, cancel to cancel, or anything else to decline.\n");
+    const answer = await this.lineIO.question("Approve file change once? ", { signal });
+    if (!this.canReviewToolChanges || this.closed || signal?.aborted || answer === null || answer === undefined) return "cancel";
+    const choice = String(answer).trim().toLowerCase();
+    const decision = choice === "yes" ? "approve-once" : choice === "cancel" ? "cancel" : "decline";
+    this.write(`[Vesper] File-change approval: ${decision === "approve-once" ? "approved once" : decision}.\n`);
+    return decision;
+  }
+
+  attachPermissionedToolRuntime(provider, sessionId) {
+    const runtime = this.createPermissionedToolRuntime(provider, sessionId);
+    this.toolRuntime = runtime;
+    provider.setToolRuntime?.(runtime);
   }
 
   replaceAppServer(appServer, options = {}) {
@@ -493,6 +551,17 @@ class TerminalFrontend {
         break;
       case "command-activity":
         this.renderCommandActivity(event.update ? [event.update] : []);
+        break;
+      case "tool-call":
+        if (event.state === "requested") {
+          this.write(`\n[Vesper tool request · ${safeTerminalText(event.toolId || "unknown")} · call ${safeTerminalText(event.toolCallId || "unknown")} · iteration ${safeTerminalText(event.iteration || 0)}]\n`);
+        } else if (event.state === "validated") {
+          this.write("[Vesper] Tool request validated for the active project and session.\n");
+        }
+        break;
+      case "tool-result":
+        this.write(`[Vesper tool result · ${safeTerminalText(event.toolId || "unknown")} · ${safeTerminalText(event.state || "unknown")}${event.verified ? " · verified" : " · not verified"}${event.errorCode ? ` · ${safeTerminalText(event.errorCode)}` : ""}]\n`);
+        if (event.summary) this.write(`${safeTerminalText(event.summary)}\n`);
         break;
       case "file-change":
         this.renderFileChangeActivities([event.activity]);

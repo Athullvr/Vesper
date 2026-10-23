@@ -224,7 +224,7 @@ test("Chat Completions streams text and resumes its bounded project-scoped local
   assert.equal(mappedIds.length, 1);
   assert.match(mappedIds[0], /^oai_[0-9a-f-]{36}$/u);
   assert.deepEqual(requests[0].body.messages.map((message) => message.role), ["developer", "user"]);
-  assert.match(requests[0].body.messages[0].content, /cannot inspect the user's project/u);
+  assert.match(requests[0].body.messages[0].content, /do not claim to have inspected project files/u);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(conversationDirectory, `${mappedIds[0]}.json`), "utf8")).messages, [
     { role: "user", content: "Explain this API shape." },
     { role: "assistant", content: "Answer one." },
@@ -262,7 +262,7 @@ test("Chat Completions streams text and resumes its bounded project-scoped local
   });
   await terminal.run();
   assert.match(terminalOutput, /OpenAI Chat Completions API · fixture-model \(text only; generated text is not executed\)/u);
-  assert.match(terminalOutput, /OpenAI text generated · not executed · files unchanged/u);
+  assert.match(terminalOutput, /OpenAI text generated · commands not executed · files unchanged/u);
   assert.match(terminalOutput, /Answer one\./u);
   provider.dispose();
   resumed.dispose();
@@ -352,6 +352,41 @@ test("interrupt aborts the local stream, retains uncertainty, and does not claim
   await assert.rejects(provider.submitTask({ task: "Do not duplicate the previous task.", projectPath: PROJECT }), (error) => error.code === "SUBMISSION_OUTCOME_UNCERTAIN");
   assert.equal(postCount, 1);
   provider.dispose();
+});
+
+test("agent elapsed-time limit aborts a pending request and preserves uncertainty without resubmission", async (t) => {
+  const root = temporaryRoot(t);
+  let postCount = 0;
+  const provider = createExecutionProvider({
+    providerId: OPENAI_PROVIDER_ID,
+    environment: environment("http://127.0.0.1:43137/v1", {
+      VESPER_OPENAI_TOOL_CALLING_MODEL: "fixture-model",
+      VESPER_OPENAI_MAX_AGENT_ELAPSED_MS: "1000",
+    }),
+    conversationDirectory: path.join(root, "provider-conversations"),
+    fetchImpl: async (_url, { signal }) => {
+      postCount += 1;
+      return new Promise((_resolve, reject) => {
+        const keepAlive = setTimeout(() => {}, 1_500);
+        signal.addEventListener("abort", () => {
+          clearTimeout(keepAlive);
+          reject(new Error("cancelled"));
+        }, { once: true });
+      });
+    },
+  });
+  const runtime = require("../permissioned-tool-runtime").createPermissionedToolRuntime({ projectRoot: PROJECT, sessionId: "8baf4d07-6a0e-43a3-9b3c-9e3128fc4eaa" });
+  provider.setToolRuntime(runtime);
+  try {
+    await assert.rejects(provider.submitTask({ task: "Wait for the bounded timeout.", projectPath: PROJECT }),
+      (error) => error.code === "SUBMISSION_OUTCOME_UNCERTAIN");
+    await assert.rejects(provider.submitTask({ task: "Do not resubmit.", projectPath: PROJECT }),
+      (error) => error.code === "SUBMISSION_OUTCOME_UNCERTAIN");
+    assert.equal(postCount, 1);
+  } finally {
+    await runtime.dispose();
+    provider.dispose();
+  }
 });
 
 test("configuration and API errors do not disclose credential-bearing values", async (t) => {

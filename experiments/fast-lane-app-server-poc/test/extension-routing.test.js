@@ -92,6 +92,63 @@ test("VS Code can select OpenAI and labels normalized output as generated text, 
   assert.match(panel.html, /project files are not sent/u);
 });
 
+test("VS Code routes opted-in OpenAI read-only calls through the project runtime and renders tool activity", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-openai-tools-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, "README.md"), "VS Code project evidence.\n", "utf8");
+  const previousFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    if (calls.length === 1) {
+      assert.ok(body.tools.some((entry) => entry.function.name === "read_file"));
+      assert.equal(body.tools.some((entry) => entry.function.name === "run_command"), false);
+      assert.equal(body.tools.some((entry) => entry.function.name === "apply_file_change"), false);
+      const events = [
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read", type: "function", function: { name: "read_file", arguments: "{\"path\":\"README.md\"}" } }] }, finish_reason: null }] },
+        { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      ].map((item) => `data: ${JSON.stringify(item)}\n\n`).join("");
+      return new Response(`${events}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }
+    assert.ok(body.messages.some((message) => message.role === "tool" && message.content.includes("VS Code project evidence.")));
+    const events = [
+      { choices: [{ delta: { content: "I inspected the project README." }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ].map((item) => `data: ${JSON.stringify(item)}\n\n`).join("");
+    return new Response(`${events}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  t.after(() => { globalThis.fetch = previousFetch; });
+
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    environment: {
+      VESPER_PROVIDER: "openai-chat-completions",
+      OPENAI_API_KEY: "fixture-only-secret",
+      VESPER_OPENAI_MODEL: "fixture-model",
+      VESPER_OPENAI_BASE_URL: "https://api.fixture.test/v1",
+      VESPER_OPENAI_TIMEOUT_MS: "4000",
+      VESPER_OPENAI_TOOL_CALLING_MODEL: "fixture-model",
+    },
+  });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  await panel.send({ type: "submit", text: "Inspect the README." });
+  assert.equal(calls.length, 2);
+  assert.equal(panel.all("assistant-delta").map((message) => message.text).join(""), "I inspected the project README.");
+  const toolEvents = panel.all("tool-activity");
+  assert.ok(toolEvents.some((event) => event.toolId === "read_file" && event.state === "requested"));
+  assert.ok(toolEvents.some((event) => event.toolId === "read_file" && event.state === "verified" && event.verified));
+  assert.match(panel.last("provider-info").displayName, /OpenAI/u);
+  const webview = mountWebview(panel.html);
+  webview.dispatch(panel.last("provider-info"));
+  webview.dispatch({ type: "assistant-start", requestId: panel.last("assistant-start").requestId, providerId: "openai-chat-completions" });
+  for (const event of toolEvents) webview.dispatch(event);
+  assert.ok(webview.elements.get("messages").children.some((entry) => entry.children[0].textContent.includes("Vesper tool · read_file")));
+  assert.match(webview.elements.get("provider-privacy").textContent, /bounded results from Vesper project inspection/u);
+});
+
 test("VS Code can use NVIDIA NIM through the compatible text adapter without implying execution", async (t) => {
   const root = makeTempDirectory("vesper-vscode-nim-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -401,6 +458,21 @@ test("webview replaces restored history, distinguishes unavailable history, and 
   webview.dispatch({ type: "conversation-history", state: "empty", text: "No saved turns.", entries: [] });
   assert.equal(webview.elements.get("messages").children.length, 0);
   assert.equal(webview.elements.get("history-state").textContent, "No saved turns.");
+});
+
+test("VS Code panel renders normalized Vesper tool activity as bounded text for the active request", async (t) => {
+  const project = fs.realpathSync(process.cwd());
+  const harness = createHarness(t, [{ name: "Vesper", uri: { fsPath: project } }]);
+  const panel = harness.openPanel();
+  const webview = mountWebview(panel.html);
+  webview.dispatch({ type: "assistant-start", requestId: "request-1", providerId: "openai-chat-completions" });
+  webview.dispatch({ type: "tool-activity", requestId: "stale-request", toolId: "read_file", state: "verified", verified: true, summary: "stale" });
+  webview.dispatch({ type: "tool-activity", requestId: "request-1", toolId: "read_file", state: "verified", verified: true, summary: "{\"path\":\"src/main.js\"}" });
+  const activity = webview.elements.get("messages").children.at(-1);
+  assert.equal(activity.children[0].textContent, "Vesper tool · read_file · verified · verified");
+  assert.equal(activity.children[1].textContent, "{\"path\":\"src/main.js\"}");
+  assert.equal(activity.children[1].innerHTML, undefined);
+  assert.equal(webview.elements.get("messages").children.length, 2, "stale-request activity was ignored");
 });
 
 test("workspace folders stay isolated and interrupt targets only the active thread and turn", async (t) => {

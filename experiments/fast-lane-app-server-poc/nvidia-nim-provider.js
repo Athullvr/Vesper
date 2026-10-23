@@ -9,9 +9,8 @@ const {
 const NVIDIA_PROVIDER_ID = "nvidia-nim";
 const DEFAULT_NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1";
 
-// NIM exposes OpenAI-compatible chat-completions endpoints, but model support varies.
-// Vesper requests text streaming only and never sends function definitions or executes
-// returned tool calls through this adapter.
+// NIM exposes compatible chat-completions endpoints, but tool support varies by model.
+// Vesper enables structured tool requests only when the host names the exact model.
 function resolveNvidiaNimConfig(environment = process.env, overrides = {}) {
   return resolveCompatibleChatCompletionsConfig(environment, {
     providerId: NVIDIA_PROVIDER_ID,
@@ -20,6 +19,11 @@ function resolveNvidiaNimConfig(environment = process.env, overrides = {}) {
     modelEnvVar: "VESPER_NVIDIA_MODEL",
     baseUrlEnvVar: "VESPER_NVIDIA_BASE_URL",
     timeoutEnvVar: "VESPER_NVIDIA_TIMEOUT_MS",
+    toolCallingModelEnvVar: "VESPER_NVIDIA_TOOL_CALLING_MODEL",
+    maxToolCallsEnvVar: "VESPER_NVIDIA_MAX_TOOL_CALLS",
+    maxToolIterationsEnvVar: "VESPER_NVIDIA_MAX_TOOL_ITERATIONS",
+    maxAgentElapsedEnvVar: "VESPER_NVIDIA_MAX_AGENT_ELAPSED_MS",
+    maxToolResultBytesEnvVar: "VESPER_NVIDIA_MAX_TOOL_RESULT_BYTES",
     defaultBaseUrl: DEFAULT_NVIDIA_NIM_BASE_URL,
     ...overrides,
   });

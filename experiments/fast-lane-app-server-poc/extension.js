@@ -12,12 +12,14 @@ const { createCapabilityProvider } = require("./capability-catalog");
 const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { createCapabilityPlan, getPlanningMetadata, renderCapabilityPlan } = require("./capability-planner");
 const { unavailableHistory } = require("./conversation-history");
+const { createPermissionedToolRuntime } = require("./permissioned-tool-runtime");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
 
 let output;
 let executionProvider;
 let executionProviderSessionId;
+let permissionedToolRuntime;
 let panel;
 let requestSequence = 0;
 let localHandlers;
@@ -222,6 +224,16 @@ async function handlePrompt(prompt, targetPanel = panel) {
   const onExecutionEvent = (event) => {
     if (event?.type === "text-delta" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
       postToPanel(targetPanel, { type: "assistant-delta", requestId, text: event.text });
+    } else if (["tool-call", "tool-result"].includes(event?.type) && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      postToPanel(targetPanel, {
+        type: "tool-activity",
+        requestId,
+        state: event.state,
+        toolId: event.toolId,
+        verified: event.verified === true,
+        ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+        ...(event.summary ? { summary: event.summary } : {}),
+      });
     }
   };
   client.on("event", onExecutionEvent);
@@ -505,6 +517,15 @@ function executionProviderForSession(session, cwd, generation) {
     };
   }
   const client = createExecutionProvider(providerOptions);
+  if (client.getState?.().toolCallingEnabled === true && typeof client.setToolRuntime === "function") {
+    permissionedToolRuntime = createPermissionedToolRuntime({
+      projectRoot: cwd,
+      sessionId,
+      commandExecutionEnabled: false,
+      commandWorkspaceWriteEnabled: false,
+    });
+    client.setToolRuntime(permissionedToolRuntime);
+  }
   if (client.capabilities.approvalEvents) client.setApprovalHandler(async () => ({ choice: "decline" }));
   client.on("event", (event) => {
     if (executionProvider !== client || executionProviderSessionId !== sessionId || projectGeneration !== generation ||
@@ -555,9 +576,12 @@ function executionProviderForSession(session, cwd, generation) {
 
 function disposeCurrentAppServer() {
   const previous = executionProvider;
+  const previousTools = permissionedToolRuntime;
   executionProvider = undefined;
   executionProviderSessionId = undefined;
+  permissionedToolRuntime = undefined;
   previous?.dispose();
+  void previousTools?.dispose?.();
 }
 
 function isCurrentRequest(requestId, client, sessionId, generation) {
@@ -806,14 +830,15 @@ function postSessionView(targetPanel) {
   postToPanel(targetPanel, { type: "session-state", ...sessionView });
   const providerId = selectedSession?.providerId ||
     (typeof process.env.VESPER_PROVIDER === "string" && process.env.VESPER_PROVIDER.trim()) || DEFAULT_PROVIDER_ID;
-  const configuredModel = listProviders().some((provider) => provider.id === providerId)
-    ? getProviderStatus(providerId, process.env).model
-    : null;
+  const providerStatus = listProviders().some((provider) => provider.id === providerId) ? getProviderStatus(providerId, process.env) : null;
+  const configuredModel = providerStatus?.model || null;
+  const activeState = executionProviderSessionId === selectedSession?.sessionId ? executionProvider?.getState?.() : null;
   postToPanel(targetPanel, {
     type: "provider-info",
     providerId,
     displayName: providerDisplayName(providerId),
     model: selectedSession?.modelId || configuredModel,
+    toolCallingEnabled: activeState?.toolCallingEnabled === true || providerStatus?.toolCallingEnabled === true,
   });
 }
 
@@ -1059,11 +1084,11 @@ function getHtml(webview) {
       if (message.type === 'provider-info') {
         currentProviderId = typeof message.providerId === 'string' ? message.providerId : 'codex-app-server';
         currentProviderName = typeof message.displayName === 'string' ? message.displayName : currentProviderId;
-        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '');
+        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '') + (message.toolCallingEnabled ? ' · project inspection/proposals enabled; file writes unavailable in panel' : '');
         providerPrivacy.textContent = currentProviderId === 'openai-chat-completions'
-          ? 'OpenAI receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.'
+          ? (message.toolCallingEnabled ? 'OpenAI receives the task, saved conversation, and bounded results from Vesper project inspection and proposal tools. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'OpenAI receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.')
           : currentProviderId === 'nvidia-nim'
-            ? 'NVIDIA NIM receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.'
+            ? (message.toolCallingEnabled ? 'NVIDIA NIM receives the task, saved conversation, and bounded results from Vesper project inspection and proposal tools. Model support is unverified. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'NVIDIA NIM receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.')
           : 'Codex uses a read-only sandbox; Vesper declines approval requests.';
       }
       if (message.type === 'project') {
@@ -1164,6 +1189,11 @@ function getHtml(webview) {
       if (message.type === 'assistant-delta' && message.requestId === activeRequestId && activeAssistant) {
         activeAssistant.body.textContent += message.text;
         messages.scrollTop = messages.scrollHeight;
+      }
+      if (message.type === 'tool-activity' && message.requestId === activeRequestId) {
+        const state = message.state || 'unknown';
+        const title = 'Vesper tool · ' + (message.toolId || 'unknown') + ' · ' + state + (message.verified ? ' · verified' : ' · not verified') + (message.errorCode ? ' · ' + message.errorCode : '');
+        addMessage('activity', title, message.summary || 'No result preview is available.');
       }
       if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
         status.textContent = 'Interrupt sent · waiting for ' + currentProviderName + ' to stop…';
