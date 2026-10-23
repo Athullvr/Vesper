@@ -90,6 +90,67 @@ test("repository intelligence returns bounded manifest, framework, entry, Git, s
   assert.ok(result.git.history.includes("add checkout flow"));
 });
 
+test("impact investigation searches the vetted inventory, reads cross-file candidates, and reports honest relationships", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.mkdirSync(path.join(root, "generated-files"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".gitignore"), "generated-files/\n");
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  fs.writeFileSync(path.join(root, "src", "main.js"), "export function start() { return true; }\n");
+  for (let index = 0; index < 7; index += 1) fs.writeFileSync(path.join(root, "src", `filler-${index}.js`), `export const value${index} = ${index};\n`);
+  fs.writeFileSync(path.join(root, "src", "z-handler.js"), "export function handleCheckout(request) { return request; }\n");
+  fs.writeFileSync(path.join(root, "src", "z-caller.js"), 'import { handleCheckout } from "./z-handler.js";\nexport function submit(request) { return handleCheckout(request); }\n');
+  fs.writeFileSync(path.join(root, "src", "z-route.js"), 'router.post("/checkout", handleCheckout);\n');
+  fs.writeFileSync(path.join(root, "src", "z.test.js"), 'test("handleCheckout", () => handleCheckout({}));\n');
+  fs.writeFileSync(path.join(root, "generated-files", "ignored.js"), "handleCheckout();\n");
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId, execFileImpl: mockGit(root) });
+  t.after(() => runtime.dispose());
+  const systemModel = createSystemModel({ repositoryIntelligence: createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId }) });
+
+  const result = await systemModel.investigate({ task: "Assess impact of changing handleCheckout", intent: "impact" });
+  assert.equal(result.intent, "impact");
+  assert.ok(result.candidateDiscovery.searchedFiles >= 10);
+  assert.ok(result.candidateDiscovery.matches >= 3);
+  assert.ok(result.findings.some((item) => item.type === "search-match" && item.path === "src/z-caller.js" && item.lineStart === 2 && item.sourceContextRead !== true));
+  assert.ok(!result.findings.some((item) => item.path === "generated-files/ignored.js"));
+  assert.ok(result.findings.some((item) => item.type === "symbol-definition" && item.path === "src/z-handler.js" && item.symbol === "handleCheckout"));
+  assert.ok(result.findings.some((item) => item.type === "likely-call-site" && item.path === "src/z-caller.js" && item.sourceContextRead === true));
+  assert.ok(result.findings.some((item) => item.type === "route-handler" && item.path === "src/z-route.js"));
+  assert.ok(result.findings.some((item) => item.type === "test-reference" && item.path === "src/z.test.js"));
+  assert.ok(result.impactReport.callSites.some((item) => item.path === "src/z-caller.js"));
+  assert.ok(result.impactReport.tests.some((item) => item.path === "src/z.test.js"));
+  assert.match(result.providerContext, /Change-impact summary/u);
+  assert.match(result.providerContext, /Suggested verification, not run/u);
+  assert.ok(result.evidence.investigation.impactReport);
+  const report = renderSystemModelReport(result);
+  assert.match(report, /Cross-file candidate discovery/u);
+  assert.match(report, /Change impact summary/u);
+  assert.match(report, /not a complete call graph/u);
+});
+
+test("candidate discovery exposes inventory-bound exhaustion instead of claiming full-project coverage", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src", "a"), { recursive: true });
+  fs.mkdirSync(path.join(root, "src", "b"), { recursive: true });
+  for (let index = 0; index < 65; index += 1) {
+    fs.writeFileSync(path.join(root, "src", "a", `module-${String(index).padStart(2, "0")}.js`), `export const valueA${index} = ${index};\n`);
+    fs.writeFileSync(path.join(root, "src", "b", `module-${String(index).padStart(2, "0")}.js`), `export const valueB${index} = ${index};\n`);
+  }
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId, execFileImpl: mockGit(root) });
+  t.after(() => runtime.dispose());
+  const result = await createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId })
+    .inspect({ task: "Impact of changing targetSymbol", intent: "impact", includeHistory: false, includeDiff: false });
+
+  assert.equal(result.candidateDiscovery.candidateFiles, 130);
+  assert.equal(result.candidateDiscovery.searchedFiles, 128);
+  assert.equal(result.candidateDiscovery.status, "partial");
+  assert.equal(result.candidateDiscovery.partialReason, "candidate-file-bound");
+  assert.ok(result.incomplete.some((item) => item.includes("Cross-file candidate discovery is partial")));
+  assert.ok(result.evidence.investigation.steps.some((step) => step.operation.toolId === "search_files" && step.operation.input.candidatePathCount === 128));
+});
+
 test("System Model follows local imports progressively and records ordered evidence with exact source lines", async (t) => {
   const { root } = project(t);
   fs.mkdirSync(path.join(root, "src"), { recursive: true });

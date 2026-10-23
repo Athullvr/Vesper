@@ -49,10 +49,26 @@ test("code-oriented terminal tasks get local evidence without changing the route
   assert.equal(appServer.turns.length, 1);
   assert.match(appServer.turns[0].prompt, /Vesper local repository evidence/u);
   assert.match(appServer.turns[0].prompt, /src\/index\.js/u);
+  assert.match(appServer.turns[0].prompt, /Cross-file candidate search/u);
+  assert.match(appServer.turns[0].prompt, /Grounded implementation planning/u);
   assert.match(text(), /\[Route · Codex · no local intent matched\]/u);
   assert.match(text(), /Vesper execution evidence/u);
+  assert.match(text(), /Change impact:/u);
   assert.match(text(), /Repository investigation: partial/u);
   assert.match(text(), /not run/u);
+  await terminal.toolRuntime.dispose();
+  terminal.executionProvider.dispose();
+});
+
+test("interactive :impact renders the bounded impact report without submitting a task", async (t) => {
+  const root = project(t);
+  const appServer = new FakeAppServer();
+  const { terminal, text } = makeTerminal(root, appServer);
+  await terminal.handlePrompt(":impact checkoutRoute");
+  assert.equal(appServer.turns.length, 0);
+  assert.match(text(), /Intent: impact/u);
+  assert.match(text(), /Cross-file candidate discovery/u);
+  assert.match(text(), /Change impact summary/u);
   await terminal.toolRuntime.dispose();
   terminal.executionProvider.dispose();
 });

@@ -19,6 +19,9 @@ const MAX_SEARCH_DEPTH = 5;
 const MAX_SEARCH_ENTRIES = 2_000;
 const MAX_SEARCH_RESULTS = 100;
 const MAX_SEARCH_BYTES = 16 * 1024 * 1024;
+const MAX_SEARCH_PATHS = 128;
+const MAX_SEARCH_PATH_LIST_BYTES = 16 * 1024;
+const MAX_SEARCH_QUERIES = 4;
 const MAX_REQUEST_SIZE = 64 * 1024;
 const MAX_COMMAND_LENGTH = 4_096;
 const MAX_COMMAND_TIMEOUT_MS = 5_000;
@@ -44,10 +47,14 @@ const TOOL_DEFINITIONS = Object.freeze([
     { maximumFileBytes: MAX_FILE_BYTES, maximumRequestedBytes: MAX_FILE_BYTES }),
   definition("list_files", "List one project directory without following symbolic links.", "project-read", false,
     objectSchema({ path: projectPathSchema() }), { maximumEntries: MAX_DIRECTORY_ENTRIES, maximumDepth: 1 }),
-  definition("search_files", "Search literal text in bounded UTF-8 project files.", "project-search", false,
-    objectSchema({ query: { type: "string", minLength: 1, maxLength: 512, "x-maxUtf8Bytes": 512 }, path: projectPathSchema() }, ["query"]), {
+  definition("search_files", "Search literal text in bounded UTF-8 project files, optionally limited to explicit project-relative files.", "project-search", false,
+    objectSchema({ query: { type: "string", minLength: 1, maxLength: 512, "x-maxUtf8Bytes": 512 },
+      queries: { type: "array", minItems: 1, maxItems: MAX_SEARCH_QUERIES, items: { type: "string", minLength: 1, maxLength: 512, "x-maxUtf8Bytes": 512 } },
+      path: projectPathSchema(), paths: { type: "array", minItems: 1, maxItems: MAX_SEARCH_PATHS, items: projectPathSchema() },
+      caseSensitive: { type: "boolean" }, maxFileBytes: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES } }, []), {
       maximumDepth: MAX_SEARCH_DEPTH, maximumEntries: MAX_SEARCH_ENTRIES,
       maximumMatches: MAX_SEARCH_RESULTS, maximumScannedBytes: MAX_SEARCH_BYTES, maximumOutputCharacters: MAX_TOOL_OUTPUT,
+      maximumExplicitPaths: MAX_SEARCH_PATHS, maximumQueries: MAX_SEARCH_QUERIES,
     }),
   definition("git_status", "Inspect bounded, read-only Git status for this project.", "project-git-read", false,
     objectSchema({}), { timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT }),
@@ -122,6 +129,7 @@ class PermissionedToolRuntime {
     this.proposalStates = new Map();
     this.commandAbortController = null;
     this.approvalAbortController = null;
+    this.operationAbortController = null;
   }
 
   getDefinitions() {
@@ -178,11 +186,16 @@ class PermissionedToolRuntime {
     }
   }
 
-  async invoke(request) {
+  async invoke(request, { signal } = {}) {
     if (this.disposed) return rejected("RUNTIME_DISPOSED", "This tool runtime has been disposed.");
     if (this.busy) return rejected("BUSY", "Another tool operation is still active.");
     this.busy = true;
     this.approvalAbortController = new AbortController();
+    const operationAbortController = new AbortController();
+    this.operationAbortController = operationAbortController;
+    const abortOperation = () => operationAbortController.abort(signal?.reason || "tool-operation-cancelled");
+    signal?.addEventListener("abort", abortOperation, { once: true });
+    if (signal?.aborted) abortOperation();
     let normalized;
     let approvalId = null;
     let state = "requested";
@@ -234,7 +247,8 @@ class PermissionedToolRuntime {
         this.recordAudit(normalized.toolId, state, normalized.requestId, approvalId);
       }
 
-      const result = await this.execute(normalized, commandPlan);
+      if (operationAbortController.signal.aborted) throw toolError("TOOL_INTERRUPTED", "The operation was cancelled before execution.", true);
+      const result = await this.execute(normalized, commandPlan, operationAbortController.signal);
       if (result.approvalId) approvalId = result.approvalId;
       if (result.proposal) {
         state = "proposed";
@@ -282,17 +296,19 @@ class PermissionedToolRuntime {
         error: Object.freeze({ code: toolError.code, message: toolError.message, retryable: toolError.retryable }),
       });
     } finally {
+      signal?.removeEventListener("abort", abortOperation);
       this.busy = false;
       this.interruptionRequested = false;
       this.approvalAbortController = null;
+      this.operationAbortController = null;
     }
   }
 
-  async execute(request, commandPlan = null) {
+  async execute(request, commandPlan = null, signal) {
     switch (request.toolId) {
       case "read_file": return this.readFile(request.input.path, request.input.maxBytes);
       case "list_files": return this.listFiles(request.input.path || ".");
-      case "search_files": return this.searchFiles(request.input.query, request.input.path || ".");
+      case "search_files": return this.searchFiles(request.input.query, request.input.path || ".", request.input, signal);
       case "git_status": return this.gitRead(["status", "--short", "--branch", "--untracked-files=no"]);
       case "git_diff": return this.gitDiff(request.input.path);
       case "git_log": return this.gitLog(request.input);
@@ -331,19 +347,78 @@ class PermissionedToolRuntime {
     } finally { root.close(); }
   }
 
-  searchFiles(query, relativePath) {
-    if (typeof query !== "string" || !query.trim() || Buffer.byteLength(query, "utf8") > 512 || query.includes("\0")) {
-      throw toolError("INVALID_ARGUMENT", "search_files requires a non-empty literal query of at most 512 bytes.", true);
+  async searchFiles(query, relativePath, options = {}, signal) {
+    const queries = Array.isArray(options.queries) ? options.queries : [query];
+    if (!Array.isArray(queries) || queries.length < 1 || queries.length > MAX_SEARCH_QUERIES ||
+        queries.some((value) => typeof value !== "string" || !value.trim() || Buffer.byteLength(value, "utf8") > 512 || value.includes("\0")) ||
+        new Set(queries).size !== queries.length) {
+      throw toolError("INVALID_ARGUMENT", "search_files requires one to four unique literal queries of at most 512 bytes each.", true);
     }
+    const explicitPaths = Array.isArray(options.paths) ? [...new Set(options.paths)] : null;
+    if (explicitPaths && (explicitPaths.length < 1 || explicitPaths.length > MAX_SEARCH_PATHS || explicitPaths.some((value) => typeof value !== "string") ||
+        explicitPaths.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0) > MAX_SEARCH_PATH_LIST_BYTES)) {
+      throw toolError("INVALID_ARGUMENT", `search_files paths must contain at most ${MAX_SEARCH_PATHS} bounded project-relative files.`, true);
+    }
+    if (explicitPaths && options.path !== undefined) throw toolError("INVALID_ARGUMENT", "search_files accepts either path or explicit paths, not both.", true);
+    if (options.caseSensitive !== undefined && typeof options.caseSensitive !== "boolean") {
+      throw toolError("INVALID_ARGUMENT", "search_files caseSensitive must be boolean.", true);
+    }
+    const caseSensitive = options.caseSensitive !== false;
     const root = this.openRoot();
-    const start = this.files.parseProjectPath(relativePath, { allowRoot: true });
+    const start = explicitPaths ? null : this.files.parseProjectPath(relativePath, { allowRoot: true });
     const results = [];
     let visited = 0;
     let scannedBytes = 0;
     let skippedFiles = 0;
-    let outputLength = JSON.stringify(query).length + 128;
+    let outputLength = JSON.stringify(queries).length + 128;
     let truncated = false;
-    const visit = (components, depth) => {
+    const ensureActive = () => {
+      if (signal?.aborted) throw toolError("TOOL_INTERRUPTED", "The project search was cancelled.", true);
+    };
+    const yieldToCancellation = () => new Promise((resolve) => setImmediate(resolve));
+    const addMatches = (relativeFilePath, text) => {
+      const lines = text.split("\n");
+      for (let index = 0; index < lines.length; index += 1) {
+        for (const term of queries) {
+          const source = caseSensitive ? lines[index] : lines[index].toLocaleLowerCase("en-US");
+          const needle = caseSensitive ? term : term.toLocaleLowerCase("en-US");
+          const column = source.indexOf(needle);
+          if (column < 0) continue;
+          const rawLine = lines[index].slice(0, 500);
+          const visibleLine = redactSensitiveText(rawLine);
+          const match = { query: term, path: relativeFilePath, line: index + 1, column: column + 1,
+            text: visibleLine, redacted: visibleLine !== rawLine };
+          const size = JSON.stringify(match).length;
+          if (outputLength + size > MAX_TOOL_OUTPUT || results.length >= MAX_SEARCH_RESULTS) { truncated = true; return false; }
+          results.push(match);
+          outputLength += size;
+        }
+      }
+      return true;
+    };
+    if (explicitPaths) {
+      for (const requestedPath of explicitPaths) {
+        ensureActive();
+        if (visited >= MAX_SEARCH_ENTRIES || scannedBytes >= MAX_SEARCH_BYTES || results.length >= MAX_SEARCH_RESULTS) { truncated = true; break; }
+        visited += 1;
+        let parent;
+        try { parent = this.files.openProjectParent(root, requestedPath); }
+        catch { skippedFiles += 1; truncated = true; continue; }
+        try {
+          let file;
+          try { file = this.files.readFileAt(parent.fd, parent.basename, Math.min(options.maxFileBytes || MAX_FILE_BYTES, MAX_SEARCH_BYTES - scannedBytes), { expectedDevice: parent.device }); }
+          catch { skippedFiles += 1; truncated = true; continue; }
+          scannedBytes += file.buffer.length;
+          if (!file.buffer.length || file.buffer.includes(0)) { skippedFiles += 1; truncated = true; continue; }
+          const text = decodeUtf8(file.buffer);
+          if (text === null) { skippedFiles += 1; truncated = true; continue; }
+          if (!addMatches(parent.relativePath, text)) break;
+        } finally { parent.close(); }
+        await yieldToCancellation();
+      }
+    }
+    const visit = async (components, depth) => {
+      ensureActive();
       if (results.length >= MAX_SEARCH_RESULTS || visited >= MAX_SEARCH_ENTRIES || scannedBytes >= MAX_SEARCH_BYTES) {
         truncated = true;
         return;
@@ -353,6 +428,7 @@ class PermissionedToolRuntime {
         const listing = this.files.listRawDirectory(directory.fd, { maximum: Math.max(0, MAX_SEARCH_ENTRIES - visited) });
         truncated ||= listing.truncated;
         for (const name of listing.entries) {
+          ensureActive();
           if (results.length >= MAX_SEARCH_RESULTS || visited >= MAX_SEARCH_ENTRIES || scannedBytes >= MAX_SEARCH_BYTES) { truncated = true; break; }
           visited += 1;
           let safeComponents;
@@ -360,7 +436,7 @@ class PermissionedToolRuntime {
           const stat = this.files.statAt(directory.fd, name);
           if (!stat || stat.isSymbolicLink()) continue;
           if (stat.isDirectory()) {
-            if (depth < MAX_SEARCH_DEPTH) visit(safeComponents, depth + 1);
+            if (depth < MAX_SEARCH_DEPTH) await visit(safeComponents, depth + 1);
             else truncated = true;
             continue;
           }
@@ -375,26 +451,15 @@ class PermissionedToolRuntime {
           if (!file.buffer.length || file.buffer.includes(0)) { skippedFiles += 1; truncated = true; continue; }
           const text = decodeUtf8(file.buffer);
           if (text === null) { skippedFiles += 1; truncated = true; continue; }
-          const lines = text.split("\n");
-          for (let index = 0; index < lines.length; index += 1) {
-            const line = lines[index];
-            const column = line.indexOf(query);
-            if (column < 0) continue;
-            const rawLine = line.slice(0, 500);
-            const visibleLine = redactSensitiveText(rawLine);
-            const match = { path: safeComponents.join("/"), line: index + 1, column: column + 1,
-              text: visibleLine, redacted: visibleLine !== rawLine };
-            const size = JSON.stringify(match).length;
-            if (outputLength + size > MAX_TOOL_OUTPUT || results.length >= MAX_SEARCH_RESULTS) { truncated = true; return; }
-            results.push(match);
-            outputLength += size;
-          }
+          if (!addMatches(safeComponents.join("/"), text)) return;
+          await yieldToCancellation();
         }
       } finally { directory.close(); }
     };
     try {
-      visit(start.components, 0);
-      return { value: { query, matches: results, scannedEntries: visited, scannedBytes, skippedFiles, truncated }, verified: !truncated, truncated };
+      if (!explicitPaths) await visit(start.components, 0);
+      ensureActive();
+      return { value: { query: queries.length === 1 ? queries[0] : null, queries, caseSensitive, matches: results, scannedEntries: visited, scannedBytes, skippedFiles, truncated }, verified: !truncated, truncated };
     } finally { root.close(); }
   }
 
@@ -910,6 +975,7 @@ class PermissionedToolRuntime {
     this.interruptionRequested = true;
     this.commandAbortController?.abort();
     this.approvalAbortController?.abort();
+    this.operationAbortController?.abort("tool-operation-interrupted");
     return true;
   }
 }
@@ -925,7 +991,7 @@ function createPermissionedToolRuntime(options) {
     getAuditEvents: () => runtime.getAuditEvents(),
     getCommandExecutionStatus: () => runtime.getCommandExecutionStatus(),
     preview: (request) => runtime.preview(request),
-    invoke: (request) => runtime.invoke(request),
+    invoke: (request, options) => runtime.invoke(request, options),
     interrupt: () => runtime.interrupt(),
     dispose: () => runtime.dispose(),
   });
@@ -1006,9 +1072,31 @@ function validateInput(toolId, input) {
     }
     case "list_files": exactKeys(["path"]); return { ...(input.path === undefined ? {} : { path: validPathValue(input.path, true) }) };
     case "search_files":
-      exactKeys(["query", "path"]);
-      if (typeof input.query !== "string" || !input.query.trim() || Buffer.byteLength(input.query, "utf8") > 512) throw toolError("INVALID_ARGUMENT", "search_files requires a non-empty literal query of at most 512 bytes.", true);
-      return { query: input.query, ...(input.path === undefined ? {} : { path: validPathValue(input.path, true) }) };
+      exactKeys(["query", "queries", "path", "paths", "caseSensitive", "maxFileBytes"], ["query", "queries", "path", "paths", "caseSensitive", "maxFileBytes"]);
+      if ((input.query === undefined) === (input.queries === undefined) || (input.path !== undefined && input.paths !== undefined)) {
+        throw toolError("INVALID_ARGUMENT", "search_files requires one query form and either path or explicit paths.", true);
+      }
+      const queries = input.queries === undefined ? [input.query] : input.queries;
+      if (!Array.isArray(queries) || queries.length < 1 || queries.length > MAX_SEARCH_QUERIES ||
+          queries.some((value) => typeof value !== "string" || !value.trim() || Buffer.byteLength(value, "utf8") > 512 || value.includes("\0")) ||
+          new Set(queries).size !== queries.length) {
+        throw toolError("INVALID_ARGUMENT", `search_files queries must contain 1 to ${MAX_SEARCH_QUERIES} unique literal values of at most 512 bytes.`, true);
+      }
+      if (input.caseSensitive !== undefined && typeof input.caseSensitive !== "boolean") throw toolError("INVALID_ARGUMENT", "search_files caseSensitive must be boolean.", true);
+      if (input.maxFileBytes !== undefined && (!Number.isInteger(input.maxFileBytes) || input.maxFileBytes < 1 || input.maxFileBytes > MAX_FILE_BYTES)) {
+        throw toolError("INVALID_ARGUMENT", `search_files maxFileBytes must be an integer from 1 to ${MAX_FILE_BYTES}.`, true);
+      }
+      if (input.paths !== undefined) {
+        if (!Array.isArray(input.paths) || input.paths.length < 1 || input.paths.length > MAX_SEARCH_PATHS) throw toolError("INVALID_ARGUMENT", `search_files paths must contain 1 to ${MAX_SEARCH_PATHS} project-relative files.`, true);
+        const paths = input.paths.map((value) => validPathValue(value, false));
+        if (new Set(paths).size !== paths.length || paths.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0) > MAX_SEARCH_PATH_LIST_BYTES) {
+          throw toolError("INVALID_ARGUMENT", "search_files paths must be unique and fit the bounded path-list size.", true);
+        }
+        return { queries: Object.freeze([...queries]), paths: Object.freeze(paths), ...(input.caseSensitive === undefined ? {} : { caseSensitive: input.caseSensitive }),
+          ...(input.maxFileBytes === undefined ? {} : { maxFileBytes: input.maxFileBytes }) };
+      }
+      return { queries: Object.freeze([...queries]), ...(input.path === undefined ? {} : { path: validPathValue(input.path, true) }),
+        ...(input.caseSensitive === undefined ? {} : { caseSensitive: input.caseSensitive }), ...(input.maxFileBytes === undefined ? {} : { maxFileBytes: input.maxFileBytes }) };
     case "git_status": exactKeys([]); return {};
     case "git_diff": exactKeys(["path"]); return input.path === undefined ? {} : { path: validPathValue(input.path, false) };
     case "git_log": {

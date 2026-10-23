@@ -96,6 +96,12 @@ function mergeRepositoryEvidence(target, source) {
       ...(source.investigation.referenceIndex && typeof source.investigation.referenceIndex === "object" ? {
         referenceIndex: normalizeReferenceIndex(source.investigation.referenceIndex),
       } : {}),
+      ...(source.investigation.candidateDiscovery && typeof source.investigation.candidateDiscovery === "object" ? {
+        candidateDiscovery: normalizeCandidateDiscovery(source.investigation.candidateDiscovery),
+      } : {}),
+      ...(source.investigation.impactReport && typeof source.investigation.impactReport === "object" ? {
+        impactReport: normalizeImpactReport(source.investigation.impactReport),
+      } : {}),
       ...(Array.isArray(source.investigation.steps) ? { steps: normalizeInvestigationSteps(source.investigation.steps) } : {}),
       ...(Array.isArray(source.investigation.unresolved) ? { unresolved: source.investigation.unresolved.slice(0, 12).map((item) => safeDescription(item, 240)).filter(Boolean) } : {}),
       ...(source.investigation.remainingBudget && typeof source.investigation.remainingBudget === "object" ? {
@@ -415,6 +421,56 @@ function normalizeReferenceIndex(value) {
   };
 }
 
+function normalizeCandidateDiscovery(value) {
+  return {
+    status: ["complete", "partial", "unavailable", "skipped"].includes(value.status) ? value.status : "unknown",
+    candidateFiles: boundedInteger(value.candidateFiles, 0, 600),
+    searchedFiles: boundedInteger(value.searchedFiles, 0, 128),
+    scannedFiles: boundedInteger(value.scannedFiles, 0, 2_000),
+    scannedBytes: boundedInteger(value.scannedBytes, 0, 16 * 1024 * 1024),
+    matches: boundedInteger(value.matches, 0, 100),
+    queryCount: boundedInteger(value.queryCount, 0, 4),
+    ...(safeToken(value.partialReason, 60) ? { partialReason: safeToken(value.partialReason, 60) } : {}),
+  };
+}
+
+function normalizeImpactItems(items) {
+  return (Array.isArray(items) ? items : []).slice(0, 24).flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const type = safeToken(item.type, 40);
+    if (!type) return [];
+    const pathValue = safeRelativePath(item.path);
+    const relatedPath = safeRelativePath(item.relatedPath);
+    return [{ type, ...(pathValue ? { path: pathValue } : {}),
+      ...(Number.isInteger(item.line) && item.line > 0 ? { line: item.line } : {}),
+      ...(relatedPath ? { relatedPath } : {}),
+      ...(Number.isInteger(item.relatedLine) && item.relatedLine > 0 ? { relatedLine: item.relatedLine } : {}),
+      ...(safeDescription(item.symbol, 120) ? { symbol: safeDescription(item.symbol, 120) } : {}),
+      confidence: ["high", "medium", "low", "unknown"].includes(item.confidence) ? item.confidence : "unknown",
+      observation: item.observation === "inferred" ? "inferred" : "observed",
+      sourceContextRead: item.sourceContextRead === true,
+      ...(safeToken(item.discoveryMethod, 80) ? { discoveryMethod: safeToken(item.discoveryMethod, 80) } : {}),
+    }];
+  });
+}
+
+function normalizeImpactReport(value) {
+  return {
+    status: value.status === "bounded" ? "bounded" : "partial",
+    targetTerms: Array.isArray(value.targetTerms) ? value.targetTerms.slice(0, 8).map((item) => safeDescription(item, 80)).filter(Boolean) : [],
+    definitions: normalizeImpactItems(value.definitions),
+    callSites: normalizeImpactItems(value.callSites),
+    dependencies: normalizeImpactItems(value.dependencies),
+    textualReferences: normalizeImpactItems(value.textualReferences),
+    routes: normalizeImpactItems(value.routes),
+    tests: normalizeImpactItems(value.tests),
+    changedFiles: uniquePaths(value.changedFiles).slice(0, 12),
+    ...(value.candidateDiscovery && typeof value.candidateDiscovery === "object" ? { candidateDiscovery: normalizeCandidateDiscovery(value.candidateDiscovery) } : {}),
+    gaps: Array.isArray(value.gaps) ? value.gaps.slice(0, 12).map((item) => safeDescription(item, 240)).filter(Boolean) : [],
+    suggestedVerification: Array.isArray(value.suggestedVerification) ? value.suggestedVerification.slice(0, 8).map((item) => safeDescription(item, 240)).filter(Boolean) : [],
+  };
+}
+
 function normalizeInvestigationSteps(steps) {
   return steps.slice(0, MAX_EVIDENCE_ENTRIES).flatMap((step, index) => {
     if (!step || typeof step !== "object" || Array.isArray(step)) return [];
@@ -424,10 +480,13 @@ function normalizeInvestigationSteps(steps) {
     const input = {};
     if (safeRelativePath(rawInput.path)) input.path = safeRelativePath(rawInput.path);
     if (Number.isInteger(rawInput.pathCount)) input.pathCount = boundedInteger(rawInput.pathCount, 0, 100);
+    if (Number.isInteger(rawInput.candidatePathCount)) input.candidatePathCount = boundedInteger(rawInput.candidatePathCount, 0, 128);
+    if (Number.isInteger(rawInput.queryCount)) input.queryCount = boundedInteger(rawInput.queryCount, 0, 4);
     if (Array.isArray(rawInput.samplePaths)) input.samplePaths = uniquePaths(rawInput.samplePaths).slice(0, 4);
     if (Number.isInteger(rawInput.limit)) input.limit = boundedInteger(rawInput.limit, 0, 20);
     if (Number.isInteger(rawInput.maxBytes)) input.maxBytes = boundedInteger(rawInput.maxBytes, 1, 128 * 1024);
     if (Number.isInteger(rawInput.queryLength)) input.queryLength = boundedInteger(rawInput.queryLength, 0, 512);
+    if (Number.isInteger(rawInput.maxFileBytes)) input.maxFileBytes = boundedInteger(rawInput.maxFileBytes, 1, 1024 * 1024);
     const result = step.result && typeof step.result === "object" ? step.result : {};
     const refs = Array.isArray(result.evidenceRefs) ? result.evidenceRefs.slice(0, 8).flatMap((item) => {
       const relative = safeRelativePath(item?.path);
@@ -567,6 +626,15 @@ function renderTaskEvidenceReport(evidence) {
     if (index.changes?.changed?.length || index.changes?.removed?.length || index.changes?.renamed?.length) {
       lines.push(`Index refresh: ${index.changes.changed.length} changed, ${index.changes.removed.length} removed, ${index.changes.renamed.length} same-content rename(s) observed.`);
     }
+  }
+  if (investigation?.candidateDiscovery) {
+    const discovery = investigation.candidateDiscovery;
+    lines.push(`Cross-file search: ${discovery.status} · ${discovery.scannedFiles}/${discovery.searchedFiles} selected files visited · ${discovery.matches} candidates${discovery.partialReason ? ` · ${discovery.partialReason}` : ""}.`);
+  }
+  if (investigation?.impactReport) {
+    const impact = investigation.impactReport;
+    lines.push(`Change impact: ${impact.status} · ${impact.definitions.length} definitions · ${impact.callSites.length} syntactic call candidates · ${impact.dependencies.length} dependency candidates · ${impact.routes.length} route matches · ${impact.tests.length} test references.`);
+    for (const gap of impact.gaps.slice(0, 4)) lines.push("- Impact limitation: " + safeDescription(gap, 220));
   }
   for (const step of (investigation?.steps || []).slice(0, 8)) {
     const target = step.operation?.input?.path ? " " + formatPath(step.operation.input.path) : "";

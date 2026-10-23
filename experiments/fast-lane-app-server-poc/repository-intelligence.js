@@ -17,6 +17,10 @@ const MAX_MANIFEST_BYTES = 128 * 1024;
 const MAX_SOURCE_READS = 4;
 const MAX_SOURCE_FILE_BYTES = 64 * 1024;
 const MAX_SOURCE_TOTAL_BYTES = 512 * 1024;
+const MAX_DISCOVERY_FILES = 128;
+const MAX_DISCOVERY_PATH_BYTES = 12 * 1024;
+const MAX_DISCOVERY_MATCHES = 32;
+const MAX_DISCOVERY_FINDINGS = 8;
 const MAX_SOURCE_LINES = 2_000;
 const MAX_TARGETED_READS = 5;
 const MAX_TRACE_HOPS = 2;
@@ -144,6 +148,7 @@ class RepositoryIntelligenceService {
       dependencyFindings: 0,
       commandFindings: 0,
       searches: [],
+      candidateDiscovery: { status: "not-run", candidateFiles: 0, searchedFiles: 0, scannedBytes: 0, matches: 0, queryCount: 0, partialReason: null },
       statusText: "",
       historyText: "",
       diffText: "",
@@ -189,6 +194,7 @@ class RepositoryIntelligenceService {
         remainingBudget: this.remainingBudget(state, startedAt),
         stopReason: state.stopReason,
         referenceIndex,
+        candidateDiscovery: Object.freeze({ ...state.candidateDiscovery }),
       };
       return Object.freeze({
         status: evidence.investigation.status,
@@ -205,6 +211,7 @@ class RepositoryIntelligenceService {
           coverage: state.gitAvailable ? "Tracked working-tree status and unstaged tracked diff only; untracked files and staged diff are omitted. Git ignore checks use in-project rules; global excludes are not read." : "Git metadata is unavailable; filesystem findings are independent of Git." }),
         findings: Object.freeze(evidence.findings.slice(0, MAX_FINDINGS).map((item) => Object.freeze({ ...item }))),
         referenceIndex,
+        candidateDiscovery: Object.freeze({ ...state.candidateDiscovery }),
         incomplete: Object.freeze(uniqueText(state.incomplete, 12, 260)),
         evidence,
       });
@@ -217,7 +224,8 @@ class RepositoryIntelligenceService {
       const referenceIndex = this.finalizeReferenceIndex(state, evidence);
       evidence.investigation = { status: aborted ? "cancelled" : state.files.length || evidence.findings.length ? "partial" : "unavailable", intent: safeToken(intent) || "overview", note, observedAt: this.now().toISOString(),
         steps: state.steps.slice(0, MAX_STEPS), unresolved: uniqueText(state.unresolved, 12, 260), remainingBudget: this.remainingBudget(state, startedAt),
-        stopReason: aborted ? "cancelled" : error?.code === "INSPECTION_BUDGET" ? state.calls >= MAX_TOOL_CALLS ? "operation-budget" : "time-budget" : "investigation-error", referenceIndex };
+        stopReason: aborted ? "cancelled" : error?.code === "INSPECTION_BUDGET" ? state.calls >= MAX_TOOL_CALLS ? "operation-budget" : "time-budget" : "investigation-error", referenceIndex,
+        candidateDiscovery: Object.freeze({ ...state.candidateDiscovery }) };
       return Object.freeze({ status: evidence.investigation.status, observedAt: evidence.investigation.observedAt, project: Object.freeze({ fileCount: state.files.length, directoryCount: state.directories.length,
         languages: Object.freeze(state.languages.slice(0, 8)), frameworks: Object.freeze(state.frameworks.slice(0, 8)), dependencies: Object.freeze(state.dependencies.slice(0, 20)),
         manifests: Object.freeze(state.manifests.map((item) => Object.freeze({ ...item }))), entryPoints: Object.freeze(state.entryPoints.slice(0, 10)),
@@ -226,6 +234,7 @@ class RepositoryIntelligenceService {
         git: Object.freeze({ available: state.gitAvailable, status: safeText(state.statusText, 4_000), history: safeText(state.historyText, 3_000), diff: safeText(state.diffText, 6_000),
           coverage: state.gitAvailable ? "Tracked working-tree status and unstaged tracked diff only; untracked files and staged diff are omitted. Git ignore checks use in-project rules; global excludes are not read." : "Git metadata is unavailable; filesystem findings are independent of Git." }),
         findings: Object.freeze(evidence.findings.slice(0, MAX_FINDINGS).map((item) => Object.freeze({ ...item }))), referenceIndex,
+        candidateDiscovery: Object.freeze({ ...state.candidateDiscovery }),
         incomplete: Object.freeze(uniqueText(state.incomplete, 12, 260)), evidence });
     } finally {
       signal?.removeEventListener("abort", onAbort);
@@ -445,9 +454,14 @@ class RepositoryIntelligenceService {
     const changedPaths = new Set(evidence.findings.filter((item) => item.type === "git-diff").map((item) => item.path).filter(Boolean));
     const scores = sourceFiles.map((file) => ({ file, score: sourceScore(file, taskTerms, entryPaths, changedPaths) }))
       .sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path));
+    const discoveryFiles = selectDiscoveryFiles(scores, MAX_DISCOVERY_FILES);
+    await this.discoverTaskCandidates({ state, evidence, files: discoveryFiles, eligibleFileCount: sourceFiles.length, taskTerms, signal });
+    const discoveredPaths = new Set(state.searches.map((item) => item.path));
+    const rankedScores = scores.map(({ file, score }) => ({ file, score: score + (discoveredPaths.has(file.path) ? 24 : 0) }))
+      .sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path));
     const selected = scores.slice(0, MAX_SOURCE_READS).map((item) => item.file);
-    state.candidates = scores.slice(0, 80).map(({ file, score }) => ({ path: file.path, sizeBytes: file.sizeBytes, score,
-      entryPoint: entryPaths.has(file.path), changed: changedPaths.has(file.path) }));
+    state.candidates = rankedScores.slice(0, 80).map(({ file, score }) => ({ path: file.path, sizeBytes: file.sizeBytes, score,
+      entryPoint: entryPaths.has(file.path), changed: changedPaths.has(file.path), searchMatch: discoveredPaths.has(file.path) }));
     if (sourceFiles.length > selected.length) state.incomplete.push(`Source investigation sampled ${selected.length} of ${sourceFiles.length} candidate code files; dependency traces may be incomplete.`);
     const symbolHits = [];
     const readContents = new Map();
@@ -548,6 +562,71 @@ class RepositoryIntelligenceService {
     }
     this.traceImports(state, evidence, readContents, [...relevantFilePaths], 0);
     return { taskTerms, symbolHits, readContents, relevantFilePaths: [...relevantFilePaths] };
+  }
+
+  async discoverTaskCandidates({ state, evidence, files, eligibleFileCount, taskTerms, signal }) {
+    const queries = [...new Set((taskTerms || []).filter((term) => typeof term === "string" && term.trim()).slice(0, 4))];
+    const discovery = state.candidateDiscovery;
+    discovery.candidateFiles = Math.max(0, eligibleFileCount);
+    discovery.searchedFiles = files.length;
+    discovery.queryCount = queries.length;
+    if (!queries.length) {
+      discovery.status = "skipped";
+      discovery.partialReason = "no-task-search-terms";
+      return;
+    }
+    if (!files.length) {
+      discovery.status = "partial";
+      discovery.partialReason = "no-eligible-source-files";
+      state.incomplete.push("Bounded candidate discovery found no eligible source or configuration files to search.");
+      return;
+    }
+    if (files.length < eligibleFileCount) discovery.partialReason = "candidate-file-bound";
+    const result = await this.callTool("search_files", {
+      queries,
+      paths: files.map((item) => item.file.path),
+      caseSensitive: false,
+      maxFileBytes: MAX_SOURCE_FILE_BYTES,
+    }, state, evidence, signal, {
+      purpose: "Find task-term candidates across the bounded, ignore-filtered project inventory without sending file contents to a model.",
+      expectedEvidence: "Literal search candidates with project-relative paths and line numbers; semantics remain unconfirmed.",
+    });
+    if (!result || result.error || !result.result || !Array.isArray(result.result.matches)) {
+      discovery.status = "unavailable";
+      discovery.partialReason = "permissioned-search-unavailable";
+      state.incomplete.push("Cross-file candidate search was unavailable; findings are limited to directly selected source reads.");
+      return;
+    }
+    const matches = result.result.matches.slice(0, MAX_DISCOVERY_MATCHES);
+    discovery.scannedFiles = Number.isSafeInteger(result.result.scannedEntries) ? result.result.scannedEntries : 0;
+    discovery.scannedBytes = Number.isSafeInteger(result.result.scannedBytes) ? result.result.scannedBytes : 0;
+    discovery.matches = matches.length;
+    if (result.result.truncated || result.truncated) discovery.partialReason ||= "search-result-or-byte-bound";
+    if (matches.length >= MAX_DISCOVERY_MATCHES) discovery.partialReason ||= "finding-bound";
+    discovery.status = discovery.partialReason ? "partial" : "complete";
+    const indexedPaths = new Set(files.map((item) => item.file.path));
+    for (const match of matches) {
+      if (!match || !indexedPaths.has(match.path) || !Number.isInteger(match.line) || match.line < 1 || typeof match.query !== "string") continue;
+      state.searches.push({ term: match.query, path: match.path, line: match.line, discovery: true });
+      if (evidence.findings.filter((item) => item.type === "search-match").length < MAX_DISCOVERY_FINDINGS) {
+        this.find(evidence, {
+          type: "search-match",
+          description: `Permissioned literal search found ${match.query}; this line is a candidate and does not establish a semantic dependency or call relationship.`,
+          path: match.path,
+          lineStart: match.line,
+          symbol: match.query,
+          source: "search_files",
+          discoveryMethod: "bounded_literal_search",
+          sourceContextRead: false,
+          confidence: "medium",
+          observation: "observed",
+          status: "confirmed",
+        });
+      }
+    }
+    if (discovery.partialReason) {
+      state.incomplete.push(`Cross-file candidate discovery is partial (${discovery.partialReason}); ${discovery.scannedFiles}/${files.length} selected files searched with ${discovery.scannedBytes} bytes and ${discovery.matches} returned matches.`);
+    }
   }
 
   traceImports(state, evidence, readContents, sourcePaths, depth) {
@@ -887,7 +966,7 @@ class RepositoryIntelligenceService {
     }
     step.state = "validated";
     let result;
-    try { result = await this.runtime.invoke(request); } catch {
+    try { result = await this.runtime.invoke(request, { signal }); } catch {
       step.state = "failed";
       step.result = { state: "failed", verified: false, summary: "The permissioned runtime failed the read-only operation." };
       state.unresolved.push(`${toolId} failed during execution.`);
@@ -1250,11 +1329,22 @@ function renderRepositoryContext(result) {
     lines.push(`JS/TS symbol/reference index: ${investigation.referenceIndex.status} · ${investigation.referenceIndex.indexedFiles}/${investigation.referenceIndex.eligibleFiles} eligible files · ${investigation.referenceIndex.relationships} relationships.`);
     lines.push(safeStepText(investigation.referenceIndex.freshness, 200));
   }
+  if (investigation.candidateDiscovery) {
+    const discovery = investigation.candidateDiscovery;
+    lines.push(`Cross-file candidate search: ${discovery.status} · ${discovery.scannedFiles}/${discovery.searchedFiles} selected files visited · ${discovery.matches} literal candidates${discovery.partialReason ? ` · ${discovery.partialReason}` : ""}.`);
+  }
+  if (result.impactReport) {
+    const impact = result.impactReport;
+    lines.push(`Change-impact summary (${impact.status}): ${impact.definitions.length} definitions, ${impact.callSites.length} syntactic call candidates, ${impact.dependencies.length} dependency candidates, ${impact.routes.length} route matches, and ${impact.tests.length} test references.`);
+    for (const gap of (impact.gaps || []).slice(0, 3)) lines.push(`Impact limitation: ${safeStepText(gap, 180)}`);
+  }
+  for (const item of (result.plan || []).slice(0, 4)) lines.push(`Grounded implementation planning: ${safeStepText(item, 200)}`);
+  for (const item of (result.verificationRequirements || []).slice(0, 4)) lines.push(`Suggested verification, not run: ${safeStepText(item, 180)}`);
   for (const step of (investigation.steps || []).slice(-8)) {
     const target = step.operation?.input?.path ? ` ${safeStepText(step.operation.input.path, 120)}` : "";
     lines.push(`Step ${step.index}: ${safeStepText(step.operation?.toolId || "read-only operation", 80)}${target} (${safeStepText(step.state || "unknown", 40)}): ${safeStepText(step.result?.summary || "result unavailable", 180)}`);
   }
-  const priority = new Map([["symbol-definition", 0], ["symbol", 1], ["likely-call-site", 2], ["route-handler", 3], ["symbol-import", 4], ["symbol-export", 5], ["identifier-reference", 6], ["textual-reference", 7], ["test-reference", 8], ["reference", 9], ["source-section", 10], ["import-edge", 11], ["git-diff-hunk", 12], ["git-diff", 13]]);
+  const priority = new Map([["symbol-definition", 0], ["symbol", 1], ["likely-call-site", 2], ["route-handler", 3], ["symbol-import", 4], ["symbol-export", 5], ["identifier-reference", 6], ["textual-reference", 7], ["test-reference", 8], ["search-match", 9], ["reference", 10], ["source-section", 11], ["import-edge", 12], ["git-diff-hunk", 13], ["git-diff", 14]]);
   const findings = [...(result.findings || [])].sort((a, b) => (priority.get(a.type) ?? 10) - (priority.get(b.type) ?? 10));
   for (const finding of findings.slice(0, 10)) {
     const location = finding.path ? `${finding.path}${finding.lineStart ? `:${finding.lineStart}${finding.lineEnd && finding.lineEnd !== finding.lineStart ? `-${finding.lineEnd}` : ""}` : ""}` : "project-wide";
@@ -1295,9 +1385,43 @@ function sourceScore(file, terms, entryPoints, changedPaths = new Set()) {
   return score;
 }
 
+function selectDiscoveryFiles(scoredFiles, maximum) {
+  const directories = new Map();
+  for (const item of scoredFiles) {
+    const directory = path.posix.dirname(item.file.path);
+    if (!directories.has(directory)) directories.set(directory, []);
+    directories.get(directory).push(item);
+  }
+  const buckets = [...directories.entries()].map(([directory, items]) => ({ directory,
+    items: items.sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path)),
+    priority: Math.max(...items.map((item) => item.score)),
+  })).sort((a, b) => b.priority - a.priority || a.directory.localeCompare(b.directory));
+  const selected = [];
+  let selectedPathBytes = 0;
+  let depth = 0;
+  while (selected.length < maximum && buckets.some((bucket) => bucket.items[depth])) {
+    for (const bucket of buckets) {
+      if (selected.length >= maximum) break;
+      const candidate = bucket.items[depth];
+      if (!candidate) continue;
+      const pathBytes = Buffer.byteLength(candidate.file.path, "utf8");
+      if (selectedPathBytes + pathBytes > MAX_DISCOVERY_PATH_BYTES) continue;
+      selected.push(candidate);
+      selectedPathBytes += pathBytes;
+    }
+    depth += 1;
+  }
+  return selected;
+}
+
 function defaultNextStep(snapshot) {
-  if (!["trace", "bug", "change-plan", "investigate"].includes(snapshot.intent)) return { stop: true, reason: "sufficient-evidence" };
+  if (!["trace", "bug", "impact", "change-plan", "investigate"].includes(snapshot.intent)) return { stop: true, reason: "sufficient-evidence" };
   const readPaths = new Set(snapshot.readPaths);
+  if (["impact", "change-plan"].includes(snapshot.intent)) {
+    const searchCandidate = snapshot.candidateFiles.find((item) => item.searchMatch && !readPaths.has(item.path));
+    if (searchCandidate) return makeReadPlan(searchCandidate.path, 1,
+      "Read " + searchCandidate.path + " because bounded project search found a task-term candidate there; classify the source relationship before reporting impact.");
+  }
   const edge = snapshot.findings
     .filter((item) => item.type === "import-edge" && item.relatedPath && !readPaths.has(item.relatedPath) && item.depth <= MAX_TRACE_HOPS)
     .sort((a, b) => a.depth - b.depth || String(a.relatedPath).localeCompare(String(b.relatedPath)))[0];
@@ -1307,10 +1431,10 @@ function defaultNextStep(snapshot) {
   if (indexedCandidate) return makeReadPlan(indexedCandidate.path, 1,
     `Read ${indexedCandidate.path} because it is a ${indexedCandidate.reason} for ${indexedCandidate.symbol} defined in ${indexedCandidate.definitionPath}.`);
   const candidate = snapshot.candidateFiles.find((item) => item.score >= 9 && !readPaths.has(item.path));
-  if (candidate && snapshot.findings.some((item) => ["symbol", "reference", "path-match", "git-diff"].includes(item.type))) {
+  if (candidate && snapshot.findings.some((item) => ["symbol", "reference", "search-match", "path-match", "git-diff"].includes(item.type))) {
     return makeReadPlan(candidate.path, 1, "Inspect the task-matched or changed source candidate " + candidate.path + " to resolve remaining references.");
   }
-  return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "symbol-definition", "identifier-reference", "likely-call-site", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
+  return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "search-match", "symbol-definition", "identifier-reference", "likely-call-site", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
 }
 
 function isGeneratedSourcePath(value) {
@@ -1349,8 +1473,19 @@ function validateInspectionOperation(toolId, input) {
   if (toolId === "read_file") return (keys === "path" || keys === "maxBytes,path") && isSafeProjectReadPath(input.path) &&
     (input.maxBytes === undefined || Number.isInteger(input.maxBytes) && input.maxBytes >= 1 && input.maxBytes <= MAX_MANIFEST_BYTES);
   if (toolId === "list_files") return (keys === "" || keys === "path") && (input.path === undefined || input.path === "." || isSafeProjectReadPath(input.path));
-  if (toolId === "search_files") return (keys === "path,query" || keys === "query") && typeof input.query === "string" &&
-    input.query.length > 0 && Buffer.byteLength(input.query, "utf8") <= 512 && (input.path === undefined || input.path === "." || isSafeProjectReadPath(input.path));
+  if (toolId === "search_files") {
+    const allowed = new Set(["caseSensitive", "maxFileBytes", "path", "paths", "queries", "query"]);
+    if (Object.keys(input).some((key) => !allowed.has(key)) || (input.query === undefined) === (input.queries === undefined) ||
+        (input.path !== undefined && input.paths !== undefined) || (input.caseSensitive !== undefined && typeof input.caseSensitive !== "boolean") ||
+        (input.maxFileBytes !== undefined && (!Number.isInteger(input.maxFileBytes) || input.maxFileBytes < 1 || input.maxFileBytes > MAX_MANIFEST_BYTES))) return false;
+    const queries = input.queries === undefined ? [input.query] : input.queries;
+    if (!Array.isArray(queries) || queries.length < 1 || queries.length > 4 || queries.some((value) => typeof value !== "string" ||
+        !value.trim() || Buffer.byteLength(value, "utf8") > 512 || value.includes("\0")) || new Set(queries).size !== queries.length) return false;
+    if (input.paths !== undefined) return Array.isArray(input.paths) && input.paths.length > 0 && input.paths.length <= 128 &&
+      input.paths.every(isSafeProjectReadPath) && new Set(input.paths).size === input.paths.length &&
+      input.paths.reduce((total, value) => total + Buffer.byteLength(value, "utf8"), 0) <= 16 * 1024;
+    return input.path === undefined || input.path === "." || isSafeProjectReadPath(input.path);
+  }
   if (toolId === "git_status") return keys === "";
   if (toolId === "git_diff") return (keys === "" || keys === "path") && (input.path === undefined || isSafeProjectReadPath(input.path));
   if (toolId === "git_log") return Object.keys(input).every((key) => ["limit", "path"].includes(key)) &&
@@ -1418,12 +1553,21 @@ function expectedEvidenceForOperation(toolId) {
 
 function summarizeOperationInput(toolId, input) {
   if (toolId === "git_check_ignore") return Object.freeze({ pathCount: input.paths.length, samplePaths: Object.freeze(input.paths.slice(0, 4).map((value) => safeStepText(value, 100))) });
+  if (toolId === "search_files" && Array.isArray(input.paths)) return Object.freeze({
+    queryCount: Array.isArray(input.queries) ? input.queries.length : 1,
+    candidatePathCount: input.paths.length,
+    samplePaths: Object.freeze(input.paths.slice(0, 3).map((value) => safeStepText(value, 100))),
+    caseSensitive: input.caseSensitive !== false,
+    maxFileBytes: Number.isInteger(input.maxFileBytes) ? input.maxFileBytes : undefined,
+  });
   const summary = {};
   for (const [key, value] of Object.entries(input || {}).slice(0, 4)) {
     if (key === "path") summary.path = safeStepText(value, 120);
     else if (key === "maxBytes" && Number.isInteger(value)) summary.maxBytes = value;
     else if (key === "limit" && Number.isInteger(value)) summary.limit = value;
     else if (key === "query" && typeof value === "string") summary.queryLength = Buffer.byteLength(value, "utf8");
+    else if (key === "queries" && Array.isArray(value)) summary.queryCount = Math.min(4, value.length);
+    else if (key === "caseSensitive" && typeof value === "boolean") summary.caseSensitive = value;
   }
   return Object.freeze(summary);
 }

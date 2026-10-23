@@ -124,6 +124,56 @@ test("read, directory listing, and literal search are bounded and redact sensiti
     /reviewable file-change limit/u);
 });
 
+test("literal search can be restricted to an explicit bounded file set", async (t) => {
+  if (process.platform !== "linux") return t.skip("Race-resistant project file access is currently Linux-only.");
+  const { parent, root } = fixture(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "caller.js"), "handleCheckout(request);\nplain text\n");
+  fs.writeFileSync(path.join(root, "src", "other.js"), "handleCheckout();\n");
+  fs.writeFileSync(path.join(parent, "outside.js"), "handleCheckout();\n");
+  fs.symlinkSync(path.join(parent, "outside.js"), path.join(root, "src", "outside-link.js"));
+  const { runtime, sessionId } = makeRuntime(root);
+  t.after(() => runtime.dispose());
+
+  const search = await runtime.invoke(request(root, sessionId, "search_files", {
+    queries: ["handleCheckout", "request"], paths: ["src/caller.js"], caseSensitive: false, maxFileBytes: 128,
+  }));
+  assert.equal(search.state, "verified");
+  assert.deepEqual(search.result.matches.map((item) => [item.query, item.path, item.line]), [
+    ["handleCheckout", "src/caller.js", 1], ["request", "src/caller.js", 1],
+  ]);
+  assert.equal(search.result.scannedEntries, 1);
+  assert.doesNotMatch(JSON.stringify(search.result), /outside|other\.js/u);
+
+  const escaped = await runtime.invoke(request(root, sessionId, "search_files", { queries: ["handleCheckout"], paths: ["../outside.js"] }));
+  assert.equal(escaped.state, "rejected");
+  assert.equal(escaped.error.code, "INVALID_PATH");
+  const symlink = await runtime.invoke(request(root, sessionId, "search_files", { queries: ["handleCheckout"], paths: ["src/outside-link.js"] }));
+  assert.notEqual(symlink.state, "verified");
+  assert.doesNotMatch(JSON.stringify(symlink), /outsideSecret|outside\.js/u);
+});
+
+test("bounded explicit-file searches observe cancellation between files", async (t) => {
+  if (process.platform !== "linux") return t.skip("Race-resistant project file access is currently Linux-only.");
+  const { root } = fixture(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  for (let index = 0; index < 20; index += 1) {
+    fs.writeFileSync(path.join(root, "src", `candidate-${index}.js`), "needle();\n");
+  }
+  const { runtime, sessionId } = makeRuntime(root);
+  t.after(() => runtime.dispose());
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort("fixture-cancel"), 0);
+  const result = await runtime.invoke(request(root, sessionId, "search_files", {
+    queries: ["needle"], paths: Array.from({ length: 20 }, (_, index) => `src/candidate-${index}.js`),
+  }), { signal: controller.signal });
+  clearTimeout(timeout);
+  assert.equal(result.state, "interrupted");
+  assert.equal(result.error.code, "TOOL_INTERRUPTED");
+  assert.equal(result.executed, false);
+  assert.equal(result.verified, false);
+});
+
 test("request schemas reject unknown tools, extra fields, accessors, and project/session mismatches", async (t) => {
   const { root } = fixture(t);
   const { runtime, sessionId } = makeRuntime(root);

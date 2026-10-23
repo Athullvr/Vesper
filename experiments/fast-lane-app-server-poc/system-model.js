@@ -24,7 +24,7 @@ class SystemModelCoordinator {
         task,
         intent,
         includeHistory: intent !== "overview" || Boolean(task),
-        includeDiff: ["bug", "feature", "change-plan"].includes(intent),
+        includeDiff: ["bug", "feature", "change-plan", "impact"].includes(intent),
         selectNextStep: (snapshot) => this.selectNextStep(snapshot),
         signal,
       });
@@ -34,13 +34,14 @@ class SystemModelCoordinator {
       const dependencyTrace = buildDependencyTrace(findings);
       const referenceTrace = buildReferenceTrace(findings);
       const referenceIndex = evidence.referenceIndex || evidence.evidence?.investigation?.referenceIndex || null;
+      const candidateDiscovery = evidence.candidateDiscovery || evidence.evidence?.investigation?.candidateDiscovery || null;
       const observedPaths = [...new Set(findings.filter((item) => item.path).map((item) => item.path))].slice(0, 12);
       const inferred = findings.filter((item) => item.observation === "inferred");
       const assumptions = [];
       if (evidence.status !== "complete") assumptions.push(...(evidence.incomplete || []).slice(0, 5));
       if (inferred.length || intent === "trace") assumptions.push("Entry-point and import-path conclusions are heuristic; import evidence does not establish runtime call order.");
       if (findings.some((item) => item.type === "likely-call-site" || item.type === "route-handler")) assumptions.push("Likely call sites and route-handler matches are syntactic candidates; aliasing, dynamic dispatch, and framework behavior are not resolved.");
-      if (referenceIndex?.status === "partial") assumptions.push("The JS/TS symbol/reference index is partial; unread files were not searched and prior cached line references were discarded.");
+      if (referenceIndex?.status === "partial") assumptions.push("The JS/TS symbol/reference index is partial; literal search candidates may span more files than the parsed index, and unread files have no current relationship records.");
       if (findings.some((item) => item.status === "contradictory")) assumptions.push("At least one repository declaration points to missing or conflicting evidence; treat that reference as unresolved.");
       if (findings.some((item) => item.status === "stale")) assumptions.push("Some evidence is marked stale and should be refreshed before relying on it.");
       if (!evidence.git?.available) assumptions.push("Git status, history, and diff could not be established for this project root.");
@@ -50,10 +51,14 @@ class SystemModelCoordinator {
         .filter((item) => /^(?:test|test:|build)$/u.test(item.name))
         .map((item) => `${item.name}: ${item.command} (identified from ${item.path}; not run)`))].slice(0, 8);
       if (!verificationRequirements.length) verificationRequirements.push("Choose and run the appropriate project verification explicitly; Vesper did not execute commands during inspection.");
-      const hasTaskMatch = findings.some((item) => ["symbol", "reference", "symbol-definition", "identifier-reference", "likely-call-site", "route-handler", "test-reference", "path-match", "import-edge"].includes(item.type));
-      if (["trace", "bug", "change-plan"].includes(intent) && !hasTaskMatch) unresolved.push("No task-matched symbol, textual reference, or local import edge was confirmed.");
+      const hasTaskMatch = findings.some((item) => ["symbol", "reference", "search-match", "symbol-definition", "identifier-reference", "likely-call-site", "route-handler", "test-reference", "path-match", "import-edge"].includes(item.type));
+      if (["trace", "bug", "impact", "change-plan"].includes(intent) && !hasTaskMatch) unresolved.push("No task-matched symbol, textual reference, or local import edge was confirmed.");
       const stopReason = evidence.evidence?.investigation?.stopReason || "investigation-status-unknown";
       const additionalInspectionRecommended = evidence.status !== "complete" || unresolved.length > 0;
+      const impactReport = ["impact", "change-plan"].includes(intent)
+        ? buildImpactReport({ findings, candidateDiscovery, unresolved, incomplete: evidence.incomplete || [], verificationRequirements })
+        : null;
+      if (impactReport && evidence.evidence?.investigation) evidence.evidence.investigation.impactReport = impactReport;
       return Object.freeze({
         contractVersion: 1,
         question: typeof task === "string" ? task.slice(0, 8_192) : "",
@@ -64,6 +69,8 @@ class SystemModelCoordinator {
         dependencyTrace: Object.freeze(dependencyTrace),
         referenceTrace: Object.freeze(referenceTrace),
         referenceIndex,
+        candidateDiscovery,
+        impactReport,
         unresolved: Object.freeze([...new Set(unresolved)].slice(0, 12)),
         stopReason,
         remainingBudget: evidence.evidence?.investigation?.remainingBudget || Object.freeze({ operations: 0, targetedReads: 0, milliseconds: 0, sourceBytes: 0 }),
@@ -84,7 +91,7 @@ class SystemModelCoordinator {
         assumptions: Object.freeze([...new Set(assumptions)].slice(0, 8)),
         verificationRequirements: Object.freeze(verificationRequirements),
         incomplete: evidence.incomplete,
-        providerContext: renderRepositoryContext(evidence),
+        providerContext: renderRepositoryContext({ ...evidence, impactReport, plan, verificationRequirements }),
       });
     } finally {
       this.active = false;
@@ -92,8 +99,13 @@ class SystemModelCoordinator {
   }
 
   selectNextStep(snapshot) {
-    if (!["trace", "bug", "change-plan", "investigate"].includes(snapshot.intent)) return { stop: true, reason: "sufficient-evidence" };
+    if (!["trace", "bug", "impact", "change-plan", "investigate"].includes(snapshot.intent)) return { stop: true, reason: "sufficient-evidence" };
     const readPaths = new Set(snapshot.readPaths);
+    if (["impact", "change-plan"].includes(snapshot.intent)) {
+      const searchCandidate = snapshot.candidateFiles.find((item) => item.searchMatch && !readPaths.has(item.path));
+      if (searchCandidate) return readOperation(searchCandidate.path, 1,
+        `Read ${searchCandidate.path} because bounded project search found a task-term candidate there; classify the source relationship before reporting impact.`);
+    }
     const edges = snapshot.findings
       .filter((item) => item.type === "import-edge" && item.relatedPath && !readPaths.has(item.relatedPath) && item.depth <= 2)
       .sort((a, b) => a.depth - b.depth || rankImportEdge(b, snapshot.taskTerms) - rankImportEdge(a, snapshot.taskTerms) ||
@@ -110,10 +122,10 @@ class SystemModelCoordinator {
     }
     const candidate = snapshot.candidateFiles.find((item) => !readPaths.has(item.path) &&
       (item.changed || item.entryPoint || item.score >= 9));
-    if (candidate && snapshot.findings.some((item) => ["symbol", "reference", "path-match", "git-diff"].includes(item.type))) {
+    if (candidate && snapshot.findings.some((item) => ["symbol", "reference", "search-match", "path-match", "git-diff"].includes(item.type))) {
       return readOperation(candidate.path, 1, "Inspect the task-matched entry point or Git-changed source candidate " + candidate.path + ".");
     }
-    return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "symbol-definition", "identifier-reference", "likely-call-site", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
+  return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "search-match", "symbol-definition", "identifier-reference", "likely-call-site", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
   }
 
   interrupt() { return this.repositoryIntelligence.interrupt(); }
@@ -170,6 +182,7 @@ function interpretTask(task) {
   const text = normalizeText(task);
   if (!text) return "overview";
   if (/\b(?:bug|defect|debug|root cause|failing|failure|regression|broken|error)\b/u.test(text)) return "bug";
+  if (/\b(?:impact|affected|affect|consequences?|blast radius|what breaks|change impact|files? (?:will|might|could) (?:change|be affected))\b/u.test(text)) return "impact";
   if (/\b(?:trace|follow|execution path|call path|data flow|request flow|how .* works|where .* (?:called|handled|routed))\b/u.test(text)) return "trace";
   if (/\b(?:plan|implement|add|create|change|refactor|extend|build|feature|fix)\b/u.test(text)) return "change-plan";
   if (/\b(?:architecture|structure|framework|dependency|dependencies|entry point|entrypoint|codebase|repository|project layout)\b/u.test(text)) return "overview";
@@ -179,11 +192,11 @@ function interpretTask(task) {
 function shouldInvestigateTask(task) {
   const text = normalizeText(task);
   if (!text) return false;
-  return /\b(?:repository|repo|codebase|project architecture|architecture|project structure|entry point|entrypoint|framework|dependency|dependencies|trace|execution path|call path|data flow|bug|defect|debug|root cause|regression|implement|implementation|add|create|refactor|extend|feature|fix|change|symbol|function|class|route|startup path)\b/u.test(text);
+  return /\b(?:repository|repo|codebase|project architecture|architecture|project structure|entry point|entrypoint|framework|dependency|dependencies|trace|execution path|call path|data flow|bug|defect|debug|root cause|regression|impact|affected|affect|blast radius|what breaks|implement|implementation|add|create|refactor|extend|feature|fix|change|symbol|function|class|route|startup path)\b/u.test(text);
 }
 
 function createGroundedPlan(intent, findings, evidence) {
-  const sourceFindings = findings.filter((item) => ["symbol", "reference", "symbol-definition", "symbol-import", "symbol-export", "identifier-reference", "likely-call-site", "route-handler", "test-reference", "textual-reference", "import-edge", "source-section", "git-diff", "git-diff-hunk"].includes(item.type));
+  const sourceFindings = findings.filter((item) => ["symbol", "reference", "search-match", "symbol-definition", "symbol-import", "symbol-export", "identifier-reference", "likely-call-site", "route-handler", "test-reference", "textual-reference", "import-edge", "source-section", "git-diff", "git-diff-hunk"].includes(item.type));
   const paths = [...new Set(sourceFindings.filter((item) => item.path).map((item) => item.path))].slice(0, 5);
   const commands = evidence.project?.commands || [];
   if (intent === "overview") {
@@ -207,8 +220,18 @@ function createGroundedPlan(intent, findings, evidence) {
       "Propose a focused change only after the affected path is inspected; tests remain unrun until explicitly requested.",
     ];
   }
+  if (intent === "impact") {
+    const candidateCount = findings.filter((item) => item.type === "search-match").length;
+    const dependencyCount = findings.filter((item) => item.type === "import-edge").length;
+    return [
+      candidateCount ? `Use ${candidateCount} bounded cross-file literal-search candidate(s) to locate likely affected modules; confirm each from the cited source sections.` : "No cross-file literal match was observed; the target may use different names or fall outside the bounded search inventory.",
+      dependencyCount ? `Review ${dependencyCount} local import-resolution relationship(s) as dependency candidates; imports do not prove runtime calls.` : "No local import relationship was resolved from inspected source.",
+      "Treat call-site, route, reference, and test matches according to their evidence type; textual matches do not establish callers or test coverage.",
+      "Resolve the listed assumptions before implementation, then use the existing provider workflow and approval boundary for any change.",
+    ];
+  }
   if (["change-plan", "feature"].includes(intent)) {
-    const pathNote = paths.length ? `Relevant inspected files include ${paths.join(", ")}.` : "No task-relevant source file was confirmed in the bounded sample.";
+    const pathNote = paths.length ? `Relevant evidence paths include ${paths.join(", ")}; literal-search candidates still require source confirmation.` : "No task-relevant source file was confirmed in the bounded sample.";
     const verify = commands.length ? `Review declared project scripts such as ${commands.slice(0, 3).map((item) => item.name).join(", ")}; do not assume they ran.` : "Identify a verification command from project documentation or manifests before claiming a result.";
     return [
       pathNote,
@@ -256,6 +279,19 @@ function renderSystemModelReport(result) {
       lines.push(`Index refresh observed ${changes.changed?.length || 0} changed, ${changes.removed?.length || 0} removed, and ${changes.renamed?.length || 0} same-content renamed files.`);
     }
   }
+  if (result.candidateDiscovery) {
+    const discovery = result.candidateDiscovery;
+    lines.push(`Cross-file candidate discovery: ${discovery.status || "unknown"} · ${discovery.scannedFiles || 0}/${discovery.searchedFiles || 0} selected files visited · ${discovery.candidateFiles || 0} eligible candidates · ${discovery.scannedBytes || 0} bytes · ${discovery.matches || 0} returned matches${discovery.partialReason ? ` · limit ${discovery.partialReason}` : ""}.`);
+    lines.push("Literal search locates candidate lines only; parsed or confirmed relationships require targeted source reads.");
+  }
+  if (result.impactReport) {
+    const impact = result.impactReport;
+    lines.push("Change impact summary:");
+    lines.push(`- Target terms: ${impact.targetTerms.length ? impact.targetTerms.join(", ") : "not resolved"}.`);
+    lines.push(`- Definitions: ${impact.definitions.length}; likely call-site candidates: ${impact.callSites.length}; dependency candidates: ${impact.dependencies.length}; route matches: ${impact.routes.length}; test references: ${impact.tests.length}.`);
+    if (impact.changedFiles.length) lines.push(`- Git changed paths: ${impact.changedFiles.slice(0, 8).join(", ")}.`);
+    for (const gap of impact.gaps.slice(0, 6)) lines.push(`- Impact gap: ${gap}`);
+  }
   if (result.referenceTrace?.length) {
     lines.push("Symbol references and candidate relationships (not a complete call graph):");
     for (const relation of result.referenceTrace.slice(0, 16)) lines.push(`- ${relation.type} · ${relation.path}${relation.line ? ":" + relation.line : ""} → ${relation.symbol}${relation.relatedPath ? ` at ${relation.relatedPath}${relation.relatedLine ? ":" + relation.relatedLine : ""}` : ""}${relation.route ? ` (${relation.route})` : ""} [${relation.confidence}; ${relation.confirmedByRead ? "source read" : "unconfirmed"}].`);
@@ -284,7 +320,7 @@ function renderSystemModelReport(result) {
     lines.push("Evidence-backed findings:");
     for (const finding of result.findings.slice(0, MAX_RENDERED_FINDINGS)) {
       const location = finding.path ? `${finding.path}${finding.lineStart ? `:${finding.lineStart}${finding.lineEnd && finding.lineEnd !== finding.lineStart ? `-${finding.lineEnd}` : ""}` : ""}` : "project-wide";
-      lines.push(`- ${finding.observation === "inferred" ? "Inferred" : "Observed"} ${finding.type} · ${location}: ${finding.description} [${finding.confidence} confidence; ${finding.status}; ${finding.source}${finding.commit ? `; commit ${finding.commit}` : ""}].`);
+      lines.push(`- ${finding.observation === "inferred" ? "Inferred" : "Observed"} ${finding.type} · ${location}: ${finding.description} [${finding.confidence} confidence; ${finding.status}; ${finding.source}${finding.discoveryMethod ? `; ${finding.discoveryMethod}` : ""}${finding.sourceContextRead ? "; source read" : finding.source === "search_files" ? "; search only" : ""}${finding.commit ? `; commit ${finding.commit}` : ""}].`);
     }
   }
   if (result.project?.commands?.length) {
@@ -300,6 +336,44 @@ function renderSystemModelReport(result) {
   return `${escapeTerminalOutput(redactSensitiveText(output))}\n`;
 }
 
+function buildImpactReport({ findings, candidateDiscovery, unresolved = [], incomplete = [], verificationRequirements = [] } = {}) {
+  const items = Array.isArray(findings) ? findings : [];
+  const select = (...types) => Object.freeze(items.filter((item) => types.includes(item.type)).slice(0, 24).map((item) => Object.freeze({
+    type: item.type,
+    path: item.path || null,
+    line: item.lineStart || null,
+    relatedPath: item.relatedPath || null,
+    relatedLine: item.relatedLine || null,
+    symbol: item.symbol || null,
+    confidence: item.confidence || "unknown",
+    observation: item.observation || "observed",
+    sourceContextRead: item.sourceContextRead === true,
+    discoveryMethod: item.discoveryMethod || null,
+  })));
+  const changedFiles = [...new Set(items.filter((item) => ["git-diff", "git-diff-hunk", "git-change"].includes(item.type) && item.path).map((item) => item.path))].slice(0, 12);
+  const targetTerms = [...new Set(items.filter((item) => item.type === "search-match" && item.symbol).map((item) => item.symbol))].slice(0, 8);
+  const gaps = [...new Set([...(unresolved || []), ...(incomplete || [])])].slice(0, 10);
+  if (candidateDiscovery?.status === "partial") gaps.unshift(`Candidate search coverage is partial (${candidateDiscovery.partialReason || "bounded-search"}).`);
+  if (!items.some((item) => ["symbol-definition", "symbol"].includes(item.type))) gaps.push("No target definition was confirmed from a targeted source read.");
+  if (!items.some((item) => item.type === "test-reference")) gaps.push("No parsed test reference was identified; test coverage remains unknown.");
+  gaps.push("Dynamic dispatch, reflection, aliases, and framework conventions may add relationships this bounded analysis cannot establish.");
+  const uniqueGaps = [...new Set(gaps)].slice(0, 12);
+  return Object.freeze({
+    status: uniqueGaps.length ? "partial" : "bounded",
+    targetTerms: Object.freeze(targetTerms),
+    definitions: select("symbol-definition", "symbol"),
+    callSites: select("likely-call-site"),
+    dependencies: select("import-edge", "symbol-import", "symbol-export"),
+    textualReferences: select("identifier-reference", "textual-reference", "search-match", "reference"),
+    routes: select("route-handler"),
+    tests: select("test-reference"),
+    changedFiles: Object.freeze(changedFiles),
+    candidateDiscovery: candidateDiscovery ? Object.freeze({ ...candidateDiscovery }) : null,
+    gaps: Object.freeze(uniqueGaps),
+    suggestedVerification: Object.freeze((verificationRequirements || []).slice(0, 8)),
+  });
+}
+
 function normalizeRouteDecision(value) {
   if (!value || typeof value !== "object") return Object.freeze({ route: "unknown", intent: null, reason: "not-provided" });
   const route = value.route === "local" || value.route === "codex" ? value.route : "unknown";
@@ -308,11 +382,12 @@ function normalizeRouteDecision(value) {
   return Object.freeze({ route, intent, reason });
 }
 
-function normalizeIntent(value) { return ["overview", "trace", "bug", "change-plan", "feature", "investigate"].includes(value) ? value : null; }
+function normalizeIntent(value) { return ["overview", "trace", "bug", "impact", "change-plan", "feature", "investigate"].includes(value) ? value : null; }
 function normalizeText(value) { return typeof value === "string" ? value.slice(0, 8_192).normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}_.-]+/gu, " ").trim().replace(/\s+/gu, " ") : ""; }
 
 module.exports = {
   SystemModelCoordinator,
+  buildImpactReport,
   createGroundedPlan,
   createSystemModel,
   interpretTask,

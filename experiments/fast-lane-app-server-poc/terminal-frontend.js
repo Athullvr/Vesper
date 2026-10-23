@@ -106,7 +106,7 @@ class TerminalFrontend {
     this.write(`Vesper · local routing with ${this.providerDisplayName()} fallback\n`);
     this.write(`Execution provider: ${this.providerDisplayName()}\n`);
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, :inspect [TASK], and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
+    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, :inspect [TASK], :impact TASK, and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -137,8 +137,14 @@ class TerminalFrontend {
         this.write(renderRoutingSummary(this.metrics, this.sessionId));
         return;
       }
-      if (prompt === ":inspect" || prompt.startsWith(":inspect ")) {
-        const task = prompt.slice(":inspect".length).trim();
+      if (prompt === ":inspect" || prompt.startsWith(":inspect ") || prompt === ":impact" || prompt.startsWith(":impact ")) {
+        const impactOnly = prompt === ":impact" || prompt.startsWith(":impact ");
+        const command = impactOnly ? ":impact" : ":inspect";
+        const task = prompt.slice(command.length).trim();
+        if (impactOnly && !task) {
+          this.write("Usage: :impact TASK\n");
+          return;
+        }
         if (!this.systemModel) {
           this.write("[Vesper] Repository intelligence is unavailable for this session; no inspection ran.\n");
           return;
@@ -152,7 +158,7 @@ class TerminalFrontend {
         this.interruptPending = false;
         this.write("\n[Vesper · inspecting bounded local repository evidence; no commands or scripts will run]\n");
         try {
-          const result = await this.systemModel.investigate({ task });
+          const result = await this.systemModel.investigate({ task, ...(impactOnly ? { intent: "impact" } : {}) });
           this.write(renderSystemModelReport(result));
         } catch {
           this.write("[Vesper] Repository inspection could not be completed. No project command was run.\n");
@@ -168,7 +174,7 @@ class TerminalFrontend {
         this.write(`[Vesper command error] ${safeTerminalText(error?.message || error)}\n`);
         return;
       }
-      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :capabilities, :inspect, :routing, or :quit.\n`);
+      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :capabilities, :inspect, :impact, :routing, or :quit.\n`);
       return;
     }
 
@@ -206,8 +212,17 @@ class TerminalFrontend {
       try {
         investigation = await this.systemModel.investigate({ task: prompt, routeDecision: decision });
         repositoryEvidence = investigation.evidence;
-        this.write(`[Repository intelligence · ${safeTerminalText(investigation.status)} · ${investigation.project?.fileCount || 0} files indexed · ${investigation.findings?.length || 0} findings]\n`);
-        for (const step of (investigation.plan || []).slice(0, 3)) this.write(`- ${safeTerminalText(step)}\n`);
+        this.write(`[Repository intelligence · ${safeTerminalText(investigation.status)} · ${investigation.project?.fileCount || 0} files discovered · ${investigation.findings?.length || 0} findings]\n`);
+        if (investigation.candidateDiscovery) {
+          const discovery = investigation.candidateDiscovery;
+          this.write(`[Cross-file search · ${safeTerminalText(discovery.status)} · ${discovery.scannedFiles || 0}/${discovery.searchedFiles || 0} selected files · ${discovery.matches || 0} literal candidates${discovery.partialReason ? ` · ${safeTerminalText(discovery.partialReason)}` : ""}]\n`);
+        }
+        if (investigation.impactReport) {
+          const impact = investigation.impactReport;
+          this.write(`[Change impact · ${safeTerminalText(impact.status)} · ${impact.definitions.length} definitions · ${impact.callSites.length} call candidates · ${impact.dependencies.length} dependency candidates · ${impact.tests.length} test references]\n`);
+          if (impact.gaps[0]) this.write(`  Impact limitation: ${safeTerminalText(impact.gaps[0])}\n`);
+        }
+        for (const step of (investigation.plan || []).slice(0, 5)) this.write(`- ${safeTerminalText(step)}\n`);
         for (const note of (investigation.incomplete || []).slice(0, 2)) this.write(`  Coverage: ${safeTerminalText(note)}\n`);
         const context = investigation.providerContext;
         if (typeof context === "string" && context && prompt.length + context.length + 64 <= 32 * 1024) {

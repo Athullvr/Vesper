@@ -74,7 +74,8 @@ Session listings are project-scoped and show at most ${MAX_SESSION_LIST_ENTRIES}
 Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID to resume one,
 :new [PROVIDER_ID [MODEL_ID]] to start another session, :providers and :tools to inspect support,
 :capabilities status|show ID to inspect local capability state,
-:plan TASK to preview an advisory plan, :routing to inspect current-session routing counts, and :quit to exit.
+:plan TASK to preview an advisory plan, :impact TASK for a focused change-impact report,
+:routing to inspect current-session routing counts, and :quit to exit.
 Use :inspect [TASK] for a bounded local repository investigation. It does not call a model or run commands.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
@@ -1037,7 +1038,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     const handleWorkspaceCommand = async (command) => {
       const [name, ...args] = command.trim().split(/\s+/u);
       if (name === ":help" && args.length === 0) {
-        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new [PROVIDER_ID [MODEL_ID]], :providers, :tools, :capabilities [list|status|show ID], :plan TASK, :inspect [TASK], :routing, :quit\n");
+        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new [PROVIDER_ID [MODEL_ID]], :providers, :tools, :capabilities [list|status|show ID], :plan TASK, :inspect [TASK], :impact TASK, :routing, :quit\n");
         return true;
       }
       if (name === ":providers" && args.length === 0) {
@@ -1135,7 +1136,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         await activateSession(selected, "Session switched");
         return true;
       }
-      output.write("Usage: :sessions | :switch SESSION_ID | :new [PROVIDER_ID [MODEL_ID]] | :providers | :tools | :capabilities [list|status|show ID] | :plan TASK | :inspect [TASK] | :routing | :help | :quit\n");
+      output.write("Usage: :sessions | :switch SESSION_ID | :new [PROVIDER_ID [MODEL_ID]] | :providers | :tools | :capabilities [list|status|show ID] | :plan TASK | :inspect [TASK] | :impact TASK | :routing | :help | :quit\n");
       return true;
     };
 
