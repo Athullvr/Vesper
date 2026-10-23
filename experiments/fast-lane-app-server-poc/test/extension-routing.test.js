@@ -25,6 +25,9 @@ test("VS Code keeps local routing local and persists only the Vesper session and
   await panel.send({ type: "submit", text: "Explain a rebase in one sentence." });
   const assistantText = panel.all("assistant-delta").map((message) => message.text).join("");
   assert.ok(assistantText.startsWith("Answer 1."));
+  assert.equal(panel.all("repository-preflight").length, 0, "ordinary conversation does not trigger repository preflight");
+  const conversationTurn = harness.requests.find((request) => request.method === "turn/start");
+  assert.equal(conversationTurn.params.input[0].text, "Explain a rebase in one sentence.");
   assert.match(assistantText, /Vesper execution evidence[\s\S]*Provider: codex-app-server[\s\S]*Provider task: turn-1/u);
   assert.match(assistantText, /Codex reported that the turn completed/u);
   assert.equal(panel.all("assistant-done").length, 1);
@@ -39,6 +42,139 @@ test("VS Code keeps local routing local and persists only the Vesper session and
   ]);
   assert.equal(harness.requests.find((request) => request.method === "thread/start").params.sandbox, "read-only");
   assert.equal(panel.last("session-state").state, "connected");
+});
+
+test("VS Code preflights a code task and submits only scoped bounded evidence once", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-preflight-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  const foreign = path.join(root, "sibling");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  fs.mkdirSync(foreign);
+  fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ name: "checkout-fixture", scripts: { test: "node --test" } }));
+  fs.writeFileSync(path.join(project, "src", "checkout.js"), "export function handleCheckout(order) { return order.total; }\n");
+  fs.writeFileSync(path.join(project, "src", "checkout.test.js"), "import { handleCheckout } from './checkout.js';\nhandleCheckout({ total: 1 });\n");
+  fs.writeFileSync(path.join(foreign, "secret.js"), "function foreignProjectMarker() {}\n");
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }]);
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const task = "Assess the impact of changing handleCheckout to validate tax.";
+  await panel.send({ type: "submit", text: task });
+
+  const preflight = panel.all("repository-preflight");
+  assert.equal(preflight[0].state, "running");
+  assert.ok(["complete", "partial"].includes(preflight.at(-1).state));
+  assert.equal(preflight.at(-1).evidenceIncluded, true);
+  assert.match(preflight.at(-1).text, /files discovered/u);
+  assert.equal(harness.requests.filter((request) => request.method === "turn/start").length, 1);
+  const turn = harness.requests.find((request) => request.method === "turn/start");
+  const submittedTask = turn.params.input[0].text;
+  assert.ok(submittedTask.length <= 32 * 1024);
+  assert.match(submittedTask, /Vesper local repository evidence/u);
+  assert.match(submittedTask, /src\/checkout\.js/u);
+  assert.match(submittedTask, /observed|inferred/iu, "the bounded context retains evidence provenance");
+  assert.doesNotMatch(submittedTask, /foreignProjectMarker|sibling\/secret/u);
+  assert.doesNotMatch(submittedTask, new RegExp(fs.realpathSync(project).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  const session = harness.store().findLatestByCwd(fs.realpathSync(project));
+  assert.match(panel.all("assistant-delta").map((message) => message.text).join(""), new RegExp(`Vesper session: ${session.sessionId}`));
+  assert.doesNotMatch(harness.logs.join("\n"), /Assess the impact of changing handleCheckout/u);
+  const messageOrder = panel.messages.map((message) => message.type);
+  assert.ok(messageOrder.indexOf("repository-preflight") < messageOrder.indexOf("assistant-running"));
+  assert.equal(panel.last("assistant-done").providerId, "codex-app-server");
+});
+
+test("VS Code preflight failure explicitly falls back to the original task without duplicate submission", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-preflight-fail-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    repositoryToolRuntimeFactory: () => { const error = new Error("fixture inspection unavailable"); error.code = "RUNTIME_UNAVAILABLE"; throw error; },
+  });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const task = "Implement a route for checkout.";
+  await panel.send({ type: "submit", text: task });
+
+  assert.equal(panel.last("repository-preflight").state, "fallback");
+  assert.match(panel.last("repository-preflight").text, /original task without repository evidence/u);
+  assert.equal(harness.requests.filter((request) => request.method === "turn/start").length, 1);
+  assert.equal(harness.requests.find((request) => request.method === "turn/start").params.input[0].text, task);
+  assert.equal(panel.all("assistant-done").length, 1);
+});
+
+test("VS Code omits evidence when the combined task would exceed the provider input bound", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-preflight-size-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, "index.js"), "export function handleCheckout() {}\n");
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }]);
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const task = `Implement ${"x".repeat(32 * 1024 - 10)}`;
+  assert.equal(task.length, 32 * 1024);
+  await panel.send({ type: "submit", text: task });
+
+  assert.equal(panel.last("repository-preflight").state, "fallback");
+  assert.match(panel.last("repository-preflight").text, /provider task limit/u);
+  const turns = harness.requests.filter((request) => request.method === "turn/start");
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].params.input[0].text, task);
+  assert.equal(turns[0].params.input[0].text.includes("Vesper local repository evidence"), false);
+});
+
+test("a provider failure after preflight is not retried or submitted twice", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-preflight-provider-failure-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, "checkout.js"), "export function handleCheckout() {}\n");
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], { statusForTurn: () => "failed" });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  await panel.send({ type: "submit", text: "Implement checkout validation." });
+
+  assert.ok(["complete", "partial"].includes(panel.all("repository-preflight").at(-1).state));
+  assert.equal(harness.requests.filter((request) => request.method === "turn/start").length, 1);
+  assert.equal(panel.all("assistant-error").length, 1);
+  assert.equal(panel.last("assistant-error").state, "failed");
+});
+
+test("stopping VS Code preflight cancels before provider submission", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-preflight-cancel-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  let invocationStarted;
+  const started = new Promise((resolve) => { invocationStarted = resolve; });
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    repositoryToolRuntimeFactory: ({ sessionId }) => ({
+      sessionId,
+      preview: async () => ({ state: "validated", executes: false, enabled: true }),
+      invoke: (request, { signal } = {}) => new Promise((resolve) => {
+        invocationStarted();
+        const finish = () => resolve({ requestId: request.requestId, toolId: request.toolId, state: "interrupted", executed: false,
+          verified: false, error: { code: "TOOL_INTERRUPTED", message: "The inspection was cancelled." } });
+        if (signal?.aborted) finish();
+        else signal?.addEventListener("abort", finish, { once: true });
+      }),
+      interrupt: () => true,
+      dispose: async () => {},
+    }),
+  });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const task = panel.send({ type: "submit", text: "Trace how checkout is routed." });
+  await started;
+  const requestId = panel.last("assistant-start").requestId;
+  await panel.send({ type: "interrupt", requestId });
+  await task;
+
+  assert.equal(harness.requests.some((request) => request.method === "thread/start" || request.method === "turn/start"), false);
+  assert.match(panel.last("assistant-error").text, /provider task was not submitted/u);
+  assert.equal(panel.last("assistant-error").preflight, true);
+  assert.equal(harness.store().findLatestByCwd(fs.realpathSync(project)).providerConversationId, null);
 });
 
 test("VS Code can select OpenAI and labels normalized output as generated text, not executed", async (t) => {
@@ -91,8 +227,8 @@ test("VS Code can select OpenAI and labels normalized output as generated text, 
   webview.dispatch(panel.last("assistant-done"));
   assert.match(webview.elements.get("messages").children[0].children[0].textContent, /generated text · not executed · files unchanged/u);
   assert.match(webview.elements.get("status").textContent, /text generated, not executed/u);
-  assert.match(webview.elements.get("provider-privacy").textContent, /OpenAI receives submitted task and saved conversation text only/u);
-  assert.match(panel.html, /project files are not sent/u);
+  assert.match(webview.elements.get("provider-privacy").textContent, /For code-oriented tasks, OpenAI receives the task, saved conversation, and a bounded local repository summary/u);
+  assert.match(panel.html, /Vesper does not send full project files by default/u);
 });
 
 test("VS Code routes opted-in OpenAI read-only calls through the project runtime and renders tool activity", async (t) => {
@@ -139,6 +275,7 @@ test("VS Code routes opted-in OpenAI read-only calls through the project runtime
   await panel.send({ type: "ready" });
   await panel.send({ type: "submit", text: "Inspect the README." });
   assert.equal(calls.length, 2);
+  assert.ok(calls[0].messages.some((message) => message.role === "user" && message.content.includes("Vesper local repository evidence")));
   const assistantText = panel.all("assistant-delta").map((message) => message.text).join("");
   assert.match(assistantText, /^I inspected the project README\./u);
   assert.match(assistantText, /Vesper execution evidence[\s\S]*read_file: `README\.md` \(verified\)/u);
@@ -185,7 +322,7 @@ test("VS Code can use NVIDIA NIM through the compatible text adapter without imp
   await panel.send({ type: "ready" });
   assert.equal(panel.last("provider-info").providerId, "nvidia-nim");
   assert.equal(panel.last("provider-info").model, "fixture/nim-model");
-  await panel.send({ type: "submit", text: "Explain this NIM fixture." });
+  await panel.send({ type: "submit", text: "Implement checkout tax validation in the project." });
 
   assert.equal(panel.all("assistant-delta").map((message) => message.text).join(""), "NIM guidance.");
   assert.equal(panel.last("assistant-done").generatedTextOnly, true);
@@ -194,6 +331,7 @@ test("VS Code can use NVIDIA NIM through the compatible text adapter without imp
   assert.equal(calls[0].url, "https://nim.fixture.test/v1/chat/completions");
   assert.equal(calls[0].authorization, "Bearer nvidia-fixture-secret");
   assert.equal(Object.hasOwn(calls[0].body, "tools"), false);
+  assert.ok(calls[0].body.messages.some((message) => message.role === "user" && message.content.includes("Vesper local repository evidence")));
   const session = harness.store().findLatestByCwd(fs.realpathSync(project));
   assert.equal(session.providerId, "nvidia-nim");
   assert.equal(session.modelId, "fixture/nim-model");
@@ -207,7 +345,7 @@ test("VS Code can use NVIDIA NIM through the compatible text adapter without imp
   webview.dispatch(panel.last("assistant-done"));
   assert.match(webview.elements.get("messages").children[0].children[0].textContent, /NVIDIA NIM · generated text · not executed · files unchanged/u);
   assert.match(webview.elements.get("status").textContent, /NVIDIA NIM · text generated, not executed/u);
-  assert.match(webview.elements.get("provider-privacy").textContent, /NVIDIA NIM receives submitted task and saved conversation text only/u);
+  assert.match(webview.elements.get("provider-privacy").textContent, /For code-oriented tasks, NVIDIA NIM receives the task, saved conversation, and a bounded local repository summary/u);
 });
 
 test("VS Code keeps a saved provider and uses VESPER_PROVIDER only for a new session", async (t) => {
@@ -281,8 +419,9 @@ test("panel reopen and extension restart restore the same persisted Vesper sessi
   panel = harness.openPanel();
   await panel.send({ type: "ready" });
   assert.equal(panel.last("session-state").state, "connected");
-  assert.deepEqual(panel.all("conversation-history").at(-1).entries.map((entry) => entry.text), [
-    "Inspect this project.",
+  const resumedEntries = panel.all("conversation-history").at(-1).entries.map((entry) => entry.text);
+  assert.match(resumedEntries[0], /^Inspect this project\.\n\nVesper local repository evidence/u);
+  assert.deepEqual(resumedEntries.slice(1), [
     "Answer 1.",
     "Codex recorded this turn as completed.",
     "Continue after reopening the panel.",
@@ -945,7 +1084,7 @@ function createHarness(t, folders, options = {}) {
     delete require.cache[appClientPath];
     extension = require(extensionPath);
     context = { subscriptions: [] };
-    extension.activate(context);
+    extension.activate(context, { repositoryToolRuntimeFactory: options.repositoryToolRuntimeFactory });
   }
   loadExtension();
 

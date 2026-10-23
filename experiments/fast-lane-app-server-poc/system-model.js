@@ -192,7 +192,9 @@ function interpretTask(task) {
 function shouldInvestigateTask(task) {
   const text = normalizeText(task);
   if (!text) return false;
-  return /\b(?:repository|repo|codebase|project architecture|architecture|project structure|entry point|entrypoint|framework|dependency|dependencies|trace|execution path|call path|data flow|bug|defect|debug|root cause|regression|impact|affected|affect|blast radius|what breaks|implement|implementation|add|create|refactor|extend|feature|fix|change|symbol|function|class|route|startup path)\b/u.test(text);
+  return /\b(?:repository|repo|codebase|project architecture|architecture|project structure|entry point|entrypoint|framework|dependency|dependencies|trace|execution path|call path|data flow|bug|defect|debug|root cause|regression|impact|affected|affect|blast radius|what breaks|implement|implementation|add|create|refactor|extend|feature|fix|change|symbol|function|class|route|startup path)\b/u.test(text) ||
+    /\b(?:inspect|read|search)\s+(?:(?:the|this|a)\s+)?(?:repository|repo|codebase|project|source|file|files|readme|module|function|class|route)\b/u.test(text) ||
+    /\bREADME(?:\.md)?\b/iu.test(text);
 }
 
 function createGroundedPlan(intent, findings, evidence) {

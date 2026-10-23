@@ -148,7 +148,7 @@ class RepositoryIntelligenceService {
       dependencyFindings: 0,
       commandFindings: 0,
       searches: [],
-      candidateDiscovery: { status: "not-run", candidateFiles: 0, searchedFiles: 0, scannedBytes: 0, matches: 0, queryCount: 0, partialReason: null },
+      candidateDiscovery: { status: "not-run", candidateFiles: 0, searchedFiles: 0, scannedFiles: 0, scannedBytes: 0, matches: 0, queryCount: 0, partialReason: null },
       statusText: "",
       historyText: "",
       diffText: "",

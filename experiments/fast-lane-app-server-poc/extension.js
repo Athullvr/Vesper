@@ -13,8 +13,13 @@ const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { createCapabilityPlan, getPlanningMetadata, renderCapabilityPlan } = require("./capability-planner");
 const { unavailableHistory } = require("./conversation-history");
 const { createPermissionedToolRuntime } = require("./permissioned-tool-runtime");
+const { createRepositoryIntelligence } = require("./repository-intelligence");
+const { createSystemModel, shouldInvestigateTask } = require("./system-model");
+const { redactSensitiveText } = require("./command-activity");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
+const MAX_PREFLIGHT_CONTEXT_LENGTH = 7_000;
+const MAX_PREFLIGHT_SUMMARY_LENGTH = 1_400;
 
 let output;
 let executionProvider;
@@ -36,9 +41,13 @@ let activeRequestType;
 let historyLoadSequence = 0;
 let historyLoadingSessionId;
 let deferredHistoryRestore = false;
+let activeRepositoryPreflight;
+let repositoryToolRuntimeFactory = createPermissionedToolRuntime;
 const capabilityProviders = new Map();
 
-function activate(context) {
+function activate(context, dependencies = {}) {
+  repositoryToolRuntimeFactory = typeof dependencies.repositoryToolRuntimeFactory === "function"
+    ? dependencies.repositoryToolRuntimeFactory : createPermissionedToolRuntime;
   output = vscode.window.createOutputChannel("Vesper");
   sessionStore = new SessionStore();
   localHandlers = createLocalHandlers({ runGit: runGitCommand });
@@ -52,7 +61,9 @@ function activate(context) {
 }
 
 function deactivate() {
+  cancelActiveRepositoryPreflight();
   disposeCurrentAppServer();
+  repositoryToolRuntimeFactory = createPermissionedToolRuntime;
 }
 
 function openPanel(context) {
@@ -242,19 +253,121 @@ async function handlePrompt(prompt, targetPanel = panel) {
   };
   client.on("event", onExecutionEvent);
   let routingDecision;
+  let repositoryEvidence = null;
+  let providerTask = prompt;
+  let preflightController;
   try {
+    if (shouldInvestigateTask(prompt)) {
+      activeRequestType = "preflight";
+      postToPanel(targetPanel, { type: "repository-preflight", requestId, state: "running" });
+      writeLog(`request=${requestId} preflight=started provider=${session.providerId}`);
+      const controller = new AbortController();
+      preflightController = controller;
+      let runtime;
+      let systemModel;
+      const preflight = { requestId, controller, systemModel, sessionId: session.sessionId, projectPath: cwd, generation };
+      activeRepositoryPreflight = preflight;
+      try {
+        runtime = repositoryToolRuntimeFactory({
+          projectRoot: cwd,
+          sessionId: session.sessionId,
+          commandExecutionEnabled: false,
+          commandWorkspaceWriteEnabled: false,
+        });
+        if (!runtime || runtime.sessionId !== session.sessionId) throw new Error("Inspection runtime session mismatch.");
+        const getConversationId = () => client.getState?.().conversationId || session.providerConversationId || null;
+        const repositoryIntelligence = createRepositoryIntelligence({
+          toolRuntime: runtime,
+          projectRoot: cwd,
+          sessionId: session.sessionId,
+          providerId: session.providerId,
+          getConversationId,
+        });
+        systemModel = createSystemModel({ repositoryIntelligence });
+        preflight.systemModel = systemModel;
+        const investigation = await systemModel.investigate({ task: prompt, routeDecision: decision, signal: controller.signal });
+        if (controller.signal.aborted || investigation.status === "cancelled") {
+          recordRouteMetrics(requestId, decision, Math.round(performance.now() - startedAt), false);
+          postToPanel(targetPanel, {
+            type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
+            text: "Repository inspection was cancelled. The provider task was not submitted.",
+            elapsedMs: Math.round(performance.now() - startedAt),
+          });
+          writeLog(`request=${requestId} preflight=cancelled task_submitted=false`);
+          return;
+        }
+        const scopedEvidence = isPreflightEvidenceScoped(investigation.evidence, session, cwd, client);
+        const context = typeof investigation.providerContext === "string" ? investigation.providerContext : "";
+        const contextFits = context.length > 0 && context.length <= MAX_PREFLIGHT_CONTEXT_LENGTH &&
+          prompt.length + context.length + 2 <= MAX_PROMPT_LENGTH;
+        const usableStatus = ["complete", "partial"].includes(investigation.status);
+        if (usableStatus && scopedEvidence && contextFits) {
+          repositoryEvidence = investigation.evidence;
+          providerTask = `${prompt}\n\n${context}`;
+        }
+        const included = Boolean(repositoryEvidence);
+        const fallbackReason = !usableStatus ? "Inspection was unavailable or incomplete; submitting the original task without repository evidence."
+          : !scopedEvidence ? "Inspection evidence did not match this project, provider, or Vesper session; submitting the original task without it."
+            : !contextFits ? "The bounded evidence summary did not fit the provider task limit; submitting the original task without repository evidence."
+              : null;
+        postToPanel(targetPanel, {
+          type: "repository-preflight", requestId,
+          state: fallbackReason ? "fallback" : investigation.status === "partial" ? "partial" : "complete",
+          evidenceIncluded: included,
+          text: fallbackReason || summarizeRepositoryPreflight(investigation, included),
+        });
+        writeLog(`request=${requestId} preflight=${fallbackReason ? "fallback" : investigation.status} evidence_attached=${included}`);
+      } catch (error) {
+        if (controller.signal.aborted) {
+          postToPanel(targetPanel, {
+            type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
+            text: "Repository inspection was cancelled. The provider task was not submitted.",
+            elapsedMs: Math.round(performance.now() - startedAt),
+          });
+          writeLog(`request=${requestId} preflight=cancelled task_submitted=false`);
+          return;
+        }
+        postToPanel(targetPanel, {
+          type: "repository-preflight", requestId, state: "fallback", evidenceIncluded: false,
+          text: "Repository inspection could not complete. Vesper will submit the original task without repository evidence; coverage is unknown.",
+        });
+        writeLog(`request=${requestId} preflight=fallback code=${safeErrorCode(error)}`);
+        repositoryEvidence = null;
+        providerTask = prompt;
+      } finally {
+        try { await runtime?.dispose?.(); } catch { /* Preflight cleanup must not turn into a second provider submission. */ }
+      }
+      if (!isCurrentRequest(requestId, client, session.sessionId, generation)) {
+        postToPanel(targetPanel, {
+          type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
+          text: "The selected project or session changed during repository inspection. The provider task was not submitted.",
+          elapsedMs: Math.round(performance.now() - startedAt),
+        });
+        return;
+      }
+    }
     const planning = await getPlanningMetadata({
       task: prompt,
       capabilityProvider: capabilityProviderFor(cwd),
       routeDecision: decision,
       projectContext: { cwd },
     });
+    if (preflightController?.signal.aborted) throw createPreflightCancelledError();
     const routed = await routeRequest(prompt, {
       decision,
       handlers: localHandlers,
       context: { cwd, capabilities: capabilityProviderFor(cwd), planning },
       onRoutingDecision: (record) => { routingDecision = record; },
-      fallback: () => client.submitTask({ task: prompt, projectPath: cwd }),
+      fallback: () => {
+        if (preflightController?.signal.aborted) throw createPreflightCancelledError();
+        if (activeRepositoryPreflight?.requestId === requestId) activeRepositoryPreflight = undefined;
+        activeRequestType = "turn";
+        postToPanel(targetPanel, { type: "task-submission", requestId, state: "submitting", providerId: session.providerId });
+        return client.submitTask({ task: providerTask, projectPath: cwd, repositoryEvidence }).then((result) => {
+          postToPanel(targetPanel, { type: "task-submission", requestId, state: result?.status || "completed", providerId: session.providerId });
+          return result;
+        });
+      },
     });
     const result = routed.fallbackResult;
     const elapsedMs = Math.round(performance.now() - startedAt);
@@ -293,7 +406,20 @@ async function handlePrompt(prompt, targetPanel = panel) {
   } catch (error) {
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs, false, routingDecision);
+    if (error.code === "PREFLIGHT_CANCELLED") {
+      postToPanel(targetPanel, {
+        type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
+        text: "Repository inspection was cancelled. The provider task was not submitted.", elapsedMs,
+      });
+      writeLog(`request=${requestId} preflight=cancelled task_submitted=false`);
+      return;
+    }
     writeLog(`request=${requestId} fallback=failed elapsed_ms=${elapsedMs} code=${error.code || "TASK_FAILED"}`);
+    postToPanel(targetPanel, {
+      type: "task-submission", requestId,
+      state: error.code === "SUBMISSION_OUTCOME_UNCERTAIN" ? "outcome-uncertain" : "provider-error",
+      providerId: session.providerId,
+    });
     const interrupted = error.code === "TASK_INTERRUPTED";
     const terminalTurnState = ["TASK_FAILED", "TASK_INTERRUPTED"].includes(error.code);
     if (!terminalTurnState) {
@@ -327,6 +453,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
     });
   } finally {
     client.off("event", onExecutionEvent);
+    if (activeRepositoryPreflight?.requestId === requestId) activeRepositoryPreflight = undefined;
     if (activeCodexRequestId === requestId) {
       activeCodexRequestId = undefined;
       activeRequestType = undefined;
@@ -474,7 +601,13 @@ function startNewSession(targetPanel) {
 }
 
 async function interruptRequest(requestId, targetPanel) {
-  if (requestId !== activeCodexRequestId || !executionProvider) return;
+  if (requestId !== activeCodexRequestId) return;
+  if (activeRepositoryPreflight?.requestId === requestId) {
+    cancelActiveRepositoryPreflight();
+    postToPanel(targetPanel, { type: "interrupt-requested", requestId, phase: "preflight" });
+    return;
+  }
+  if (!executionProvider) return;
   try {
     const accepted = await executionProvider.interrupt();
     if (accepted && requestId === activeCodexRequestId) {
@@ -580,6 +713,7 @@ function executionProviderForSession(session, cwd, generation) {
 }
 
 function disposeCurrentAppServer() {
+  cancelActiveRepositoryPreflight();
   const previous = executionProvider;
   const previousTools = permissionedToolRuntime;
   executionProvider = undefined;
@@ -587,6 +721,50 @@ function disposeCurrentAppServer() {
   permissionedToolRuntime = undefined;
   previous?.dispose();
   void previousTools?.dispose?.();
+}
+
+function cancelActiveRepositoryPreflight() {
+  const preflight = activeRepositoryPreflight;
+  if (!preflight) return false;
+  preflight.controller.abort("repository-preflight-cancelled");
+  try { Promise.resolve(preflight.systemModel?.interrupt?.()).catch(() => undefined); } catch { /* Cancellation is best-effort; no provider task is submitted until inspection resolves. */ }
+  return true;
+}
+
+function isPreflightEvidenceScoped(evidence, session, cwd, client) {
+  const context = evidence?.context;
+  if (!context || context.sessionId !== session.sessionId || context.providerId !== session.providerId ||
+      typeof context.projectRoot !== "string" || path.resolve(context.projectRoot) !== path.resolve(cwd)) return false;
+  const expectedConversation = client.getState?.().conversationId || session.providerConversationId || null;
+  return !context.conversationId || !expectedConversation || context.conversationId === expectedConversation;
+}
+
+function summarizeRepositoryPreflight(result, evidenceIncluded) {
+  const status = result?.status === "complete" ? "complete" : "partial";
+  const lines = [
+    `${status} · ${Number.isSafeInteger(result?.project?.fileCount) ? result.project.fileCount : 0} files discovered · ${Array.isArray(result?.findings) ? result.findings.length : 0} findings.`,
+    evidenceIncluded ? "Bounded findings attached to this provider task only." : "No repository evidence attached to the provider task.",
+  ];
+  const impact = result?.impactReport;
+  if (impact) lines.push(`Impact: ${impact.definitions.length} definitions · ${impact.callSites.length} call candidates · ${impact.dependencies.length} dependencies · ${impact.tests.length} test references.`);
+  for (const finding of (result?.findings || []).slice(0, 3)) {
+    const location = finding.path ? `${finding.path}${finding.lineStart ? `:${finding.lineStart}` : ""}` : finding.source || "project";
+    const provenance = `${finding.observation || "observed"}${finding.sourceContextRead ? ", source read" : ""}`;
+    lines.push(`- ${provenance} · ${location} · ${finding.description || finding.type || "finding"}`);
+  }
+  const gap = result?.incomplete?.[0] || impact?.gaps?.[0];
+  if (gap) lines.push(`Coverage: ${gap}`);
+  return redactSensitiveText(lines.join("\n")).slice(0, MAX_PREFLIGHT_SUMMARY_LENGTH);
+}
+
+function safeErrorCode(error) {
+  return typeof error?.code === "string" && /^[A-Z0-9_-]{1,80}$/u.test(error.code) ? error.code : "INSPECTION_UNAVAILABLE";
+}
+
+function createPreflightCancelledError() {
+  const error = new Error("Repository inspection was cancelled before provider submission.");
+  error.code = "PREFLIGHT_CANCELLED";
+  return error;
 }
 
 function isCurrentRequest(requestId, client, sessionId, generation) {
@@ -1091,9 +1269,9 @@ function getHtml(webview) {
         currentProviderName = typeof message.displayName === 'string' ? message.displayName : currentProviderId;
         providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '') + (message.toolCallingEnabled ? ' · project inspection/proposals enabled; file writes unavailable in panel' : '');
         providerPrivacy.textContent = currentProviderId === 'openai-chat-completions'
-          ? (message.toolCallingEnabled ? 'OpenAI receives the task, saved conversation, and bounded results from Vesper project inspection and proposal tools. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'OpenAI receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.')
+          ? (message.toolCallingEnabled ? 'OpenAI receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'For code-oriented tasks, OpenAI receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
           : currentProviderId === 'nvidia-nim'
-            ? (message.toolCallingEnabled ? 'NVIDIA NIM receives the task, saved conversation, and bounded results from Vesper project inspection and proposal tools. Model support is unverified. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'NVIDIA NIM receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.')
+            ? (message.toolCallingEnabled ? 'NVIDIA NIM receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. Model support is unverified. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'For code-oriented tasks, NVIDIA NIM receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
           : 'Codex uses a read-only sandbox; Vesper declines approval requests.';
       }
       if (message.type === 'project') {
@@ -1153,7 +1331,12 @@ function getHtml(webview) {
       if (message.type === 'active-request') {
         activeRequestId = message.requestId;
         setBusy(true);
-        if (message.kind === 'turn') {
+        if (message.kind === 'preflight') {
+          activeAssistant = addMessage('activity', 'Vesper · inspecting repository…', 'The provider task has not been submitted.');
+          stop.hidden = false;
+          stop.disabled = false;
+          status.textContent = 'Vesper · inspecting bounded local repository evidence';
+        } else if (message.kind === 'turn') {
           activeAssistant = addMessage('assistant', currentProviderName + ' · task continued after panel reopen…', '');
           stop.hidden = false;
           stop.disabled = false;
@@ -1163,6 +1346,26 @@ function getHtml(webview) {
       if (message.type === 'plan-preview') {
         addMessage(message.error ? 'error' : 'assistant', 'Vesper plan · advisory · not executed', message.text || 'No plan output is available.');
         previewPlan.disabled = false;
+      }
+      if (message.type === 'repository-preflight' && message.requestId === activeRequestId) {
+        if (message.state === 'running') {
+          status.textContent = 'Vesper · inspecting bounded local repository evidence';
+          if (activeAssistant) activeAssistant.title.textContent = 'Vesper · inspecting repository…';
+        } else {
+          const stateLabel = message.state === 'fallback' ? 'fallback · original task only'
+            : message.state === 'partial' ? 'partial coverage' : 'bounded evidence';
+          const evidenceLabel = message.evidenceIncluded ? ' · attached to this task' : ' · not sent to provider';
+          addMessage(message.state === 'fallback' ? 'error' : 'activity', 'Repository preflight · ' + stateLabel + evidenceLabel, message.text || 'No repository summary is available.');
+          status.textContent = message.state === 'fallback' ? 'Vesper · preflight limited; submitting original task' : currentProviderName + ' · submitting task';
+          if (activeAssistant) activeAssistant.title.textContent = currentProviderName + ' · submitting task…';
+        }
+      }
+      if (message.type === 'task-submission' && message.requestId === activeRequestId) {
+        if (message.state === 'submitting') status.textContent = currentProviderName + ' · submitting task…';
+        else if (message.state === 'completed') status.textContent = currentProviderName + ' · task completed';
+        else if (message.state === 'interrupted') status.textContent = currentProviderName + ' · task interrupted';
+        else if (message.state === 'outcome-uncertain') status.textContent = currentProviderName + ' · task outcome uncertain; do not resubmit';
+        else if (message.state === 'provider-error') status.textContent = currentProviderName + ' · provider did not confirm completion';
       }
       if (message.type === 'local-answer') {
         const state = message.result?.status || 'confirmed';
@@ -1209,7 +1412,9 @@ function getHtml(webview) {
         }
       }
       if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
-        status.textContent = 'Interrupt sent · waiting for ' + currentProviderName + ' to stop…';
+        status.textContent = message.phase === 'preflight'
+          ? 'Vesper · cancelling repository inspection; provider task has not been submitted…'
+          : 'Interrupt sent · waiting for ' + currentProviderName + ' to stop…';
       }
       if (message.type === 'assistant-interrupt-error' && message.requestId === activeRequestId) {
         status.textContent = 'Interrupt was not confirmed · the turn may still be running.';
@@ -1233,7 +1438,8 @@ function getHtml(webview) {
       if (message.type === 'assistant-error' && message.requestId === activeRequestId) {
         if (activeAssistant) {
           const interrupted = message.state === 'interrupted';
-          activeAssistant.title.textContent = interrupted ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed · ' + message.elapsedMs + ' ms';
+          activeAssistant.title.textContent = message.preflight ? 'Vesper preflight cancelled · task not submitted'
+            : interrupted ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed · ' + message.elapsedMs + ' ms';
           activeAssistant.body.textContent += (activeAssistant.body.textContent ? '\\n\\n' : '') + message.text;
           activeAssistant = undefined;
         } else {
@@ -1241,7 +1447,8 @@ function getHtml(webview) {
           addMessage('assistant', label, message.text);
         }
         activeRequestId = undefined;
-        status.textContent = message.state === 'interrupted' ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed; the conversation remains visible in this panel.';
+        status.textContent = message.preflight ? 'Vesper · provider task not submitted'
+          : message.state === 'interrupted' ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed; the conversation remains visible in this panel.';
         stop.hidden = true;
         setBusy(false);
       }
