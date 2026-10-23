@@ -12,6 +12,7 @@ flowchart TD
     CLI[Terminal CLI]
     ROUTER[Deterministic routing core]
     LOCAL[Fixed local Git and test-evidence handlers]
+    REPO[Bounded repository intelligence and System Model]
     CLIENT[Codex app-server client]
     CODEX[Installed Codex CLI app-server]
     STORE[(Vesper session metadata)]
@@ -19,7 +20,9 @@ flowchart TD
     VSC --> ROUTER
     CLI --> ROUTER
     ROUTER -->|explicit supported local question| LOCAL
-    ROUTER -->|other or ambiguous task| CLIENT
+    ROUTER -->|terminal provider task| REPO
+    REPO -->|bounded findings; same route and provider| CLIENT
+    ROUTER -->|other tasks or VS Code provider task| CLIENT
     CLIENT <-->|JSON-RPC over stdio| CODEX
     VSC <--> STORE
     CLI <--> STORE
@@ -32,6 +35,7 @@ flowchart TD
 - **Codex app-server:** Vesper starts or resumes a Codex thread and streams turn events through the installed CLI's app-server using JSON-RPC over stdio. The app-server remains the coding and reasoning backend; Vesper is its interface and safety-aware adapter.
 - **Session identity:** Vesper stores a session ID, canonical project path, Codex thread ID, schema version, and timestamps under `~/.vesper/sessions/` (or `$VESPER_HOME/sessions/`). It does not store prompts or model transcripts. The VS Code panel restores supported persisted history from the Codex thread; local answers are not part of that history.
 - **Capability planning:** a normalized local catalog feeds a deterministic advisory planner, available from the CLI, terminal workspace, and VS Code panel. Planning preserves the router's decision, distinguishes unknown and stale runtime evidence, and never activates or executes a capability.
+- **Repository intelligence:** `vesper inspect [TASK]` and terminal `:inspect [TASK]` run bounded, read-only project and Git analysis through the existing permissioned tool runtime. Terminal code-oriented provider tasks receive synthesized local findings in the same session; paths, lines, provenance, uncertainty, and coverage limits remain explicit. The deterministic System Model does not add another model call or change routing. VS Code preflight is a later integration step.
 - **Bounded activity views:** command activity, per-item file-change evidence, and turn-level aggregate diffs have separate projections. They are correlated to their supported thread/turn/item identities, bounded, and escaped before display. An aggregate diff or proposed file change is not proof of a disk write.
 
 ## Safety boundaries

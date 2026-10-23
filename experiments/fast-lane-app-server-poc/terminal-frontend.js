@@ -9,6 +9,8 @@ const { approvalReview } = require("./approval-review");
 const { createExecutionProvider, listProviders } = require("./execution-provider");
 const { assertExecutionProvider } = require("./execution-interface");
 const { createPermissionedToolRuntime, renderToolApproval } = require("./permissioned-tool-runtime");
+const { createRepositoryIntelligence } = require("./repository-intelligence");
+const { createSystemModel, renderSystemModelReport, shouldInvestigateTask } = require("./system-model");
 const { codexApprovalResponse, normalizeApprovalRequest } = require("./codex-execution-provider");
 const { getPlanningMetadata } = require("./capability-planner");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
@@ -54,6 +56,8 @@ class TerminalFrontend {
     this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
     this.sessionId = sessionId;
     this.toolRuntime = null;
+    this.systemModel = null;
+    this.repositoryInspectionActive = false;
     this.onWorkspaceCommand = onWorkspaceCommand;
     this.onTask = onTask;
     this.onExecutionState = onExecutionState;
@@ -102,7 +106,7 @@ class TerminalFrontend {
     this.write(`Vesper · local routing with ${this.providerDisplayName()} fallback\n`);
     this.write(`Execution provider: ${this.providerDisplayName()}\n`);
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
+    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, :inspect [TASK], and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -133,13 +137,38 @@ class TerminalFrontend {
         this.write(renderRoutingSummary(this.metrics, this.sessionId));
         return;
       }
+      if (prompt === ":inspect" || prompt.startsWith(":inspect ")) {
+        const task = prompt.slice(":inspect".length).trim();
+        if (!this.systemModel) {
+          this.write("[Vesper] Repository intelligence is unavailable for this session; no inspection ran.\n");
+          return;
+        }
+        if (this.activeRequest) {
+          this.write("[Vesper] Wait for the active task to finish before starting an inspection.\n");
+          return;
+        }
+        this.activeRequest = true;
+        this.repositoryInspectionActive = true;
+        this.interruptPending = false;
+        this.write("\n[Vesper · inspecting bounded local repository evidence; no commands or scripts will run]\n");
+        try {
+          const result = await this.systemModel.investigate({ task });
+          this.write(renderSystemModelReport(result));
+        } catch {
+          this.write("[Vesper] Repository inspection could not be completed. No project command was run.\n");
+        } finally {
+          this.repositoryInspectionActive = false;
+          this.activeRequest = false;
+        }
+        return;
+      }
       try {
         if (await this.onWorkspaceCommand?.(prompt, this)) return;
       } catch (error) {
         this.write(`[Vesper command error] ${safeTerminalText(error?.message || error)}\n`);
         return;
       }
-      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :capabilities, :routing, or :quit.\n`);
+      this.write(`[Vesper] Unknown workspace command: ${safeTerminalText(prompt)}. Use :sessions, :switch ID, :new, :capabilities, :inspect, :routing, or :quit.\n`);
       return;
     }
 
@@ -164,6 +193,38 @@ class TerminalFrontend {
       this.metrics.record(decision, elapsedMs, { handlerFailed: failed, routingDecision: routed.routingDecision });
       this.write(`${safeTerminalText(routed.result.summary)}\n`);
       return;
+    }
+
+    let repositoryEvidence = null;
+    let providerTask = prompt;
+    if (this.systemModel && shouldInvestigateTask(prompt)) {
+      this.activeRequest = true;
+      this.repositoryInspectionActive = true;
+      this.interruptPending = false;
+      this.write("\n[Vesper · inspecting bounded local repository evidence; no commands or scripts will run]\n");
+      let investigation;
+      try {
+        investigation = await this.systemModel.investigate({ task: prompt, routeDecision: decision });
+        repositoryEvidence = investigation.evidence;
+        this.write(`[Repository intelligence · ${safeTerminalText(investigation.status)} · ${investigation.project?.fileCount || 0} files indexed · ${investigation.findings?.length || 0} findings]\n`);
+        for (const step of (investigation.plan || []).slice(0, 3)) this.write(`- ${safeTerminalText(step)}\n`);
+        for (const note of (investigation.incomplete || []).slice(0, 2)) this.write(`  Coverage: ${safeTerminalText(note)}\n`);
+        const context = investigation.providerContext;
+        if (typeof context === "string" && context && prompt.length + context.length + 64 <= 32 * 1024) {
+          providerTask = `${prompt}\n\n${context}`;
+        } else if (context) {
+          this.write("[Repository evidence omitted from provider context because the task is at the provider input limit; local findings remain available above.]\n");
+        }
+      } catch {
+        this.write("[Repository intelligence unavailable; continuing with the original task and no repository evidence.]\n");
+      } finally {
+        this.repositoryInspectionActive = false;
+        this.activeRequest = false;
+      }
+      if (this.interruptPending || investigation?.status === "cancelled") {
+        this.write("[Vesper] Repository inspection cancelled; the provider task was not submitted.\n");
+        return;
+      }
     }
 
     // The planner is an advisory catalog consumer. It does not alter the
@@ -204,7 +265,7 @@ class TerminalFrontend {
         },
         fallback: async () => {
           await this.restoreSavedHistory();
-          return this.executionProvider.submitTask({ task: prompt, projectPath: this.cwd });
+          return this.executionProvider.submitTask({ task: providerTask, projectPath: this.cwd, repositoryEvidence });
         },
       });
       const result = routed.fallbackResult;
@@ -399,16 +460,19 @@ class TerminalFrontend {
   replaceExecutionProvider(executionProvider, { sessionId = null, savedConversationId = null, savedThreadId = null } = {}) {
     if (this.activeRequest || this.pendingApprovals.size) throw new Error("A Vesper session can only be switched while the terminal is idle.");
     assertExecutionProvider(executionProvider);
+    const nextSavedConversationId = savedConversationId || savedThreadId || null;
     const nextRuntime = this.createPermissionedToolRuntime(executionProvider, sessionId);
+    const nextSystemModel = this.createSystemModel(nextRuntime, executionProvider, sessionId, nextSavedConversationId);
     this.executionProvider.off("event", this.handleExecutionEvent);
     const previousRuntime = this.toolRuntime;
     this.executionProvider = executionProvider;
     this.toolRuntime = nextRuntime;
+    this.systemModel = nextSystemModel;
     executionProvider.setToolRuntime?.(nextRuntime);
     this.executionProvider.setApprovalHandler?.((request) => this.requestApproval(request));
     this.executionProvider.on("event", this.handleExecutionEvent);
     this.sessionId = sessionId;
-    this.savedConversationId = savedConversationId || savedThreadId || null;
+    this.savedConversationId = nextSavedConversationId;
     this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
     this.turnDiffIdentity = null;
     this.turnDiffRendered = false;
@@ -419,14 +483,16 @@ class TerminalFrontend {
   }
 
   createPermissionedToolRuntime(provider, sessionId) {
-    if (typeof provider?.setToolRuntime !== "function" || provider.getState?.().toolCallingEnabled !== true) return null;
-    if (typeof sessionId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(sessionId)) {
-      throw new Error("Structured tool calling requires the active Vesper session UUID.");
+    const hasStructuredTools = typeof provider?.setToolRuntime === "function" && provider.getState?.().toolCallingEnabled === true;
+    const validSessionId = typeof sessionId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(sessionId);
+    if (!validSessionId) {
+      if (hasStructuredTools) throw new Error("Structured tool calling requires the active Vesper session UUID.");
+      return null;
     }
     const runtime = createPermissionedToolRuntime({
       projectRoot: this.cwd,
       sessionId,
-      approvalHandler: this.canReviewToolChanges ? (snapshot) => this.requestToolApproval(snapshot) : undefined,
+      approvalHandler: hasStructuredTools && this.canReviewToolChanges ? (snapshot) => this.requestToolApproval(snapshot) : undefined,
       commandExecutionEnabled: false,
       commandWorkspaceWriteEnabled: false,
     });
@@ -435,6 +501,20 @@ class TerminalFrontend {
       throw new Error("Vesper could not bind the read-only tool runtime to the active session.");
     }
     return runtime;
+  }
+
+  createSystemModel(runtime, provider, sessionId, fallbackConversationId = this.savedConversationId) {
+    if (!runtime || typeof sessionId !== "string") return null;
+    const getConversationId = () => (provider.getState?.() || {}).conversationId || fallbackConversationId || null;
+    const repositoryIntelligence = createRepositoryIntelligence({
+      toolRuntime: runtime,
+      projectRoot: this.cwd,
+      sessionId,
+      providerId: provider.id,
+      conversationId: getConversationId(),
+      getConversationId,
+    });
+    return createSystemModel({ repositoryIntelligence });
   }
 
   async requestToolApproval(snapshot, { signal } = {}) {
@@ -455,6 +535,7 @@ class TerminalFrontend {
   attachPermissionedToolRuntime(provider, sessionId) {
     const runtime = this.createPermissionedToolRuntime(provider, sessionId);
     this.toolRuntime = runtime;
+    this.systemModel = this.createSystemModel(runtime, provider, sessionId);
     provider.setToolRuntime?.(runtime);
   }
 
@@ -657,8 +738,11 @@ class TerminalFrontend {
       if (this.interruptPending) return;
       this.interruptPending = true;
       this.lineIO.cancelPending?.();
-      this.write("\n[Vesper] Ctrl+C received; interrupting this turn. Vesper will return to the prompt when it ends.\n");
-      Promise.resolve(this.executionProvider.interrupt()).catch((error) => {
+      this.write(this.repositoryInspectionActive
+        ? "\n[Vesper] Ctrl+C received; cancelling local repository inspection. No provider task has been submitted.\n"
+        : "\n[Vesper] Ctrl+C received; interrupting this turn. Vesper will return to the prompt when it ends.\n");
+      const interruption = this.repositoryInspectionActive ? this.systemModel?.interrupt?.() : this.executionProvider.interrupt();
+      Promise.resolve(interruption).catch((error) => {
         this.write(`[Vesper interrupt error] ${safeTerminalText(error?.message || error)}\n`);
       });
     } else {

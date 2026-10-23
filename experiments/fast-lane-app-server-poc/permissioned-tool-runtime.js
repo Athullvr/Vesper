@@ -33,6 +33,7 @@ const TOOL_IDS = Object.freeze([
   "git_status",
   "git_diff",
   "git_log",
+  "git_check_ignore",
   "run_command",
   "propose_file_change",
   "apply_file_change",
@@ -53,6 +54,9 @@ const TOOL_DEFINITIONS = Object.freeze([
     objectSchema({ path: projectPathSchema() }), { timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT }),
   definition("git_log", "Inspect a bounded, read-only summary of local Git history.", "project-git-read", false,
     objectSchema({ limit: { type: "integer", minimum: 1, maximum: 20 }, path: projectPathSchema() }), { defaultLimit: 10, maximumLimit: 20, timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT, remoteAccess: false }),
+  definition("git_check_ignore", "Check project-relative paths against the repository's Git ignore rules.", "project-git-read", false,
+    objectSchema({ paths: { type: "array", minItems: 1, maxItems: 100, items: projectPathSchema() } }, ["paths"]),
+    { maximumPaths: 100, timeoutMs: MAX_COMMAND_TIMEOUT_MS, externalGitConfiguration: false }),
   definition("run_command", "Run one explicitly approved argv inside a rootless Linux container with network disabled.", "command-execution", true,
     objectSchema({ argv: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1, maxLength: MAX_COMMAND_LENGTH }, "x-maxAggregateUtf8Bytes": MAX_COMMAND_LENGTH },
       workspaceAccess: { type: "string", enum: ["read-only", "read-write"] } }, ["argv"]), { enabledByDefault: false, shell: false, isolation: "rootless-podman-required",
@@ -291,6 +295,7 @@ class PermissionedToolRuntime {
       case "git_status": return this.gitRead(["status", "--short", "--branch", "--untracked-files=no"]);
       case "git_diff": return this.gitDiff(request.input.path);
       case "git_log": return this.gitLog(request.input);
+      case "git_check_ignore": return this.gitCheckIgnore(request.input.paths);
       case "run_command": return this.runCommand(request, commandPlan);
       case "propose_file_change": return this.proposeFileChange(request);
       case "apply_file_change": return this.applyFileChange(request);
@@ -409,6 +414,50 @@ class PermissionedToolRuntime {
       args.push(`:(literal)${parsed.relativePath}`);
     }
     return this.gitRead(args);
+  }
+
+  async gitCheckIgnore(relativePaths) {
+    if (!Array.isArray(relativePaths) || relativePaths.length < 1 || relativePaths.length > 100) {
+      throw toolError("INVALID_ARGUMENT", "git_check_ignore requires 1 to 100 project-relative paths.", true);
+    }
+    const normalizedPaths = relativePaths.map((value) => this.files.parseProjectPath(value, { allowRoot: false }).relativePath);
+    const root = this.openRoot();
+    try {
+      await this.assertGitProjectRoot(root);
+      let result;
+      const args = ["--no-pager", "-c", "core.fsmonitor=false", "-c", "core.quotepath=false", "-c", "core.excludesFile=/dev/null", "-C", root.path,
+        "check-ignore", "-z", "--", ...normalizedPaths.map((value) => `:(literal)${value}`)];
+      const options = {
+        cwd: root.path,
+        timeout: MAX_COMMAND_TIMEOUT_MS,
+        maxBuffer: 128 * 1024,
+        encoding: "buffer",
+        windowsHide: true,
+        env: {
+          PATH: process.env.PATH || "/usr/bin:/bin",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_TERMINAL_PROMPT: "0",
+          GIT_PAGER: "cat",
+          PAGER: "cat",
+          GIT_OPTIONAL_LOCKS: "0",
+        },
+      };
+      try {
+        result = await this.execFileImpl("git", args, options);
+      } catch (error) {
+        // git check-ignore exits 1 when none of the requested paths are ignored.
+        if (error?.code === 1) result = { stdout: error.stdout || Buffer.alloc(0) };
+        else if (error?.killed || error?.code === "ETIMEDOUT") throw toolError("TIMEOUT", "The bounded Git ignore inspection timed out.", true);
+        else throw toolError("GIT_FAILED", "Git could not evaluate repository ignore rules.", false);
+      }
+      const buffer = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout || "");
+      if (buffer.length > 64 * 1024) throw toolError("OUTPUT_LIMIT", "Git ignore output exceeded Vesper's bound.", true);
+      const ignored = buffer.toString("utf8").split("\0").filter(Boolean);
+      const requested = new Set(normalizedPaths);
+      const safeIgnored = ignored.filter((value) => requested.has(value));
+      return { value: { ignored: safeIgnored, checked: normalizedPaths.length }, verified: true };
+    } finally { root.close(); }
   }
 
   async gitRead(commandArgs) {
@@ -959,6 +1008,13 @@ function validateInput(toolId, input) {
       const limit = input.limit === undefined ? 10 : input.limit;
       if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw toolError("INVALID_ARGUMENT", "git_log limit must be an integer from 1 to 20.", true);
       return { limit, ...(input.path === undefined ? {} : { path: validPathValue(input.path, false) }) };
+    }
+    case "git_check_ignore": {
+      exactKeys(["paths"], ["paths"]);
+      if (!Array.isArray(input.paths) || input.paths.length < 1 || input.paths.length > 100) {
+        throw toolError("INVALID_ARGUMENT", "git_check_ignore paths must contain from 1 to 100 values.", true);
+      }
+      return { paths: input.paths.map((value) => validPathValue(value, false)) };
     }
     case "run_command":
       exactKeys(["argv", "workspaceAccess"], ["workspaceAccess"]);

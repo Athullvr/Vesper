@@ -18,6 +18,7 @@ const {
   hasEvidenceBackedPlan,
   recordTaskToolOutcome,
   recordRejectedTaskTool,
+  mergeRepositoryEvidence,
   renderTaskEvidenceReport,
   renderEvidenceInstructions,
   MAX_REPORT_LENGTH,
@@ -300,7 +301,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     };
   }
 
-  async submitTask({ task, projectPath } = {}) {
+  async submitTask({ task, projectPath, repositoryEvidence = null } = {}) {
     this.assertLive();
     this.assertConfigured();
     if (typeof task !== "string" || !task.trim() || task.length > 32 * 1024) {
@@ -336,6 +337,14 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     }
     this.setConversation(pending);
     const controller = new AbortController();
+    const taskEvidence = createTaskEvidence({
+      providerId: this.id,
+      sessionId: this.toolRuntime?.sessionId,
+      conversationId: this.conversationId,
+      taskId,
+      projectRoot: this.projectPath,
+    });
+    if (repositoryEvidence) mergeRepositoryEvidence(taskEvidence, repositoryEvidence);
     const active = {
       taskId,
       conversationId: this.conversationId,
@@ -352,13 +361,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       toolCallCount: 0,
       toolIterationCount: 0,
       changedFiles: false,
-      evidence: createTaskEvidence({
-        providerId: this.id,
-        sessionId: this.toolRuntime?.sessionId,
-        conversationId: this.conversationId,
-        taskId,
-        projectRoot: this.projectPath,
-      }),
+      evidence: taskEvidence,
     };
     this.active = active;
     active.timer = setTimeout(() => {
@@ -373,7 +376,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     try {
       return await this.runAgentLoop({ active, taskId, pending });
     } catch (error) {
-      if (this.config.toolCallingEnabled && active.evidence.toolCalls > 0) {
+      if (active.evidence.toolCalls > 0 || active.evidence.findings?.length > 0) {
         this.emitWorkflowStage(active, "report");
         this.emitForTask(active, "task-progress", {
           kind: "workflow-report",
@@ -602,7 +605,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       finalText = completion.text;
       this.assertAgentTimeRemaining(active);
       let evidenceReport = "";
-      if (this.config.toolCallingEnabled && active.evidence.toolCalls > 0) {
+      if (active.evidence.toolCalls > 0 || active.evidence.findings?.length > 0) {
         this.emitWorkflowStage(active, "report");
         evidenceReport = renderTaskEvidenceReport(active.evidence);
         const suffix = `\n\n${evidenceReport}`;

@@ -33,6 +33,20 @@ test("read-only evidence reports only files and Git operations that actually com
   assert.doesNotMatch(report, /secret file body omitted/u);
 });
 
+test("Git ignore checks are retained as bounded, project-relative inspection evidence", () => {
+  const evidence = createTaskEvidence({ sessionId: "session-1", projectRoot: "/repo" });
+  recordTaskToolOutcome(evidence, { toolId: "git_check_ignore", input: { paths: ["src/main.js", "vendor/lib.js"] }, result: {
+    state: "verified", executed: true, verified: true, result: { checked: 2, ignored: ["vendor/lib.js"] },
+  } });
+  assert.equal(hasSuccessfulInspection(evidence), true);
+  assert.deepEqual(evidence.inspections, [
+    { kind: "git_check_ignore", path: null, state: "verified" },
+  ]);
+  const report = renderTaskEvidenceReport(evidence);
+  assert.match(report, /git_check_ignore \(verified\)/u);
+  assert.doesNotMatch(report, /\/repo/u);
+});
+
 test("proposal and apply evidence distinguish a proposal from an approved verified write", () => {
   const evidence = createTaskEvidence();
   recordTaskToolOutcome(evidence, { toolId: "search_files", input: { query: "route" }, result: {

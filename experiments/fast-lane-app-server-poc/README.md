@@ -42,7 +42,7 @@ vesper sessions new
 
 `list` shows at most the 50 newest sessions for the selected canonical project and prints the Vesper id, update time, provider, and whether a provider conversation is saved. Session metadata does not retain a title or prompt preview. `resume` defaults to the current project and rejects a session saved for another project; it resumes with the same provider recorded on that session. `new` creates a separate session and leaves existing sessions intact. Each command accepts an optional project directory.
 
-The interactive workspace keeps task text separate from workspace commands. Use `:providers` and `:tools` to inspect local support, `:new [PROVIDER_ID [MODEL_ID]]` to create a separately scoped provider/model session, `:plan TASK` to preview an advisory plan, and `:capabilities` to inspect discovered extensions. Ordinary terminal input is routed as a Vesper task or local query; Vesper does not intercept arbitrary shell commands. Explicit read-only inspection uses the named tools below, while commands use the isolated, approval-gated `run_command` tool.
+The interactive workspace keeps task text separate from workspace commands. Use `:providers` and `:tools` to inspect local support, `:new [PROVIDER_ID [MODEL_ID]]` to create a separately scoped provider/model session, `:plan TASK` to preview an advisory plan, `:inspect [TASK]` to inspect this repository locally, and `:capabilities` to inspect discovered extensions. Ordinary terminal input is routed as a Vesper task or local query; Vesper does not intercept arbitrary shell commands. Code-oriented provider tasks get a bounded, read-only repository preflight before dispatch. Explicit commands remain behind the isolated, approval-gated `run_command` tool.
 
 Read-only integration discovery is available from the terminal. `vesper plugins` checks project and personal local marketplace manifests plus the local plugin cache; `vesper mcp` uses Codex's JSON listing command; and `vesper skills` checks project and user skill directories. These commands show only names, status, and source, never MCP command arguments, environment values, skill instructions, or conversation text. `vesper modules` is not implemented.
 
@@ -108,6 +108,25 @@ Execution path: codex_fallback
 
 The second example depends on matching local metadata and a failed observation; the third shows the valid no-match case. Plans list at most eight relevant capabilities and truncate display output at a fixed limit. Full task text is not copied into the plan object or routing metadata.
 
+## Repository intelligence and System Model
+
+The repository-intelligence service builds bounded evidence from the selected project through Vesper's existing permissioned read-only runtime. Use it directly without starting a provider:
+
+```sh
+vesper inspect
+vesper inspect "Trace handleCheckout through the service layer" --project /path/to/project
+```
+
+Inside the terminal workspace, `:inspect [TASK]` prints the same kind of local report. For code-oriented terminal tasks, Vesper performs a short local preflight, shows its status and grounded next steps, then sends a bounded synthesized evidence summary alongside the original task. It preserves the selected provider, model, conversation, and routing outcome. This is not an extra model call; the selected provider handles the task as usual. `vesper inspect` and `:inspect` themselves never call a model. The VS Code task path does not yet run this preflight.
+
+The service examines at most 600 files, 10 directories, six manifests, eight source/config files, 64 KiB per analyzed file, 512 KiB total source content, 32 permissioned operations, and about 10 seconds. It uses local Git status/history/diff and Git ignore checks when safe in-project `.git` metadata is available. Without Git, it applies a bounded subset of `.gitignore` rules. It excludes common generated/dependency directories, sensitive credential-like paths, and symbolic links. Git ignore checks use project `.gitignore` and `.git/info/exclude`; global excludes are not read. Git status omits untracked files, and the current diff is unstaged tracked changes only.
+
+Manifest declarations, dependency summaries, language counts, framework indicators, source symbols, configuration references, and likely entry points are reported with relative paths, line references where available, source, confidence, observation kind, status, and observation time. Package-declared entry points are distinguished from conventional inferences. Import edges can support an approximate cross-file trace, but they do not prove runtime call order or form a complete call graph. Unsupported or malformed manifests, inaccessible paths, absent Git metadata, contradictory declarations, and coverage limits remain visible.
+
+Test/build/start commands are identified from manifests as observed or inferred suggestions; Vesper never runs them automatically. Repository contents are untrusted input. For remote OpenAI/NVIDIA sessions, the selected provider receives the task and the bounded synthesized repository summary, not full source files from this preflight. Existing structured tool calls may separately request bounded file results through the permissioned runtime. Review the provider's data-sharing settings before using remote providers with private repositories.
+
+The System Model coordinator is deterministic in this phase. It classifies investigation intent, selects bounded local inspections, collects findings into the existing task-evidence ledger, and returns a grounded plan, unresolved assumptions, and verification requirements. It does not select or switch providers, execute tools on a provider's behalf, install capabilities, or change files. Codex continues through its native app-server execution and approval path; OpenAI/NVIDIA use their existing adapters and runtime approval boundary.
+
 Vesper can manage only operations with a documented Codex CLI interface. Each operation prints the exact target, intended change, backup/recovery guidance, then requires typing the capability ID:
 
 ```sh
@@ -154,6 +173,7 @@ The interactive workspace shows the canonical project path and active Vesper ses
 :capabilities status   show current catalog and passive runtime observations
 :capabilities show ID  inspect one capability in this session
 :plan TASK             preview an advisory plan without executing it
+:inspect [TASK]        inspect this project locally without calling a model
 :routing               show routing outcome counts for the active session
 :help                  show workspace commands
 :quit                  exit and keep saved sessions
@@ -284,7 +304,7 @@ vesper tools run propose_file_change '{"path":"notes.txt","content":"Reviewed te
 vesper tools run propose_file_change '{"path":"notes.txt","content":"Reviewed text\n"}' --apply
 ```
 
-The initial tools are `read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, `git_log`, `run_command`, `propose_file_change`, and `apply_file_change`. `git_log` returns at most 20 local commit summaries and never contacts a remote. File operations use canonical project-root descriptors with no-follow path traversal, reject hard links and cross-device mounts, and currently fail closed outside Linux with `/proc/self/fd` and `O_NOFOLLOW`. Same-device bind mounts are not distinguished from ordinary directories. Reads are limited to 1 MiB; directory lists to 100 entries; literal search to depth 5, 2,000 entries, 100 matches, 16 MiB scanned, and 16 KiB displayed; Git output to 16 KiB and five seconds. Git inspection rejects worktrees/external metadata, repositories rooted above the selected project, Git object alternates, and local config includes. Search skips symbolic links and non-text/oversized files.
+The initial tools are `read_file`, `list_files`, `search_files`, `git_status`, `git_diff`, `git_log`, `git_check_ignore`, `run_command`, `propose_file_change`, and `apply_file_change`. `git_log` returns at most 20 local commit summaries and never contacts a remote. `git_check_ignore` accepts at most 100 literal project-relative paths and disables external/global Git configuration. File operations use canonical project-root descriptors with no-follow path traversal, reject hard links and cross-device mounts, and currently fail closed outside Linux with `/proc/self/fd` and `O_NOFOLLOW`. Same-device bind mounts are not distinguished from ordinary directories. Reads are limited to 1 MiB; directory lists to 100 entries; literal search to depth 5, 2,000 entries, 100 matches, 16 MiB scanned, and 16 KiB displayed; Git output to 16 KiB and five seconds. Git inspection rejects worktrees/external metadata, repositories rooted above the selected project, Git object alternates, and local config includes. Search skips symbolic links and non-text/oversized files.
 
 `propose_file_change` is a whole-file UTF-8 replacement proposal, not a patch engine. The existing file and proposed content must each fit in an 8 KiB review field, and the complete review must fit 20 KiB. `.git` and `.vesper` metadata paths are excluded. Existing files must be owned by the Vesper user and have the group the replacement would inherit. Applying a proposal requires a fresh `approve-once`, binds the approval to the proposal, session, project, original snapshot, and proposed content, then rechecks the target immediately before the atomic operation and verifies the resulting bytes. A concurrent change observed during revalidation invalidates the proposal. New files use atomic create-if-absent; existing files use an atomic same-directory replacement. Node does not expose a compare-and-swap rename, so a narrow race remains between the final existing-file check and replacement; a later native filesystem adapter should close that window. Replacement preserves basic mode and owner/group eligibility, but extended ACLs and xattrs are not preserved. Proposals and approvals do not survive runtime disposal. Secret-like text that the existing redactor would hide is refused for protected-operation approval so a reviewer is not asked to approve a partially hidden command or file.
 

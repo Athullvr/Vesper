@@ -10,7 +10,7 @@ const {
   createExecutionEvent,
   unsupportedOperation,
 } = require("./execution-interface");
-const { createTaskEvidence, recordProviderExecutionEvent, renderTaskEvidenceReport } = require("./task-evidence");
+const { createTaskEvidence, mergeRepositoryEvidence, recordProviderExecutionEvent, renderTaskEvidenceReport } = require("./task-evidence");
 
 const CODEX_PROVIDER_ID = "codex-app-server";
 const MAX_TEXT_EVENT_LENGTH = 32 * 1024;
@@ -138,7 +138,7 @@ class CodexExecutionProvider extends EventEmitter {
     }
   }
 
-  async submitTask({ task, projectPath } = {}) {
+  async submitTask({ task, projectPath, repositoryEvidence = null } = {}) {
     this.assertLive();
     if (typeof task !== "string" || !task.trim()) {
       throw createExecutionError("INVALID_REQUEST", "A non-empty task is required.", { providerId: this.id });
@@ -156,6 +156,7 @@ class CodexExecutionProvider extends EventEmitter {
       conversationId: this.conversationId,
       projectRoot: projectPath,
     });
+    if (repositoryEvidence) mergeRepositoryEvidence(this.activeEvidence, repositoryEvidence);
     let submissionResult = null;
     try {
       const result = await this.client.runTurn({

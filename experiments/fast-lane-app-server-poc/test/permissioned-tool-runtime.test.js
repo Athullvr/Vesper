@@ -39,7 +39,7 @@ test("tool definitions are explicit, and the public runtime exposes only the inv
   const { runtime } = makeRuntime(root);
   t.after(() => runtime.dispose());
   const definitions = runtime.getDefinitions();
-  assert.deepEqual(definitions.map((entry) => entry.id), ["read_file", "list_files", "search_files", "git_status", "git_diff", "git_log", "run_command", "propose_file_change", "apply_file_change"]);
+  assert.deepEqual(definitions.map((entry) => entry.id), ["read_file", "list_files", "search_files", "git_status", "git_diff", "git_log", "git_check_ignore", "run_command", "propose_file_change", "apply_file_change"]);
   assert.equal(definitions.find((entry) => entry.id === "run_command").enabled, false);
   assert.equal(definitions.find((entry) => entry.id === "apply_file_change").enabled, false);
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.properties.path.format, "project-relative-path");
@@ -186,6 +186,33 @@ test("Git inspection is read-only, bounded, and scoped to an in-project reposito
   assert.equal(includeResult.state, "rejected");
   assert.equal(includeResult.error.code, "GIT_SCOPE_REJECTED");
   assert.equal(externalConfigCalls, 0);
+});
+
+test("Git ignore inspection uses only literal project paths and local repository rules", async (t) => {
+  const { root } = fixture(t);
+  fs.mkdirSync(path.join(root, ".git", "objects", "info"), { recursive: true });
+  fs.writeFileSync(path.join(root, ".gitignore"), "secret*\n");
+  fs.writeFileSync(path.join(root, "secret[abc].txt"), "private\n");
+  fs.writeFileSync(path.join(root, "public[abc].txt"), "public\n");
+  const calls = [];
+  const { runtime, sessionId } = makeRuntime(root, {
+    execFileImpl: async (executable, args, options) => {
+      calls.push({ executable, args, options });
+      if (args.includes("rev-parse")) return { stdout: Buffer.from(`${root}\n`) };
+      if (args.includes("check-ignore")) return { stdout: Buffer.from("secret[abc].txt\0") };
+      return { stdout: Buffer.alloc(0) };
+    },
+  });
+  t.after(() => runtime.dispose());
+  const result = await runtime.invoke(request(root, sessionId, "git_check_ignore", { paths: ["secret[abc].txt", "public[abc].txt"] }));
+  assert.equal(result.state, "verified");
+  assert.deepEqual(result.result.ignored, ["secret[abc].txt"]);
+  assert.equal(result.result.checked, 2);
+  const ignoreCall = calls.find((call) => call.args.includes("check-ignore"));
+  assert.ok(ignoreCall.args.includes(":(literal)secret[abc].txt"));
+  assert.ok(ignoreCall.args.includes(":(literal)public[abc].txt"));
+  assert.equal(ignoreCall.options.env.GIT_CONFIG_GLOBAL, "/dev/null");
+  assert.equal(ignoreCall.options.env.GIT_CONFIG_NOSYSTEM, "1");
 });
 
 test("file changes remain proposals until exact one-time approval, then are atomically verified", async (t) => {

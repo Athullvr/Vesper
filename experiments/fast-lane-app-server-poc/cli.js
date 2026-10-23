@@ -33,6 +33,8 @@ const { classifyRequest } = require("./routing-core");
 const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
 const { escapeTerminalOutput, redactSensitiveText } = require("./command-activity");
 const { createPermissionedToolRuntime, renderToolApproval, renderToolDefinitions } = require("./permissioned-tool-runtime");
+const { createRepositoryIntelligence } = require("./repository-intelligence");
+const { createSystemModel, renderSystemModelReport } = require("./system-model");
 
 const USAGE = `Vesper terminal frontend
 
@@ -59,6 +61,7 @@ Usage:
   vesper capabilities configure mcp <NAME> (--stdio <COMMAND> [--arg <ARG> ...] | --url <HTTPS_URL> [--bearer-token-env-var <NAME>])
   vesper capabilities enable|disable <ID> [PROJECT_DIRECTORY]
   vesper plan <TASK> [--project PROJECT_DIRECTORY]
+  vesper inspect [TASK] [--project PROJECT_DIRECTORY]
   vesper tools [list]
   vesper tools status
   vesper tools preview <TOOL_ID> '<JSON>' [--project PROJECT_DIRECTORY]
@@ -72,6 +75,7 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 :new [PROVIDER_ID [MODEL_ID]] to start another session, :providers and :tools to inspect support,
 :capabilities status|show ID to inspect local capability state,
 :plan TASK to preview an advisory plan, :routing to inspect current-session routing counts, and :quit to exit.
+Use :inspect [TASK] for a bounded local repository investigation. It does not call a model or run commands.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
 The tools command inspects or manually invokes the permissioned Vesper tool runtime. Compatible
@@ -151,6 +155,7 @@ function parseArgs(argv) {
   if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
   if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
   if (args[0] === "plan") return parsePlanArgs(args.slice(1));
+  if (args[0] === "inspect") return parseInspectArgs(args.slice(1));
   if (args[0] === "tools") return parseToolsArgs(args.slice(1));
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
@@ -241,6 +246,24 @@ function parsePlanArgs(args) {
     throw new Error("Usage: vesper plan TASK [--project PROJECT_DIRECTORY].");
   }
   return { command: "plan", task, projectDirectory, help: false };
+}
+
+function parseInspectArgs(args) {
+  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command: "inspect", help: true };
+  const rest = [...args];
+  let projectDirectory = null;
+  const projectOption = rest.indexOf("--project");
+  if (projectOption >= 0) {
+    if (projectOption !== rest.length - 2 || !rest[projectOption + 1]) {
+      throw new Error("Usage: vesper inspect [TASK] [--project PROJECT_DIRECTORY].");
+    }
+    projectDirectory = rest[projectOption + 1];
+    rest.splice(projectOption, 2);
+  }
+  if (rest.some((arg) => arg.startsWith("--")) || rest.some((arg) => ["--help", "-h"].includes(arg))) {
+    throw new Error("Usage: vesper inspect [TASK] [--project PROJECT_DIRECTORY].");
+  }
+  return { command: "inspect", task: rest.join(" ").trim(), projectDirectory, help: false };
 }
 
 function parseCapabilityArgs(args) {
@@ -437,12 +460,13 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "inspect" ? "Vesper repository intelligence\n\nUsage:\n  vesper inspect [TASK] [--project PROJECT_DIRECTORY]\n\nInspects bounded local filesystem and Git evidence through the permissioned read-only tool runtime. It does not call a model, run project commands, modify files, or claim a complete call graph.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
   if (options.command === "providers") return runProviders(options, dependencies, output, errorOutput);
   if (options.command === "plan") return runPlan(options, dependencies, output, errorOutput);
+  if (options.command === "inspect") return runInspect(options, dependencies, output, errorOutput);
   if (options.command === "tools") return runTools(options, dependencies, output, errorOutput);
 
   if (options.command === "capabilities") {
@@ -578,6 +602,46 @@ async function runPlan(options, dependencies, output, errorOutput) {
   } catch (error) {
     errorOutput.write(`[Vesper plan error] ${safeTerminalText(error?.message || error)}\n`);
     return 1;
+  }
+}
+
+async function runInspect(options, dependencies, output, errorOutput) {
+  let runtime;
+  let systemModel;
+  const onInterrupt = () => { void systemModel?.interrupt?.(); };
+  try {
+    const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    const sessionId = dependencies.inspectionSessionId || crypto.randomUUID();
+    const runtimeOptions = {
+      projectRoot: cwd,
+      sessionId,
+      commandExecutionEnabled: false,
+      commandWorkspaceWriteEnabled: false,
+    };
+    runtime = typeof dependencies.repositoryToolRuntimeFactory === "function"
+      ? await dependencies.repositoryToolRuntimeFactory(runtimeOptions)
+      : createPermissionedToolRuntime(runtimeOptions);
+    if (!runtime || runtime.sessionId !== sessionId) throw new Error("Vesper could not bind the read-only inspection runtime to its session.");
+    const repositoryIntelligence = createRepositoryIntelligence({
+      toolRuntime: runtime,
+      projectRoot: cwd,
+      sessionId,
+      providerId: null,
+    });
+    systemModel = createSystemModel({ repositoryIntelligence });
+    process.once("SIGINT", onInterrupt);
+    const result = await systemModel.investigate({
+      task: options.task || "",
+      signal: dependencies.signal,
+    });
+    output.write(renderSystemModelReport(result));
+    return result.status === "cancelled" ? 130 : result.status === "unavailable" ? 1 : 0;
+  } catch (error) {
+    errorOutput.write(`[Vesper inspect error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  } finally {
+    process.removeListener("SIGINT", onInterrupt);
+    await runtime?.dispose?.();
   }
 }
 
@@ -895,6 +959,9 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     }
 
     output.write(`Vesper session: ${session.sessionId}\n`);
+    // Schema v1 session fixtures and legacy records predate providerId and
+    // map to the original Codex provider through the session-store adapter.
+    session = { ...session, providerId: session.providerId || DEFAULT_PROVIDER_ID };
     const sessionStatus = resumed ? "resumed" : "new";
     const conversationStatus = providerConversationLabel(session);
     output.write(`Session status: ${sessionStatus} · ${conversationStatus}\n`);
@@ -970,7 +1037,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
     const handleWorkspaceCommand = async (command) => {
       const [name, ...args] = command.trim().split(/\s+/u);
       if (name === ":help" && args.length === 0) {
-        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new [PROVIDER_ID [MODEL_ID]], :providers, :tools, :capabilities [list|status|show ID], :plan TASK, :routing, :quit\n");
+        output.write("Workspace commands: :sessions, :switch SESSION_ID, :new [PROVIDER_ID [MODEL_ID]], :providers, :tools, :capabilities [list|status|show ID], :plan TASK, :inspect [TASK], :routing, :quit\n");
         return true;
       }
       if (name === ":providers" && args.length === 0) {
@@ -1068,7 +1135,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
         await activateSession(selected, "Session switched");
         return true;
       }
-      output.write("Usage: :sessions | :switch SESSION_ID | :new [PROVIDER_ID [MODEL_ID]] | :providers | :tools | :capabilities [list|status|show ID] | :plan TASK | :routing | :help | :quit\n");
+      output.write("Usage: :sessions | :switch SESSION_ID | :new [PROVIDER_ID [MODEL_ID]] | :providers | :tools | :capabilities [list|status|show ID] | :plan TASK | :inspect [TASK] | :routing | :help | :quit\n");
       return true;
     };
 
@@ -1136,6 +1203,7 @@ module.exports = {
   SESSIONS_USAGE,
   USAGE,
   parseArgs,
+  parseInspectArgs,
   resolveProjectDirectory,
   runGitCommand,
   parsePlanArgs,
