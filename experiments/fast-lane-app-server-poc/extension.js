@@ -851,7 +851,7 @@ function selectedProviderForNewSession() {
 function providerDisplayName(providerId) {
   const provider = listProviders().find((entry) => entry.id === providerId);
   const name = provider?.name || safeMessage(providerId || "unknown provider");
-  return isTextOnlyProvider(providerId) ? `${name} (text only)` : name;
+  return isTextOnlyProvider(providerId) ? `${name} (remote model)` : name;
 }
 
 function providerSessionName(providerId) {

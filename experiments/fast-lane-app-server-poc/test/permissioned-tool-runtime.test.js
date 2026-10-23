@@ -646,7 +646,7 @@ test("tools status is an explicit read-only diagnostic and tools list does not p
   assert.doesNotMatch(status.text, /test-secret-must-not-pass/u);
 });
 
-test("OpenAI provider remains text-only and Codex-native approval implementation stays separate", () => {
+test("Chat Completions providers declare no native execution and Codex approval stays separate", () => {
   assert.equal(OPENAI_CAPABILITIES.approvalEvents, false);
   assert.equal(OPENAI_CAPABILITIES.fileChanges, false);
   assert.equal(OPENAI_CAPABILITIES.commandExecutionEvents, false);

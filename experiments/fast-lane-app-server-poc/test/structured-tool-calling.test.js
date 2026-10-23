@@ -137,6 +137,14 @@ test("structured streamed calls assemble fragments, invoke multiple read-only to
     const history = await provider.readConversationHistory();
     assert.ok(history.entries.some((entry) => entry.text.includes("read_file, list_files")));
     assert.equal(requests[0].tool_choice, "auto");
+    const conversationId = result.conversationId;
+    provider.dispose();
+    const resumed = createProvider({ root, project, baseUrl });
+    await resumed.resumeConversation({ projectPath: project, conversationId });
+    const resumedHistory = await resumed.readConversationHistory();
+    assert.ok(resumedHistory.entries.some((entry) => entry.label === "Vesper permissioned tool result"));
+    assert.ok(resumedHistory.entries.some((entry) => entry.text.includes("Local project evidence.")));
+    resumed.dispose();
   } finally {
     await runtime.dispose();
     provider.dispose();
@@ -278,6 +286,53 @@ test("model-requested file changes use the terminal's exact one-time approval an
     assert.ok(proposalId);
   } finally {
     await terminal.toolRuntime.dispose();
+    provider.dispose();
+  }
+});
+
+test("disposing an active provider interrupts a pending tool approval before any file write", async (t) => {
+  const root = temporaryRoot(t);
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const target = path.join(project, "notes.txt");
+  fs.writeFileSync(target, "original\n", "utf8");
+  let requestCount = 0;
+  let approvalStarted;
+  const waitingForApproval = new Promise((resolve) => { approvalStarted = resolve; });
+  const baseUrl = await localServer(t, async (request, response) => {
+    const body = await readJson(request);
+    requestCount += 1;
+    if (requestCount === 1) {
+      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_propose", type: "function", function: {
+        name: "propose_file_change", arguments: JSON.stringify({ path: "notes.txt", content: "changed\n" }),
+      } }] }, finish_reason: "tool_calls" }] }]);
+      return;
+    }
+    const proposal = JSON.parse(body.messages.find((message) => message.role === "tool").content).proposal;
+    sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_apply", type: "function", function: {
+      name: "apply_file_change", arguments: JSON.stringify({ proposalId: proposal.proposalId }),
+    } }] }, finish_reason: "tool_calls" }] }]);
+  });
+  const provider = createProvider({ root, project, baseUrl });
+  const runtime = createPermissionedToolRuntime({
+    projectRoot: project,
+    sessionId: SESSION_ID,
+    approvalHandler: async (_snapshot, { signal } = {}) => new Promise((resolve) => {
+      approvalStarted();
+      signal?.addEventListener("abort", () => resolve("approve-once"), { once: true });
+    }),
+  });
+  provider.setToolRuntime(runtime);
+  try {
+    const task = provider.submitTask({ task: "Change notes.txt.", projectPath: project });
+    await waitingForApproval;
+    provider.dispose();
+    await assert.rejects(task, (error) => error.code === "CONNECTION_LOST");
+    assert.equal(requestCount, 2);
+    assert.equal(fs.readFileSync(target, "utf8"), "original\n");
+    assert.ok(runtime.getAuditEvents().some((event) => event.toolId === "apply_file_change" && event.state === "interrupted"));
+  } finally {
+    await runtime.dispose();
     provider.dispose();
   }
 });

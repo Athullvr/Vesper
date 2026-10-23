@@ -404,18 +404,22 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       throw createExecutionError("UNSUPPORTED_OPERATION", "Vesper could not read the safe tool definitions; no API request was sent.", { providerId: this.id });
     }
     if (!Array.isArray(definitions)) throw createExecutionError("UNSUPPORTED_OPERATION", "The attached Vesper tool runtime returned malformed definitions.", { providerId: this.id });
-    return definitions
-      .filter((entry) => entry && SAFE_TOOL_IDS.has(entry.id) && entry.enabled !== false &&
-        typeof entry.description === "string" && entry.inputSchema && typeof entry.inputSchema === "object")
-      .map((entry) => ({
-        type: "function",
-        function: {
-          name: entry.id,
-          description: entry.description.slice(0, 512),
-          parameters: providerJsonSchema(entry.inputSchema),
-        },
-      }))
-      .slice(0, SAFE_TOOL_IDS.size);
+    try {
+      return definitions
+        .filter((entry) => entry && SAFE_TOOL_IDS.has(entry.id) && entry.enabled !== false &&
+          typeof entry.description === "string" && entry.inputSchema && typeof entry.inputSchema === "object")
+        .map((entry) => ({
+          type: "function",
+          function: {
+            name: entry.id,
+            description: entry.description.slice(0, 512),
+            parameters: providerJsonSchema(entry.inputSchema),
+          },
+        }))
+        .slice(0, SAFE_TOOL_IDS.size);
+    } catch {
+      throw createExecutionError("UNSUPPORTED_OPERATION", "Vesper's permissioned tool definitions are malformed; no API request was sent.", { providerId: this.id });
+    }
   }
 
   async runAgentLoop({ active, taskId, pending, toolDefinitions }) {
@@ -424,6 +428,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     let finishReason = null;
     for (let iteration = 0; iteration <= this.config.maxToolIterations; iteration += 1) {
       if (active.interrupted || active.timedOut || active.disposed) throw new Error("Vesper stopped the provider task.");
+      this.assertAgentTimeRemaining(active);
       const apiMessages = [{ role: "developer", content: DEVELOPER_MESSAGE }, ...transcript];
       const body = {
         model: this.config.modelId,
@@ -496,6 +501,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
         throw submissionUncertain("The compatible API returned neither a supported event stream nor a complete JSON response.", this.id);
       }
       finishReason = completion.finishReason;
+      this.assertAgentTimeRemaining(active);
       if (completion.legacyFunctionCallSeen) {
         this.store.markUncertain(active.conversationId, this.projectPath, taskId, "unsupported");
         throw createExecutionError("UNSUPPORTED_OPERATION", "The provider returned the legacy function_call format. Vesper supports only the structured tool_calls protocol and executed nothing.", { providerId: this.id });
@@ -530,6 +536,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
           const toolName = SAFE_TOOL_IDS.has(call.function.name) ? call.function.name : "unsupported_tool";
           this.emitForTask(active, "tool-call", { toolCallId: call.id, toolId: toolName, state: "requested", iteration: active.toolIterationCount });
           const result = await this.invokeModelTool(call, requestId, active);
+          this.assertAgentTimeRemaining(active);
           transcript.push({ role: "tool", tool_call_id: call.id, content: result.content });
           this.emitForTask(active, "tool-result", {
             toolCallId: call.id,
@@ -551,6 +558,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
         throw submissionUncertain("The provider response ended without a supported completion status.", this.id);
       }
       finalText = completion.text;
+      this.assertAgentTimeRemaining(active);
       const extraMessages = transcript.slice(pending.messages.length);
       const record = this.store.completeTask(active.conversationId, this.projectPath, taskId, finalText, extraMessages);
       this.setConversation(record);
@@ -579,6 +587,14 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     }
     this.markUncertainQuietly(active, "uncertain");
     throw createExecutionError("TASK_FAILED", "Vesper reached its bounded tool-loop limit without a final answer.", { providerId: this.id });
+  }
+
+  assertAgentTimeRemaining(active) {
+    if (Date.now() - active.startedAt < Math.min(this.config.requestTimeoutMs, this.config.maxAgentElapsedMs)) return;
+    active.timedOut = true;
+    active.controller.abort("vesper-agent-timeout");
+    void this.toolRuntime?.interrupt?.();
+    throw submissionUncertain("Vesper reached the configured agent time limit before confirming completion; it will not resubmit the task.", this.id);
   }
 
   async invokeModelTool(call, requestId, active) {
@@ -666,6 +682,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     if (active) {
       active.disposed = true;
       active.controller.abort("vesper-dispose");
+      try { this.toolRuntime?.interrupt?.(); } catch { /* Provider shutdown must still complete. */ }
       if (active.reader) void active.reader.cancel().catch(() => undefined);
     }
     this.emitEvent("connection-state", { state: "closed" });
