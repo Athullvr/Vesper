@@ -601,6 +601,8 @@ test("terminal approval choices reach the app-server and its outcome controls co
         };
         let frontend;
         const { client } = createClient(server, { onApproval: (name, params, context) => frontend.requestApproval(name, params, context) });
+        const approvalDecisions = [];
+        client.on("progress", (event) => { if (event.type === "approval_decided") approvalDecisions.push(event); });
         t.after(() => client.dispose());
         const answers = ["Inspect this repository", answer, ":quit"];
         let text = "";
@@ -622,6 +624,13 @@ test("terminal approval choices reach the app-server and its outcome controls co
           assert.deepEqual(response, { permissions: answer === "yes" ? { network: { enabled: true } } : {}, scope: "turn" });
         } else {
           assert.deepEqual(response, { decision: answer === "yes" ? "accept" : answer === "cancel" ? "cancel" : "decline" });
+        }
+        if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+          assert.equal(approvalDecisions.length, 1);
+          assert.equal(approvalDecisions[0].method, method);
+          assert.equal(approvalDecisions[0].status, answer === "yes" ? "approved" : answer === "cancel" ? "cancelled" : "declined");
+        } else {
+          assert.equal(approvalDecisions.length, 0, "permission profile responses are not normalized as approval choices");
         }
         assert.match(text, /Codex approval required/u);
         assert.match(text, /Approval choice:/u);
@@ -958,6 +967,15 @@ test("file snapshots and pending answers cannot survive disconnect and same-thre
   assert.equal(second.requests.find((message) => message.method === "thread/resume").params.threadId, "saved-thread");
   fileItem(second, { threadId: "saved-thread" });
   assert.deepEqual(await fileRequest(second, "fresh-after-resume", { threadId: "saved-thread" }), { decision: "accept" });
+  assert.deepEqual(await fileRequest(second, "stale-turn-approval", {
+    threadId: "saved-thread", turnId: "stale-turn", itemId: "stale-item", approvalId: "stale-approval",
+  }), { decision: "decline" });
+  const safetyDecline = progress.find((event) => event.type === "file_approval_declined" && event.approvalId === "stale-approval");
+  assert.deepEqual({
+    conversationId: safetyDecline?.conversationId,
+    taskId: safetyDecline?.taskId,
+    itemId: safetyDecline?.itemId,
+  }, { conversationId: "saved-thread", taskId: "stale-turn", itemId: "stale-item" });
   second.send({ method: "turn/completed", params: { threadId: "saved-thread", turn: { id: "turn-1", status: "completed" } } });
   assert.deepEqual(await recovered, { status: "completed" });
 });

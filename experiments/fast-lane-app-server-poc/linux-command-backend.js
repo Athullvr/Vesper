@@ -1,7 +1,4 @@
-/
-
-
-\"use strict";
+"use strict";
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");

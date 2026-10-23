@@ -23,7 +23,10 @@ test("VS Code keeps local routing local and persists only the Vesper session and
   assert.equal(harness.store().findLatestByCwd(project), null);
 
   await panel.send({ type: "submit", text: "Explain a rebase in one sentence." });
-  assert.equal(panel.all("assistant-delta").map((message) => message.text).join(""), "Answer 1.");
+  const assistantText = panel.all("assistant-delta").map((message) => message.text).join("");
+  assert.ok(assistantText.startsWith("Answer 1."));
+  assert.match(assistantText, /Vesper execution evidence[\s\S]*Provider: codex-app-server[\s\S]*Provider task: turn-1/u);
+  assert.match(assistantText, /Codex reported that the turn completed/u);
   assert.equal(panel.all("assistant-done").length, 1);
   const session = harness.store().findLatestByCwd(project);
   assert.ok(session?.sessionId);

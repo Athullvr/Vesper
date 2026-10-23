@@ -352,7 +352,13 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       toolCallCount: 0,
       toolIterationCount: 0,
       changedFiles: false,
-      evidence: createTaskEvidence(),
+      evidence: createTaskEvidence({
+        providerId: this.id,
+        sessionId: this.toolRuntime?.sessionId,
+        conversationId: this.conversationId,
+        taskId,
+        projectRoot: this.projectPath,
+      }),
     };
     this.active = active;
     active.timer = setTimeout(() => {

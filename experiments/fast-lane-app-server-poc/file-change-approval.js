@@ -105,6 +105,7 @@ class FileChangeApprovalStore {
       turnId: params.turnId,
       itemId,
       number: previous?.number || this.nextNumber++,
+      sourceEventType: method,
       snapshot,
       terminal,
       requested: previous?.requested || false,
@@ -158,6 +159,7 @@ class FileChangeApprovalStore {
       itemId: entry.itemId,
       number: entry.number,
       state: entry.state,
+      sourceEventType: entry.sourceEventType,
       changes: Object.freeze(changes),
       incomplete: entry.state === "invalidated" || changes.some((change) => change.addedLines === null),
     });

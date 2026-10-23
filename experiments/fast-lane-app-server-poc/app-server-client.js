@@ -461,8 +461,16 @@ class AppServerClient extends EventEmitter {
     };
     const declineFileChange = (reason) => {
       if (this.child !== child || !child) return;
-      respond({ id, result: defaultApproval(method) });
-      if (this.activeTurn === active) this.emit("progress", { type: "file_approval_declined", reason });
+      const sent = respond({ id, result: defaultApproval(method) });
+      if (!sent) return;
+      if (this.activeTurn === active) this.emit("progress", {
+        type: "file_approval_declined",
+        reason,
+        ...(isSafeProtocolIdentity(params.threadId || params.conversationId) ? { conversationId: params.threadId || params.conversationId } : {}),
+        ...(isSafeProtocolIdentity(params.turnId) ? { taskId: params.turnId } : {}),
+        ...(isSafeProtocolIdentity(params.itemId) ? { itemId: params.itemId } : {}),
+        ...(isSafeProtocolIdentity(params.approvalId) ? { approvalId: params.approvalId } : {}),
+      });
     };
     try {
       if (!isApprovalMethod(method)) {
@@ -515,7 +523,7 @@ class AppServerClient extends EventEmitter {
       }
       const safeResult = validateApprovalResult(method, result);
       const sent = respond({ id, result: safeResult });
-      if (sent && method === "item/commandExecution/requestApproval") {
+      if (sent && (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval")) {
         const status = safeResult.decision === "accept" ? "approved" : safeResult.decision === "cancel" ? "cancelled" : "declined";
         this.emit("progress", { type: "approval_decided", method, params, status });
       }

@@ -7,6 +7,7 @@ const {
   hasSuccessfulInspection,
   hasEvidenceBackedPlan,
   recordTaskToolOutcome,
+  recordProviderExecutionEvent,
   renderTaskEvidenceReport,
   renderEvidenceInstructions,
 } = require("../task-evidence");
@@ -73,4 +74,94 @@ test("stale approval or failed verification is reported as unverified and never 
   assert.match(report, /apply_file_change: uncertain \(WRITE_VERIFICATION_FAILED\)/u);
   assert.doesNotMatch(report, /Applied and verified by Vesper read-back/u);
   assert.match(renderEvidenceInstructions(evidence), /Never claim tests or builds passed/u);
+});
+
+test("provider-native evidence is bounded, correlated, deduplicated, and keeps provider-reported status separate from verification", () => {
+  const evidence = createTaskEvidence({
+    providerId: "codex-app-server",
+    sessionId: "session-1",
+    conversationId: "thread-1",
+    projectRoot: "/repo",
+  });
+  const taskStart = { type: "task-started", fields: { conversationId: "thread-1", taskId: "turn-1" }, sourceEventType: "turn/started" };
+  assert.equal(recordProviderExecutionEvent(evidence, taskStart), true);
+  assert.equal(recordProviderExecutionEvent(evidence, taskStart), true);
+
+  const commandStarted = {
+    type: "command-activity",
+    sourceEventType: "item/started",
+    fields: { update: { type: "state", activity: {
+      threadId: "thread-1", turnId: "turn-1", itemId: "item-command", cwd: "/repo/src", executionStatus: "inProgress",
+    } } },
+  };
+  recordProviderExecutionEvent(evidence, commandStarted);
+  recordProviderExecutionEvent(evidence, commandStarted);
+  recordProviderExecutionEvent(evidence, {
+    type: "command-activity",
+    sourceEventType: "item/completed",
+    fields: { update: { type: "state", activity: {
+      threadId: "thread-1", turnId: "turn-1", itemId: "item-command", cwd: "/repo/src", executionStatus: "completed",
+      exitCodeAvailable: true, exitCode: 0,
+    } } },
+  });
+  recordProviderExecutionEvent(evidence, {
+    type: "file-change", sourceEventType: "file_change_activity",
+    fields: { activity: { threadId: "thread-1", turnId: "turn-1", itemId: "item-file", state: "pending", changes: [{ path: "src/main.js" }] } },
+  });
+  recordProviderExecutionEvent(evidence, {
+    type: "file-change", sourceEventType: "file_change_activity",
+    fields: { activity: { threadId: "thread-1", turnId: "turn-1", itemId: "item-file", state: "completed", changes: [] } },
+  });
+  recordProviderExecutionEvent(evidence, {
+    type: "approval-required", sourceEventType: "item/commandExecution/requestApproval",
+    fields: { request: { type: "command", conversationId: "thread-1", taskId: "turn-1", itemId: "item-command", approvalId: "approval-1" } },
+  });
+  recordProviderExecutionEvent(evidence, {
+    type: "approval-decided", sourceEventType: "item/commandExecution/requestApproval",
+    fields: { operation: "command", conversationId: "thread-1", taskId: "turn-1", itemId: "item-command", approvalId: "approval-1", status: "approved" },
+  });
+  recordProviderExecutionEvent(evidence, {
+    type: "approval-required", sourceEventType: "item/commandExecution/requestApproval",
+    fields: { request: { type: "command", conversationId: "thread-1", taskId: "turn-1", itemId: "item-command", approvalId: "approval-2" } },
+  });
+  assert.equal(recordProviderExecutionEvent(evidence, {
+    type: "command-activity",
+    fields: { update: { type: "state", activity: { threadId: "thread-1", turnId: "turn-old", itemId: "stale", executionStatus: "completed" } } },
+  }), false);
+
+  assert.equal(evidence.providerEvents.length, 5);
+  const command = evidence.providerEvents.find((entry) => entry.category === "command");
+  assert.equal(command.state, "completed");
+  assert.equal(command.exitCode, 0);
+  assert.equal(command.independentlyVerified, false);
+  assert.deepEqual(command.paths, ["src"]);
+  const fileChange = evidence.providerEvents.find((entry) => entry.category === "file-change");
+  assert.equal(fileChange.state, "unverified");
+  assert.deepEqual(fileChange.paths, ["src/main.js"]);
+  assert.equal(evidence.providerEvents.find((entry) => entry.category === "approval").state, "approved");
+  assert.equal(evidence.providerEvents.filter((entry) => entry.category === "approval").length, 2);
+
+  const report = renderTaskEvidenceReport(evidence);
+  assert.match(report, /Provider: codex-app-server/u);
+  assert.match(report, /Vesper session: session-1/u);
+  assert.match(report, /codex-app-server command item item-command in working directory `src`: completed/u);
+  assert.match(report, /exit code 0/u);
+  assert.match(report, /not independently verify/u);
+  assert.match(report, /file-change item item-file for `src\/main\.js`: unverified/u);
+  assert.match(report, /command approval item item-command approval approval-1: approved/u);
+  assert.doesNotMatch(report, /\/repo/u);
+});
+
+test("provider evidence from one task or Vesper session cannot enter another ledger", () => {
+  const first = createTaskEvidence({ providerId: "codex-app-server", sessionId: "session-one", conversationId: "thread-one" });
+  const second = createTaskEvidence({ providerId: "codex-app-server", sessionId: "session-two", conversationId: "thread-two" });
+  const staleEvent = {
+    type: "task-state", fields: { conversationId: "thread-one", taskId: "turn-one", state: "completed" },
+  };
+  assert.equal(recordProviderExecutionEvent(first, staleEvent), true);
+  assert.equal(recordProviderExecutionEvent(second, staleEvent), false);
+  assert.equal(first.providerEvents.length, 1);
+  assert.equal(second.providerEvents.length, 0);
+  assert.match(renderTaskEvidenceReport(second), /Vesper session: session-two/u);
+  assert.doesNotMatch(renderTaskEvidenceReport(second), /thread-one|turn-one/u);
 });

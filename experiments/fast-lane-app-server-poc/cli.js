@@ -915,6 +915,7 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       const providerOptions = {
         providerId,
         environment,
+        sessionId: selectedSession.sessionId,
         ...(selectedSession.modelId ? { modelId: selectedSession.modelId } : {}),
         onConversationId: async (conversationId) => {
           const updated = store.update(selectedSession.sessionId, {

@@ -10,6 +10,7 @@ const {
   createExecutionEvent,
   unsupportedOperation,
 } = require("./execution-interface");
+const { createTaskEvidence, recordProviderExecutionEvent, renderTaskEvidenceReport } = require("./task-evidence");
 
 const CODEX_PROVIDER_ID = "codex-app-server";
 const MAX_TEXT_EVENT_LENGTH = 32 * 1024;
@@ -26,11 +27,13 @@ const CODEX_CAPABILITIES = Object.freeze({
 });
 
 class CodexExecutionProvider extends EventEmitter {
-  constructor({ client, clientOptions, clientFactory = createDefaultAppServerClient, approvalHandler = null } = {}) {
+  constructor({ client, clientOptions, clientFactory = createDefaultAppServerClient, approvalHandler = null, sessionId = null } = {}) {
     super();
     this.id = CODEX_PROVIDER_ID;
     this.capabilities = CODEX_CAPABILITIES;
     this.approvalHandler = approvalHandler;
+    this.sessionId = safeIdentity(sessionId);
+    this.activeEvidence = null;
     this.disposed = false;
     this.connectionInitialized = false;
     this.commandActivity = new CommandActivityStore();
@@ -144,8 +147,16 @@ class CodexExecutionProvider extends EventEmitter {
       throw createExecutionError("INVALID_REQUEST", "A project directory is required.", { providerId: this.id });
     }
     if (typeof this.client.runTurn !== "function") throw unsupportedOperation(this.id, "submit task");
+    if (this.activeEvidence) throw createExecutionError("TASK_FAILED", "Codex already has an active task; wait for it to finish before submitting another.", { providerId: this.id });
 
     this.commandActivity = new CommandActivityStore();
+    this.activeEvidence = createTaskEvidence({
+      providerId: this.id,
+      sessionId: this.sessionId,
+      conversationId: this.conversationId,
+      projectRoot: projectPath,
+    });
+    let submissionResult = null;
     try {
       const result = await this.client.runTurn({
         prompt: task,
@@ -159,12 +170,43 @@ class CodexExecutionProvider extends EventEmitter {
       else {
         throw createExecutionError("TASK_FAILED", "The provider did not confirm a successful task completion.", { providerId: this.id });
       }
-      return Object.freeze({ status });
+      submissionResult = { status };
+      return submissionResult;
     } catch (error) {
       const normalized = mapProviderError(error, "TASK_FAILED");
       const state = normalized.code === "TASK_INTERRUPTED" ? "interrupted" : "failed";
-      this.emitEvent("task-state", { state, errorCode: normalized.code, conversationId: this.conversationId });
+      this.emitEvent("task-state", {
+        state,
+        errorCode: normalized.code,
+        conversationId: this.conversationId,
+        taskId: this.activeEvidence?.context.taskId,
+        sourceEventType: "codex.submitTask.result",
+      });
       throw normalized;
+    } finally {
+      const evidence = this.activeEvidence;
+      if (evidence) {
+        const report = renderTaskEvidenceReport(evidence);
+        this.emitEvent("task-progress", {
+          kind: "workflow-stage",
+          stage: "report",
+          sessionId: evidence.context.sessionId,
+          conversationId: evidence.context.conversationId,
+          taskId: evidence.context.taskId,
+        });
+        this.emitEvent("task-progress", {
+          kind: "workflow-report",
+          report,
+          sessionId: evidence.context.sessionId,
+          conversationId: evidence.context.conversationId,
+          taskId: evidence.context.taskId,
+        });
+        if (submissionResult) {
+          submissionResult.evidenceReport = report;
+          Object.freeze(submissionResult);
+        }
+        this.activeEvidence = null;
+      }
     }
   }
 
@@ -208,7 +250,7 @@ class CodexExecutionProvider extends EventEmitter {
     if (request.type === "command") {
       this.emitCommandUpdates(this.commandActivity.applyApproval(approvalActivityParams(request), "requested"));
     }
-    this.emitEvent("approval-required", { request: publicApprovalRequest(request) });
+    this.emitEvent("approval-required", { request: publicApprovalRequest(request), sourceEventType: method });
     if (typeof this.approvalHandler !== "function") return codexApprovalResponse(method, "decline", params);
     let choice = "decline";
     try {
@@ -244,37 +286,48 @@ class CodexExecutionProvider extends EventEmitter {
         this.emitEvent("conversation-state", { state: "resumed", conversationId });
         break;
       case "turn_started":
-        this.emitEvent("task-started", { conversationId, taskId });
+        this.emitEvent("task-started", { conversationId, taskId, sourceEventType: "turn/start" });
         break;
       case "turn_identity": {
         const activityUpdates = this.commandActivity.bindTurn(conversationId, taskId);
         this.emitEvent("task-identity", {
           conversationId,
           taskId,
+          sourceEventType: "turn/start",
         });
         for (const activity of boundedArray(event.fileChanges, 64)) {
-          this.emitEvent("file-change", { activity: boundedObject(activity) });
+          this.emitEvent("file-change", {
+            activity: boundedObject(activity),
+            sourceEventType: activity?.sourceEventType || "turn/start.fileChanges",
+          });
         }
-        if (activityUpdates.length) this.emitCommandUpdates(activityUpdates);
+        if (activityUpdates.length) this.emitCommandUpdates(activityUpdates, "turn/start");
         break;
       }
       case "turn_status":
-        this.emitCommandUpdates(this.commandActivity.setTurnStatus(conversationId, taskId, event.status));
-        this.emitEvent("task-state", { state: mapTurnState(event.status), conversationId, taskId });
+        this.emitCommandUpdates(this.commandActivity.setTurnStatus(conversationId, taskId, event.status), "turn/completed");
+        this.emitEvent("task-state", { state: mapTurnState(event.status), conversationId, taskId, sourceEventType: "turn/completed" });
         break;
       case "approval_requested":
         // The separately normalized approval-required event is emitted by the
         // approval callback. The protocol payload is deliberately discarded.
         break;
       case "approval_decided":
-        this.emitCommandUpdates(this.commandActivity.applyApproval(event.params, event.status));
-        this.emitEvent("approval-decided", normalizeApprovalActivity(event.params, event.status));
+        this.emitCommandUpdates(this.commandActivity.applyApproval(event.params, event.status), event.method || "approval.response");
+        this.emitEvent("approval-decided", {
+          ...normalizeApprovalActivity(event.params, event.status, event.method),
+          operation: approvalType(event.method),
+          sourceEventType: event.method || "approval.response",
+        });
         break;
       case "codex_progress":
         this.handleCodexProgress(event.method, event.params);
         break;
       case "file_change_activity":
-        this.emitEvent("file-change", { activity: boundedObject(event.activity) });
+        this.emitEvent("file-change", {
+          activity: boundedObject(event.activity),
+          sourceEventType: event.activity?.sourceEventType || "file_change_activity",
+        });
         break;
       case "turn_diff_activity":
       case "turn_diff_updated":
@@ -285,16 +338,25 @@ class CodexExecutionProvider extends EventEmitter {
         });
         break;
       case "turn_timed_out":
-        this.emitEvent("task-state", { state: "timed-out", conversationId });
+        this.emitEvent("task-state", { state: "timed-out", conversationId, taskId: this.activeEvidence?.context.taskId, sourceEventType: "turn.timeout" });
         break;
       case "disconnected":
         this.connectionInitialized = false;
-        this.emitEvent("connection-lost", { message: "Codex app-server connection was lost.", conversationId });
+        this.emitEvent("connection-lost", { message: "Codex app-server connection was lost.", conversationId, taskId: this.activeEvidence?.context.taskId, sourceEventType: "app-server.disconnected" });
         break;
       case "interrupt_requested":
         this.emitEvent("interrupt-requested", { accepted: true, conversationId });
         break;
       case "file_approval_declined":
+        this.emitEvent("approval-decided", {
+          operation: "file-change",
+          conversationId: safeIdentity(event.conversationId),
+          taskId: safeIdentity(event.taskId),
+          itemId: safeIdentity(event.itemId),
+          approvalId: safeIdentity(event.approvalId),
+          status: "declined",
+          sourceEventType: "app-server.file_approval_declined",
+        });
         this.emitEvent("task-progress", { kind: "approval-declined", message: "A file-change request could not be safely approved." });
         break;
       default:
@@ -304,7 +366,7 @@ class CodexExecutionProvider extends EventEmitter {
 
   handleCodexProgress(method, params) {
     if (method === "item/started" || method === "item/completed" || method === "item/commandExecution/outputDelta") {
-      this.emitCommandUpdates(this.commandActivity.applyProtocolNotification(method, params));
+      this.emitCommandUpdates(this.commandActivity.applyProtocolNotification(method, params), method);
       return;
     }
     if (method === "turn/plan/updated" || method === "item/mcpToolCall/progress") {
@@ -312,8 +374,10 @@ class CodexExecutionProvider extends EventEmitter {
     }
   }
 
-  emitCommandUpdates(updates) {
-    for (const update of boundedArray(updates, 100)) this.emitEvent("command-activity", { update: boundedObject(update) });
+  emitCommandUpdates(updates, sourceEventType = "command-activity") {
+    for (const update of boundedArray(updates, 100)) {
+      this.emitEvent("command-activity", { update: boundedObject(update), sourceEventType });
+    }
   }
 
   emitText(value) {
@@ -326,6 +390,13 @@ class CodexExecutionProvider extends EventEmitter {
 
   emitEvent(type, fields = {}) {
     if (this.disposed) return;
+    if (this.activeEvidence) {
+      recordProviderExecutionEvent(this.activeEvidence, {
+        type,
+        fields,
+        sourceEventType: fields.sourceEventType,
+      });
+    }
     const event = createExecutionEvent(type, { providerId: this.id, ...fields });
     this.emit("event", event);
   }
@@ -395,12 +466,13 @@ function approvalActivityParams(request) {
   };
 }
 
-function normalizeApprovalActivity(params = {}, status) {
+function normalizeApprovalActivity(params = {}, status, method) {
   return {
     conversationId: safeIdentity(params.threadId),
     taskId: safeIdentity(params.turnId),
     itemId: safeIdentity(params.itemId),
     approvalId: safeIdentity(params.approvalId),
+    operation: approvalType(method),
     command: safeField(params.command, MAX_COMMAND_LENGTH, true),
     cwd: safeField(params.cwd, MAX_CWD_LENGTH, false),
     status: ["approved", "declined", "cancelled"].includes(status) ? status : "declined",

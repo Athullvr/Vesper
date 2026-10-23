@@ -497,6 +497,7 @@ function executionProviderForSession(session, cwd, generation) {
   const providerOptions = {
     providerId: session.providerId,
     environment: process.env,
+    sessionId,
     ...(session.modelId ? { modelId: session.modelId } : {}),
     onConversationId: async (conversationId) => {
       const latest = sessionStore.load(sessionId);

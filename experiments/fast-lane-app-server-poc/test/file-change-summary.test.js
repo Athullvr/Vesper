@@ -32,6 +32,7 @@ test("matching cached evidence produces immutable, identity-scoped summaries wit
     itemId: "file-1",
     number: 1,
     state: "updated",
+    sourceEventType: "item/fileChange/patchUpdated",
     changes: [{ path: "/workspace/example.txt", pathTruncated: false, kind: "update", movePath: null, movePathTruncated: false, addedLines: 1, removedLines: 1 }],
     incomplete: false,
   });
