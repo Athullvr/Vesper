@@ -5,6 +5,7 @@ const { redactSensitiveText } = require("./command-activity");
 
 const MAX_EVIDENCE_ENTRIES = 32;
 const MAX_EVIDENCE_PATHS = 16;
+const MAX_REPOSITORY_FINDINGS = 48;
 const MAX_REPORT_LENGTH = 8_192;
 const MAX_PROVIDER_EVENTS = 64;
 const NORMALIZED_EVENT_SOURCES = new Set([
@@ -39,7 +40,7 @@ function createTaskEvidence({ providerId = null, sessionId = null, conversationI
 }
 
 function recordRepositoryFinding(evidence, finding = {}) {
-  if (!evidence || !Array.isArray(evidence.findings) || evidence.findings.length >= MAX_EVIDENCE_ENTRIES) return false;
+  if (!evidence || !Array.isArray(evidence.findings) || evidence.findings.length >= MAX_REPOSITORY_FINDINGS) return false;
   const type = safeToken(finding.type, 40);
   const description = safeDescription(finding.description, 320);
   const source = safeToken(finding.source, 80);
@@ -49,6 +50,7 @@ function recordRepositoryFinding(evidence, finding = {}) {
     type,
     description,
     ...(normalizedPath ? { path: normalizedPath } : {}),
+    ...(safeRelativePath(finding.relatedPath) ? { relatedPath: safeRelativePath(finding.relatedPath) } : {}),
     ...(Number.isInteger(finding.lineStart) && finding.lineStart > 0 ? { lineStart: finding.lineStart } : {}),
     ...(Number.isInteger(finding.lineEnd) && finding.lineEnd >= (finding.lineStart || 1) ? { lineEnd: finding.lineEnd } : {}),
     ...(safeDescription(finding.symbol, 120) ? { symbol: safeDescription(finding.symbol, 120) } : {}),
@@ -57,6 +59,7 @@ function recordRepositoryFinding(evidence, finding = {}) {
     observation: finding.observation === "inferred" ? "inferred" : "observed",
     status: ["confirmed", "incomplete", "stale", "contradictory", "unknown"].includes(finding.status) ? finding.status : "confirmed",
     ...(safeToken(finding.commit, 40) ? { commit: safeToken(finding.commit, 40) } : {}),
+    ...(Number.isInteger(finding.depth) && finding.depth >= 1 && finding.depth <= 8 ? { depth: finding.depth } : {}),
     observedAt: safeTimestamp(finding.observedAt) || new Date().toISOString(),
   };
   const key = findingKey(entry);
@@ -74,7 +77,7 @@ function mergeRepositoryEvidence(target, source) {
     addBoundedUnique(target.inspections, entry, (item) => `${item.kind}:${item.path || ""}`);
   }
   if (target.inspections.length > MAX_EVIDENCE_PATHS) target.inspections.length = MAX_EVIDENCE_PATHS;
-  for (const finding of Array.isArray(source.findings) ? source.findings.slice(0, MAX_EVIDENCE_ENTRIES) : []) recordRepositoryFinding(target, finding);
+  for (const finding of Array.isArray(source.findings) ? source.findings.slice(0, MAX_REPOSITORY_FINDINGS) : []) recordRepositoryFinding(target, finding);
   if (source.investigation && typeof source.investigation === "object") {
     const status = ["complete", "partial", "unavailable", "cancelled"].includes(source.investigation.status)
       ? source.investigation.status : "partial";
@@ -83,6 +86,17 @@ function mergeRepositoryEvidence(target, source) {
       ...(safeToken(source.investigation.intent, 40) ? { intent: safeToken(source.investigation.intent, 40) } : {}),
       ...(safeDescription(source.investigation.note, 240) ? { note: safeDescription(source.investigation.note, 240) } : {}),
       ...(safeTimestamp(source.investigation.observedAt) ? { observedAt: safeTimestamp(source.investigation.observedAt) } : {}),
+      ...(Array.isArray(source.investigation.steps) ? { steps: normalizeInvestigationSteps(source.investigation.steps) } : {}),
+      ...(Array.isArray(source.investigation.unresolved) ? { unresolved: source.investigation.unresolved.slice(0, 12).map((item) => safeDescription(item, 240)).filter(Boolean) } : {}),
+      ...(source.investigation.remainingBudget && typeof source.investigation.remainingBudget === "object" ? {
+        remainingBudget: {
+          operations: boundedInteger(source.investigation.remainingBudget.operations, 0, MAX_EVIDENCE_ENTRIES),
+          targetedReads: boundedInteger(source.investigation.remainingBudget.targetedReads, 0, 5),
+          milliseconds: boundedInteger(source.investigation.remainingBudget.milliseconds, 0, 10_000),
+          sourceBytes: boundedInteger(source.investigation.remainingBudget.sourceBytes, 0, 512 * 1024),
+        },
+      } : {}),
+      ...(safeToken(source.investigation.stopReason, 60) ? { stopReason: safeToken(source.investigation.stopReason, 60) } : {}),
     };
   }
   return true;
@@ -342,7 +356,7 @@ function safeDescription(value, maximum) {
 }
 
 function findingKey(entry) {
-  return `${entry.type}:${entry.path || ""}:${entry.lineStart || ""}:${entry.symbol || ""}:${entry.description}`;
+  return `${entry.type}:${entry.path || ""}:${entry.relatedPath || ""}:${entry.lineStart || ""}:${entry.symbol || ""}:${entry.description}`;
 }
 
 function safeSourceEventType(value) {
@@ -354,6 +368,49 @@ function safeTimestamp(value) {
   return typeof value === "string" && value.length <= 40 && Number.isFinite(Date.parse(value))
     ? new Date(value).toISOString()
     : null;
+}
+
+function boundedInteger(value, minimum, maximum) {
+  return Number.isInteger(value) ? Math.min(maximum, Math.max(minimum, value)) : 0;
+}
+
+function normalizeInvestigationSteps(steps) {
+  return steps.slice(0, MAX_EVIDENCE_ENTRIES).flatMap((step, index) => {
+    if (!step || typeof step !== "object" || Array.isArray(step)) return [];
+    const toolId = safeToken(step.operation?.toolId, 80);
+    if (!toolId) return [];
+    const rawInput = step.operation?.input && typeof step.operation.input === "object" ? step.operation.input : {};
+    const input = {};
+    if (safeRelativePath(rawInput.path)) input.path = safeRelativePath(rawInput.path);
+    if (Number.isInteger(rawInput.pathCount)) input.pathCount = boundedInteger(rawInput.pathCount, 0, 100);
+    if (Array.isArray(rawInput.samplePaths)) input.samplePaths = uniquePaths(rawInput.samplePaths).slice(0, 4);
+    if (Number.isInteger(rawInput.limit)) input.limit = boundedInteger(rawInput.limit, 0, 20);
+    if (Number.isInteger(rawInput.maxBytes)) input.maxBytes = boundedInteger(rawInput.maxBytes, 1, 128 * 1024);
+    if (Number.isInteger(rawInput.queryLength)) input.queryLength = boundedInteger(rawInput.queryLength, 0, 512);
+    const result = step.result && typeof step.result === "object" ? step.result : {};
+    const refs = Array.isArray(result.evidenceRefs) ? result.evidenceRefs.slice(0, 8).flatMap((item) => {
+      const relative = safeRelativePath(item?.path);
+      const type = safeToken(item?.type, 40);
+      if (!relative || !type) return [];
+      return [{ type, path: relative,
+        ...(Number.isInteger(item.lineStart) && item.lineStart > 0 ? { lineStart: item.lineStart } : {}),
+        ...(Number.isInteger(item.lineEnd) && item.lineEnd >= (item.lineStart || 1) ? { lineEnd: item.lineEnd } : {}) }];
+    }) : [];
+    return [{
+      index: boundedInteger(step.index, 1, MAX_EVIDENCE_ENTRIES) || index + 1,
+      operation: { toolId, input },
+      purpose: safeDescription(step.purpose, 180) || "Read-only investigation operation.",
+      requiredInputs: Array.isArray(step.requiredInputs) ? step.requiredInputs.map((item) => safeToken(item, 40)).filter(Boolean).slice(0, 8) : [],
+      expectedEvidence: safeDescription(step.expectedEvidence, 120) || "Bounded project evidence.",
+      state: safeToken(step.state, 40) || "unknown",
+      result: {
+        state: safeToken(result.state, 40) || "unknown",
+        verified: result.verified === true,
+        summary: safeDescription(result.summary, 180) || "Operation result unavailable.",
+        evidenceRefs: refs,
+      },
+    }];
+  });
 }
 
 function hasSuccessfulInspection(evidence) {
@@ -461,7 +518,15 @@ function renderTaskEvidenceReport(evidence) {
   if (evidence?.investigation && typeof evidence.investigation === "object") {
     lines.push(`Repository investigation: ${safeToken(evidence.investigation.status, 40) || "partial"}${evidence.investigation.observedAt ? ` · observed ${safeTimestamp(evidence.investigation.observedAt) || "time unavailable"}` : ""}${evidence.investigation.note ? ` · ${safeDescription(evidence.investigation.note, 240)}` : ""}.`);
   }
-  const findings = Array.isArray(evidence?.findings) ? evidence.findings.slice(0, 16) : [];
+  const investigation = evidence?.investigation && typeof evidence.investigation === "object" ? evidence.investigation : null;
+  if (investigation?.stopReason) lines.push("Investigation stopped: " + (safeToken(investigation.stopReason, 60) || "unknown") + ".");
+  for (const step of (investigation?.steps || []).slice(0, 8)) {
+    const target = step.operation?.input?.path ? " " + formatPath(step.operation.input.path) : "";
+    lines.push("- Step " + step.index + ": " + (safeToken(step.operation?.toolId, 80) || "read-only operation") + target +
+      " (" + (safeToken(step.state, 40) || "unknown") + "): " + (safeDescription(step.result?.summary, 180) || "result unavailable"));
+  }
+  for (const note of (investigation?.unresolved || []).slice(0, 5)) lines.push("- Unresolved: " + safeDescription(note, 240));
+  const findings = Array.isArray(evidence?.findings) ? evidence.findings.slice(0, 20) : [];
   if (findings.length) {
     lines.push("Repository findings:");
     for (const finding of findings) {
@@ -571,6 +636,7 @@ module.exports = {
   recordRepositoryFinding,
   mergeRepositoryEvidence,
   MAX_EVIDENCE_ENTRIES,
+  MAX_REPOSITORY_FINDINGS,
   MAX_PROVIDER_EVENTS,
   MAX_REPORT_LENGTH,
 };

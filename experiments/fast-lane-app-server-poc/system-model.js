@@ -25,9 +25,13 @@ class SystemModelCoordinator {
         intent,
         includeHistory: intent !== "overview" || Boolean(task),
         includeDiff: ["bug", "feature", "change-plan"].includes(intent),
+        selectNextStep: (snapshot) => this.selectNextStep(snapshot),
         signal,
       });
       const findings = evidence.findings || [];
+      const steps = evidence.evidence?.investigation?.steps || [];
+      const unresolved = [...(evidence.evidence?.investigation?.unresolved || [])];
+      const dependencyTrace = buildDependencyTrace(findings);
       const observedPaths = [...new Set(findings.filter((item) => item.path).map((item) => item.path))].slice(0, 12);
       const inferred = findings.filter((item) => item.observation === "inferred");
       const assumptions = [];
@@ -42,20 +46,28 @@ class SystemModelCoordinator {
         .filter((item) => /^(?:test|test:|build)$/u.test(item.name))
         .map((item) => `${item.name}: ${item.command} (identified from ${item.path}; not run)`))].slice(0, 8);
       if (!verificationRequirements.length) verificationRequirements.push("Choose and run the appropriate project verification explicitly; Vesper did not execute commands during inspection.");
-      const hasTaskMatch = findings.some((item) => ["symbol", "reference", "path-match", "execution-path"].includes(item.type));
-      const additionalInspectionRecommended = evidence.status !== "complete" || (["trace", "bug", "change-plan"].includes(intent) && !hasTaskMatch);
+      const hasTaskMatch = findings.some((item) => ["symbol", "reference", "path-match", "import-edge"].includes(item.type));
+      if (["trace", "bug", "change-plan"].includes(intent) && !hasTaskMatch) unresolved.push("No task-matched symbol, textual reference, or local import edge was confirmed.");
+      const stopReason = evidence.evidence?.investigation?.stopReason || "investigation-status-unknown";
+      const additionalInspectionRecommended = evidence.status !== "complete" || unresolved.length > 0;
       return Object.freeze({
         contractVersion: 1,
+        question: typeof task === "string" ? task.slice(0, 8_192) : "",
         intent,
         status: evidence.status,
         observedAt: evidence.observedAt || null,
+        steps,
+        dependencyTrace: Object.freeze(dependencyTrace),
+        unresolved: Object.freeze([...new Set(unresolved)].slice(0, 12)),
+        stopReason,
+        remainingBudget: evidence.evidence?.investigation?.remainingBudget || Object.freeze({ operations: 0, targetedReads: 0, milliseconds: 0, sourceBytes: 0 }),
         routeDecision: routeDecision ? normalizeRouteDecision(routeDecision) : null,
         coordination: Object.freeze({
           additionalInspectionRecommended,
           providerReasoningRecommended: Boolean(normalizeText(task)),
-          reason: additionalInspectionRecommended
-            ? "Coverage limits or task-specific questions remain unresolved in the bounded local evidence."
-            : "The inspected local evidence is available for developer or selected-provider reasoning; no additional local operation was selected.",
+          reason: "Investigation stopped because " + stopReason.replaceAll("-", " ") + (additionalInspectionRecommended
+            ? "; coverage limits or task-specific questions remain unresolved."
+            : "; no justified local read remains within the current evidence."),
         }),
         project: evidence.project,
         git: evidence.git,
@@ -73,7 +85,50 @@ class SystemModelCoordinator {
     }
   }
 
+  selectNextStep(snapshot) {
+    if (!["trace", "bug", "change-plan", "investigate"].includes(snapshot.intent)) return { stop: true, reason: "sufficient-evidence" };
+    const readPaths = new Set(snapshot.readPaths);
+    const edges = snapshot.findings
+      .filter((item) => item.type === "import-edge" && item.relatedPath && !readPaths.has(item.relatedPath) && item.depth <= 2)
+      .sort((a, b) => a.depth - b.depth || rankImportEdge(b, snapshot.taskTerms) - rankImportEdge(a, snapshot.taskTerms) ||
+        String(a.relatedPath).localeCompare(String(b.relatedPath)));
+    if (edges.length) {
+      const edge = edges[0];
+      return readOperation(edge.relatedPath, edge.depth,
+        "Inspect the local module imported at " + edge.path + ":" + edge.lineStart + "; this may clarify the neighboring layer.");
+    }
+    const candidate = snapshot.candidateFiles.find((item) => !readPaths.has(item.path) &&
+      (item.changed || item.entryPoint || item.score >= 9));
+    if (candidate && snapshot.findings.some((item) => ["symbol", "reference", "path-match", "git-diff"].includes(item.type))) {
+      return readOperation(candidate.path, 1, "Inspect the task-matched entry point or Git-changed source candidate " + candidate.path + ".");
+    }
+    return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
+  }
+
   interrupt() { return this.repositoryIntelligence.interrupt(); }
+}
+
+function rankImportEdge(edge, taskTerms) {
+  const text = (edge.relatedPath + " " + edge.path).toLowerCase();
+  return (taskTerms || []).reduce((score, term) => score + (text.includes(String(term).toLowerCase()) ? 1 : 0), 0);
+}
+
+function buildDependencyTrace(findings) {
+  return findings.filter((item) => item.type === "import-edge" && item.path && item.relatedPath)
+    .sort((a, b) => (a.depth || 0) - (b.depth || 0) || a.path.localeCompare(b.path) || (a.lineStart || 0) - (b.lineStart || 0))
+    .slice(0, 16)
+    .map((item) => Object.freeze({ from: item.path, line: item.lineStart || null, to: item.relatedPath, depth: item.depth || 1,
+      evidence: "observed local import declaration; not proof of a runtime call" }));
+}
+
+function readOperation(filePath, depth, purpose) {
+  return {
+    operation: { toolId: "read_file", input: { path: filePath } },
+    purpose: purpose.slice(0, 180),
+    requiredInputs: ["path"],
+    expectedEvidence: "Source declarations, references, and local imports with exact line numbers.",
+    depth,
+  };
 }
 
 function createSystemModel(options) {
@@ -101,7 +156,7 @@ function shouldInvestigateTask(task) {
 }
 
 function createGroundedPlan(intent, findings, evidence) {
-  const sourceFindings = findings.filter((item) => ["symbol", "reference", "execution-path", "git-diff", "git-diff-hunk"].includes(item.type));
+  const sourceFindings = findings.filter((item) => ["symbol", "reference", "import-edge", "source-section", "git-diff", "git-diff-hunk"].includes(item.type));
   const paths = [...new Set(sourceFindings.filter((item) => item.path).map((item) => item.path))].slice(0, 5);
   const commands = evidence.project?.commands || [];
   if (intent === "overview") {
@@ -114,7 +169,7 @@ function createGroundedPlan(intent, findings, evidence) {
   if (intent === "trace") {
     return [
       sourceFindings.length ? `Start from the observed symbol/reference findings${paths.length ? ` in ${paths.join(", ")}` : ""}.` : "No matching source symbol was confirmed; identify a narrower symbol or inspect likely entry points.",
-      "Follow only explicit local import edges found in inspected files; label runtime control-flow conclusions as inferred.",
+      "Use the ordered import trace as a module-dependency outline; textual references do not establish calls or runtime order.",
       "Request additional reads for unresolved branches before presenting a complete path.",
     ];
   }
@@ -150,6 +205,28 @@ function renderSystemModelReport(result) {
   if (result.coordination) lines.push(`Next analysis: ${result.coordination.additionalInspectionRecommended ? "additional evidence recommended" : "no additional local inspection selected"}${result.coordination.providerReasoningRecommended ? "; selected-provider reasoning may continue" : ""}.`);
   if (result.project?.languages?.length) lines.push(`Languages: ${result.project.languages.slice(0, 6).map((item) => `${item.name} (${item.files})`).join(", ")}`);
   if (result.project?.frameworks?.length) lines.push(`Framework indicators: ${result.project.frameworks.slice(0, 8).map((item) => `${item.name} via ${item.dependency}`).join(", ")}`);
+  if (result.steps?.length) {
+    lines.push("Ordered investigation steps:");
+    for (const step of result.steps.slice(0, 16)) {
+      lines.push(String(step.index) + ". " + (step.state || "unknown") + " · " + (step.operation?.toolId || "unknown operation") + " · " + (step.purpose || "Purpose unavailable."));
+      if (step.result?.summary) lines.push("   Result: " + step.result.summary);
+      for (const reference of (step.result?.evidenceRefs || []).slice(0, 4)) {
+        const location = reference.path ? reference.path + (reference.lineStart ? ":" + reference.lineStart + (reference.lineEnd && reference.lineEnd !== reference.lineStart ? "-" + reference.lineEnd : "") : "") : "project-wide";
+        lines.push("   Evidence: " + reference.type + " · " + location);
+      }
+    }
+  }
+  if (result.dependencyTrace?.length) {
+    lines.push("Ordered local dependency trace (imports do not prove calls or runtime order):");
+    for (const edge of result.dependencyTrace.slice(0, 12)) lines.push(`- ${edge.from}${edge.line ? ":" + edge.line : ""} → ${edge.to} (hop ${edge.depth}).`);
+  }
+  if (result.stopReason) lines.push("Stopped: " + result.stopReason.replaceAll("-", " ") + " · remaining budget " +
+    (result.remainingBudget?.operations ?? 0) + " operations, " + (result.remainingBudget?.targetedReads ?? 0) + " targeted reads, " +
+    (result.remainingBudget?.milliseconds ?? 0) + " ms, " + (result.remainingBudget?.sourceBytes ?? 0) + " source bytes.");
+  if (result.unresolved?.length) {
+    lines.push("Unresolved questions:");
+    for (const item of result.unresolved.slice(0, 8)) lines.push("- " + item);
+  }
   if (result.git?.available) {
     const branch = result.git.status.match(/^## (.+)$/mu)?.[1];
     lines.push(`Git: available${branch ? ` · branch ${branch}` : ""}`);

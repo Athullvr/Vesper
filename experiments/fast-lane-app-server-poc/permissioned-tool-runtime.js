@@ -40,7 +40,8 @@ const TOOL_IDS = Object.freeze([
 ]);
 const TOOL_DEFINITIONS = Object.freeze([
   definition("read_file", "Read a UTF-8 regular file inside the selected project.", "project-read", false,
-    objectSchema({ path: projectPathSchema() }, ["path"]), { maximumFileBytes: MAX_FILE_BYTES }),
+    objectSchema({ path: projectPathSchema(), maxBytes: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES } }, ["path"]),
+    { maximumFileBytes: MAX_FILE_BYTES, maximumRequestedBytes: MAX_FILE_BYTES }),
   definition("list_files", "List one project directory without following symbolic links.", "project-read", false,
     objectSchema({ path: projectPathSchema() }), { maximumEntries: MAX_DIRECTORY_ENTRIES, maximumDepth: 1 }),
   definition("search_files", "Search literal text in bounded UTF-8 project files.", "project-search", false,
@@ -289,7 +290,7 @@ class PermissionedToolRuntime {
 
   async execute(request, commandPlan = null) {
     switch (request.toolId) {
-      case "read_file": return this.readFile(request.input.path);
+      case "read_file": return this.readFile(request.input.path, request.input.maxBytes);
       case "list_files": return this.listFiles(request.input.path || ".");
       case "search_files": return this.searchFiles(request.input.query, request.input.path || ".");
       case "git_status": return this.gitRead(["status", "--short", "--branch", "--untracked-files=no"]);
@@ -303,12 +304,12 @@ class PermissionedToolRuntime {
     }
   }
 
-  readFile(relativePath) {
+  readFile(relativePath, maxBytes = MAX_FILE_BYTES) {
     const root = this.openRoot();
     try {
       const parent = this.files.openProjectParent(root, relativePath);
       try {
-        const file = this.files.readFileAt(parent.fd, parent.basename, MAX_FILE_BYTES, { expectedDevice: parent.device });
+        const file = this.files.readFileAt(parent.fd, parent.basename, maxBytes, { expectedDevice: parent.device });
         const text = decodeUtf8(file.buffer);
         if (text === null) throw toolError("UNSUPPORTED_FILE_TYPE", "Only UTF-8 text files are supported by read_file.", true);
         const visibleText = redactSensitiveText(text);
@@ -995,7 +996,14 @@ function validateInput(toolId, input) {
     if (expected.some((key) => !Object.hasOwn(input, key) && !optional.includes(key))) throw toolError("INVALID_ARGUMENT", "Tool input is missing a required field.", true);
   };
   switch (toolId) {
-    case "read_file": exactKeys(["path"]); return { path: validPathValue(input.path, false) };
+    case "read_file": {
+      exactKeys(["path", "maxBytes"], ["maxBytes"]);
+      const maxBytes = input.maxBytes === undefined ? MAX_FILE_BYTES : input.maxBytes;
+      if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_FILE_BYTES) {
+        throw toolError("INVALID_ARGUMENT", `read_file maxBytes must be an integer from 1 to ${MAX_FILE_BYTES}.`, true);
+      }
+      return { path: validPathValue(input.path, false), maxBytes };
+    }
     case "list_files": exactKeys(["path"]); return { ...(input.path === undefined ? {} : { path: validPathValue(input.path, true) }) };
     case "search_files":
       exactKeys(["query", "path"]);

@@ -9,7 +9,7 @@ const path = require("node:path");
 const { createPermissionedToolRuntime } = require("../permissioned-tool-runtime");
 const { createRepositoryIntelligence, MAX_CONTEXT_LENGTH, parseManifest, renderRepositoryContext } = require("../repository-intelligence");
 const { createSystemModel, interpretTask, renderSystemModelReport } = require("../system-model");
-const { createTaskEvidence, mergeRepositoryEvidence } = require("../task-evidence");
+const { createTaskEvidence, mergeRepositoryEvidence, renderTaskEvidenceReport } = require("../task-evidence");
 const { parseArgs, runVesper } = require("../cli");
 
 function project(t) {
@@ -75,18 +75,154 @@ test("repository intelligence returns bounded manifest, framework, entry, Git, s
   assert.ok(result.project.entryPoints.some((item) => item.path === "src/main.js" && item.confidence === "high"));
   assert.ok(result.project.commands.some((item) => item.name === "test" && item.command === "node --test" && item.autoRun === false));
   assert.ok(result.findings.some((item) => item.type === "symbol" && item.path === "src/checkout.js" && item.lineStart === 2 && item.symbol === "handleCheckout"));
-  assert.ok(result.findings.some((item) => item.type === "execution-path" && item.path === "src/checkout.js" && item.observation === "inferred"));
+  assert.ok(result.findings.some((item) => item.type === "import-edge" && item.path === "src/checkout.js" && item.relatedPath === "src/checkout-service.js" && item.lineStart === 1 && item.observation === "inferred"));
   assert.ok(result.findings.some((item) => item.type === "git-history" && item.commit === "abcde"));
   assert.ok(result.findings.some((item) => item.type === "git-diff-hunk" && item.path === "src/checkout.js"));
   assert.ok(result.findings.every((item) => item.observedAt === "2026-10-23T00:00:00.000Z"));
   assert.ok(result.project.structure.every((item) => !item.includes(".env") && !item.includes("generated-files") && !item.includes("node_modules") && !item.includes("outside-link")));
   assert.ok(result.evidence.inspections.some((item) => item.kind === "read_file" && item.path === "src/checkout.js"));
   assert.ok(result.evidence.inspections.some((item) => item.kind === "git_check_ignore" && item.state === "verified"));
-  assert.ok(result.findings.some((item) => item.type === "execution-path" && item.description.includes("resolves to src/checkout-service.js")));
+  assert.ok(result.findings.some((item) => item.type === "import-edge" && item.description.includes("resolves to src/checkout-service.js")));
+  assert.ok(result.evidence.investigation.steps.some((step) => step.operation.toolId === "read_file" && step.operation.input.path === "src/checkout.js" && step.result.evidenceRefs.some((ref) => ref.path === "src/checkout.js" && ref.lineStart === 1)));
   assert.ok(!JSON.stringify(result).includes("sk-test-value"));
   assert.ok(!JSON.stringify(result).includes("outsideSecret"));
   assert.ok(result.git.status.includes("feature/checkout"));
   assert.ok(result.git.history.includes("add checkout flow"));
+});
+
+test("System Model follows local imports progressively and records ordered evidence with exact source lines", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ main: "src/main.js" }));
+  fs.writeFileSync(path.join(root, "src", "main.js"), 'const routes = require("./checkout-controller");\nmodule.exports = routes;\n');
+  fs.writeFileSync(path.join(root, "src", "a.js"), "export const a = 1;\n");
+  fs.writeFileSync(path.join(root, "src", "b.js"), "export const b = 1;\n");
+  fs.writeFileSync(path.join(root, "src", "c.js"), "export const c = 1;\n");
+  fs.writeFileSync(path.join(root, "src", "checkout-controller.js"), 'const service = require("./checkout-service");\nfunction handleCheckout(request) { return service(request); }\n');
+  fs.writeFileSync(path.join(root, "src", "checkout-service.js"), 'const repository = require("./checkout-repository");\nfunction checkoutService(request) { return repository(request); }\n');
+  fs.writeFileSync(path.join(root, "src", "checkout-repository.js"), "function checkoutRepository() { return true; }\n");
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId });
+  t.after(() => runtime.dispose());
+  const repositoryIntelligence = createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId });
+  const systemModel = createSystemModel({ repositoryIntelligence });
+
+  const result = await systemModel.investigate({ task: "Trace handleCheckout request flow", intent: "trace" });
+  const targeted = result.steps.filter((step) => step.operation.toolId === "read_file" && step.operation.input.path.startsWith("src/checkout-"));
+  assert.deepEqual(targeted.map((step) => step.operation.input.path), ["src/checkout-controller.js", "src/checkout-service.js"]);
+  assert.ok(result.findings.some((item) => item.type === "import-edge" && item.path === "src/main.js" && item.relatedPath === "src/checkout-controller.js" && item.lineStart === 1));
+  assert.ok(result.findings.some((item) => item.type === "import-edge" && item.path === "src/checkout-controller.js" && item.relatedPath === "src/checkout-service.js" && item.lineStart === 1));
+  assert.deepEqual(result.dependencyTrace.slice(0, 2).map((edge) => [edge.from, edge.line, edge.to]), [
+    ["src/main.js", 1, "src/checkout-controller.js"],
+    ["src/checkout-controller.js", 1, "src/checkout-service.js"],
+  ]);
+  assert.ok(result.findings.every((item) => item.type !== "execution-path"));
+  assert.match(result.stopReason, /no-justified-next-step|no-targeted-evidence/u);
+  assert.match(renderSystemModelReport(result), /Ordered investigation steps/u);
+  assert.match(renderSystemModelReport(result), /Ordered local dependency trace/u);
+  assert.match(renderSystemModelReport(result), /imports do not prove calls or runtime order/u);
+  assert.match(renderSystemModelReport(result), /src\/checkout-controller\.js:1/u);
+  const saved = createTaskEvidence({ sessionId, projectRoot: root });
+  assert.equal(mergeRepositoryEvidence(saved, result.evidence), true);
+  assert.equal(saved.investigation.steps.some((step) => step.operation.input.path === "src/checkout-service.js"), true);
+  assert.equal(saved.investigation.steps.find((step) => step.operation.input.path === "src/checkout-service.js").operation.input.maxBytes, 65_536);
+  assert.ok(renderTaskEvidenceReport(saved).includes("Investigation stopped:"));
+});
+
+test("missing and ambiguous symbols remain unresolved rather than becoming a complete call trace", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "a.js"), "function checkoutHandler() { return 1; }\n");
+  fs.writeFileSync(path.join(root, "src", "b.js"), "function checkoutHandler() { return 2; }\n");
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId });
+  t.after(() => runtime.dispose());
+  const service = createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId });
+  const ambiguous = await service.inspect({ task: "Trace checkoutHandler", intent: "trace", includeHistory: false });
+  assert.ok(ambiguous.findings.some((item) => item.type === "ambiguous-symbol" && item.status === "unknown"));
+  assert.ok(ambiguous.evidence.investigation.unresolved.some((item) => item.includes("multiple inspected files")));
+
+  const missing = await service.inspect({ task: "Trace notPresentAnywhere", intent: "trace", includeHistory: false });
+  assert.ok(!missing.findings.some((item) => item.type === "symbol" && item.symbol === "notPresentAnywhere"));
+  assert.ok(missing.evidence.investigation.unresolved.some((item) => /did not match|No matching symbol/u.test(item)));
+});
+
+test("project-local Python imports are traced with source line provenance", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "main.py"), "from .checkout_service import checkout_service\n\ndef route(request):\n    return checkout_service(request)\n");
+  fs.writeFileSync(path.join(root, "src", "checkout_service.py"), "def checkout_service(request):\n    return request\n");
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId });
+  t.after(() => runtime.dispose());
+  const result = await createSystemModel({ repositoryIntelligence: createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId }) })
+    .investigate({ task: "Trace checkout_service request flow", intent: "trace" });
+  assert.ok(result.findings.some((item) => item.type === "import-edge" && item.path === "src/main.py" &&
+    item.relatedPath === "src/checkout_service.py" && item.lineStart === 1));
+  assert.ok(result.dependencyTrace.some((edge) => edge.from === "src/main.py" && edge.to === "src/checkout_service.py"));
+});
+
+test("malformed follow-up operations are rejected before dispatch and generated sources are skipped", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "main.js"), "function checkoutHandler() { return true; }\n");
+  fs.writeFileSync(path.join(root, "src", "api.generated.ts"), "function checkoutHandler() { return false; }\n");
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId });
+  t.after(() => runtime.dispose());
+  const service = createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId });
+  const invalid = await service.inspect({ task: "Trace checkoutHandler", intent: "trace", includeHistory: false, selectNextStep: () => ({
+    operation: { toolId: "read_file", input: { path: "../outside.js" } }, purpose: "Read outside", requiredInputs: ["path"],
+    expectedEvidence: "Source content", depth: 1,
+  }) });
+  assert.equal(invalid.evidence.investigation.stopReason, "invalid-operation");
+  assert.ok(!invalid.evidence.investigation.steps.some((step) => step.operation.input.path?.includes("outside")));
+  assert.ok(!invalid.project.readPaths.includes("src/api.generated.ts"));
+  assert.ok(invalid.incomplete.some((item) => /generated-looking/u.test(item)));
+  let getterCalls = 0;
+  const accessorPlan = {};
+  Object.defineProperty(accessorPlan, "stop", { enumerable: true, get() { getterCalls += 1; return false; } });
+  const accessorResult = await service.inspect({ task: "Trace checkoutHandler", intent: "trace", includeHistory: false, selectNextStep: () => accessorPlan });
+  assert.equal(accessorResult.evidence.investigation.stopReason, "invalid-operation");
+  assert.equal(getterCalls, 0);
+});
+
+test("oversized and long source files remain bounded and are reported as incomplete", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "main.js"), `${Array.from({ length: 2_001 }, (_, index) => `const line${index} = ${index};`).join("\n")}\n`);
+  fs.writeFileSync(path.join(root, "src", "large.js"), "x".repeat(64 * 1024 + 1));
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId });
+  t.after(() => runtime.dispose());
+  const result = await createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId })
+    .inspect({ task: "Explain project structure", includeHistory: false });
+  assert.ok(result.incomplete.some((item) => /exceeded the 65536-byte per-file analysis limit/u.test(item)));
+  assert.ok(result.incomplete.some((item) => /stopped at 2000 lines/u.test(item)));
+  assert.ok(result.project.readPaths.includes("src/main.js"));
+  assert.ok(!result.project.readPaths.includes("src/large.js"));
+});
+
+test("investigation budgets and cancellation stop without dispatching unbounded follow-up reads", async (t) => {
+  const { root } = project(t);
+  fs.mkdirSync(path.join(root, "src"), { recursive: true });
+  fs.writeFileSync(path.join(root, "src", "main.js"), "function checkoutHandler() { return true; }\n");
+  const sessionId = crypto.randomUUID();
+  const runtime = createPermissionedToolRuntime({ projectRoot: root, sessionId });
+  t.after(() => runtime.dispose());
+  let clockValue = 0;
+  const service = createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId, clock: () => (clockValue += 2_000) });
+  const timedOut = await service.inspect({ task: "Trace checkoutHandler", intent: "trace", includeHistory: false });
+  assert.equal(timedOut.evidence.investigation.stopReason, "time-budget");
+  assert.ok(timedOut.evidence.investigation.steps.length < 16);
+
+  const controller = new AbortController();
+  controller.abort("test-cancel");
+  const cancelled = await createRepositoryIntelligence({ toolRuntime: runtime, projectRoot: root, sessionId })
+    .inspect({ task: "Trace checkoutHandler", intent: "trace", includeHistory: false, signal: controller.signal });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.evidence.investigation.stopReason, "cancelled");
+  assert.equal(cancelled.evidence.investigation.steps.length, 0);
 });
 
 test("non-Git inspection honors bounded .gitignore rules and reports missing Git evidence", async (t) => {
@@ -235,6 +371,7 @@ test("CLI inspection is explicit, local-only, and does not instantiate an execut
   assert.equal(errorOutput.value, "");
   assert.match(output.value, /Vesper repository investigation · deterministic and read-only/u);
   assert.match(output.value, /src\/main.js/u);
+  assert.match(output.value, /Ordered investigation steps/u);
   assert.match(output.value, /not executed/u);
   assert.doesNotMatch(output.value, /Existing route:/u);
 });

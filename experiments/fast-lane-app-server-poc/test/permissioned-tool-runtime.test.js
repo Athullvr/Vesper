@@ -7,7 +7,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { parseArgs, runVesper } = require("../cli");
-const { createPermissionedToolRuntime, listToolDefinitions, renderToolApproval } = require("../permissioned-tool-runtime");
+const { MAX_FILE_BYTES, createPermissionedToolRuntime, listToolDefinitions, renderToolApproval } = require("../permissioned-tool-runtime");
 const { OPENAI_CAPABILITIES } = require("../openai-chat-completions-provider");
 const workspaceFiles = require("../tool-workspace-files");
 
@@ -43,6 +43,7 @@ test("tool definitions are explicit, and the public runtime exposes only the inv
   assert.equal(definitions.find((entry) => entry.id === "run_command").enabled, false);
   assert.equal(definitions.find((entry) => entry.id === "apply_file_change").enabled, false);
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.properties.path.format, "project-relative-path");
+  assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.properties.maxBytes.maximum, MAX_FILE_BYTES);
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.additionalProperties, false);
   assert.equal(definitions.find((entry) => entry.id === "run_command").requiresApproval, true);
   assert.equal(definitions.find((entry) => entry.id === "apply_file_change").requiresApproval, true);
@@ -113,6 +114,12 @@ test("read, directory listing, and literal search are bounded and redact sensiti
   const oversized = await runtime.invoke(request(root, sessionId, "read_file", { path: "oversized.txt" }));
   assert.equal(oversized.state, "rejected");
   assert.equal(oversized.error.code, "INPUT_TOO_LARGE");
+  const bounded = await runtime.invoke(request(root, sessionId, "read_file", { path: "src/config.js", maxBytes: 10 }));
+  assert.equal(bounded.state, "rejected");
+  assert.equal(bounded.error.code, "INPUT_TOO_LARGE");
+  const invalidBound = await runtime.invoke(request(root, sessionId, "read_file", { path: "src/config.js", maxBytes: 0 }));
+  assert.equal(invalidBound.state, "rejected");
+  assert.equal(invalidBound.error.code, "INVALID_ARGUMENT");
   await assert.rejects(runtime.preview(request(root, sessionId, "propose_file_change", { path: "x.txt", content: "x".repeat(8_001) })),
     /reviewable file-change limit/u);
 });
