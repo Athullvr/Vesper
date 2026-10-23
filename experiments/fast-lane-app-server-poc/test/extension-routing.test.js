@@ -92,6 +92,60 @@ test("VS Code can select OpenAI and labels normalized output as generated text, 
   assert.match(panel.html, /project files are not sent/u);
 });
 
+test("VS Code can use NVIDIA NIM through the compatible text adapter without implying execution", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-nim-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const previousFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, authorization: options.headers.Authorization, body: JSON.parse(options.body) });
+    const events = [
+      { choices: [{ delta: { content: "NIM guidance." }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ].map((item) => `data: ${JSON.stringify(item)}\n\n`).join("");
+    return new Response(`${events}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  t.after(() => { globalThis.fetch = previousFetch; });
+
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    environment: {
+      VESPER_PROVIDER: "nvidia-nim",
+      NVIDIA_API_KEY: "nvidia-fixture-secret",
+      VESPER_NVIDIA_MODEL: "fixture/nim-model",
+      VESPER_NVIDIA_BASE_URL: "https://nim.fixture.test/v1",
+    },
+  });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  assert.equal(panel.last("provider-info").providerId, "nvidia-nim");
+  assert.equal(panel.last("provider-info").model, "fixture/nim-model");
+  await panel.send({ type: "submit", text: "Explain this NIM fixture." });
+
+  assert.equal(panel.all("assistant-delta").map((message) => message.text).join(""), "NIM guidance.");
+  assert.equal(panel.last("assistant-done").generatedTextOnly, true);
+  assert.equal(panel.last("assistant-done").model, "fixture/nim-model");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://nim.fixture.test/v1/chat/completions");
+  assert.equal(calls[0].authorization, "Bearer nvidia-fixture-secret");
+  assert.equal(Object.hasOwn(calls[0].body, "tools"), false);
+  const session = harness.store().findLatestByCwd(fs.realpathSync(project));
+  assert.equal(session.providerId, "nvidia-nim");
+  assert.equal(session.modelId, "fixture/nim-model");
+  assert.match(session.providerConversationId, /^nim_[0-9a-f-]{36}$/u);
+  assert.doesNotMatch(fs.readFileSync(path.join(harness.home, "sessions", `${session.sessionId}.json`), "utf8"), /Explain this NIM fixture|nvidia-fixture-secret/u);
+
+  const webview = mountWebview(panel.html);
+  webview.dispatch(panel.last("provider-info"));
+  webview.dispatch({ type: "assistant-start", requestId: 1, providerId: "nvidia-nim" });
+  webview.dispatch({ type: "assistant-delta", requestId: 1, text: "NIM guidance." });
+  webview.dispatch(panel.last("assistant-done"));
+  assert.match(webview.elements.get("messages").children[0].children[0].textContent, /NVIDIA NIM · generated text · not executed · files unchanged/u);
+  assert.match(webview.elements.get("status").textContent, /NVIDIA NIM · text generated, not executed/u);
+  assert.match(webview.elements.get("provider-privacy").textContent, /NVIDIA NIM receives submitted task and saved conversation text only/u);
+});
+
 test("VS Code keeps a saved provider and uses VESPER_PROVIDER only for a new session", async (t) => {
   const root = makeTempDirectory("vesper-vscode-provider-resume-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

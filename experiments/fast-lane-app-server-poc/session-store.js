@@ -5,7 +5,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const SESSION_SCHEMA_VERSION = 2;
+const SESSION_SCHEMA_VERSION = 3;
+const PROVIDER_SESSION_SCHEMA_VERSION = 2;
 const LEGACY_SESSION_SCHEMA_VERSION = 1;
 const DEFAULT_PROVIDER_ID = "codex-app-server";
 const MAX_SESSION_FILE_BYTES = 16_384;
@@ -14,6 +15,10 @@ const MAX_SESSION_LIST_ENTRIES = 50;
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const LEGACY_SESSION_KEYS = new Set(["schemaVersion", "sessionId", "cwd", "threadId", "createdAt", "updatedAt"]);
 const SESSION_KEYS = new Set([
+  "schemaVersion", "sessionId", "cwd", "providerId", "providerConversationId",
+  "modelId", "status", "recovery", "createdAt", "updatedAt",
+]);
+const PROVIDER_SESSION_KEYS = new Set([
   "schemaVersion", "sessionId", "cwd", "providerId", "providerConversationId",
   "status", "recovery", "createdAt", "updatedAt",
 ]);
@@ -24,9 +29,10 @@ class SessionStore {
     this.now = now;
   }
 
-  create(cwd, { providerId = DEFAULT_PROVIDER_ID } = {}) {
+  create(cwd, { providerId = DEFAULT_PROVIDER_ID, modelId = null } = {}) {
     if (typeof cwd !== "string" || !path.isAbsolute(cwd)) throw new TypeError("Session project directory must be absolute.");
     if (typeof providerId !== "string" || !/^[a-z][a-z0-9-]{0,79}$/u.test(providerId)) throw new TypeError("Session provider id is invalid.");
+    validateModelId(modelId);
     const now = this.now().toISOString();
     const session = {
       schemaVersion: SESSION_SCHEMA_VERSION,
@@ -34,6 +40,7 @@ class SessionStore {
       cwd,
       providerId,
       providerConversationId: null,
+      modelId,
       status: "new",
       recovery: null,
       createdAt: now,
@@ -135,7 +142,7 @@ class SessionStore {
   }
 
   write(session) {
-    if (!isValidV2Session(session)) throw new TypeError("Invalid Vesper session metadata.");
+    if (!isValidCurrentSession(session)) throw new TypeError("Invalid Vesper session metadata.");
     this.ensureDirectory();
     const filePath = this.sessionPath(session.sessionId);
     try {
@@ -201,7 +208,8 @@ function validateSessionId(sessionId) {
 function isValidSession(session) {
   if (!session || typeof session !== "object" || Array.isArray(session)) return false;
   if (session.schemaVersion === LEGACY_SESSION_SCHEMA_VERSION) return isValidLegacySession(session);
-  return isValidV2Session(session);
+  if (session.schemaVersion === PROVIDER_SESSION_SCHEMA_VERSION) return isValidProviderSession(session);
+  return isValidCurrentSession(session);
 }
 
 function isValidLegacySession(session) {
@@ -212,10 +220,22 @@ function isValidLegacySession(session) {
   return validTimestamps(session);
 }
 
-function isValidV2Session(session) {
+function isValidProviderSession(session) {
+  if (!session || typeof session !== "object" || Array.isArray(session) ||
+      Object.keys(session).some((key) => !PROVIDER_SESSION_KEYS.has(key)) || Object.keys(session).length !== PROVIDER_SESSION_KEYS.size) return false;
+  if (session.schemaVersion !== PROVIDER_SESSION_SCHEMA_VERSION || !SESSION_ID_PATTERN.test(session.sessionId || "")) return false;
+  return isValidSessionFields(session);
+}
+
+function isValidCurrentSession(session) {
   if (!session || typeof session !== "object" || Array.isArray(session) ||
       Object.keys(session).some((key) => !SESSION_KEYS.has(key)) || Object.keys(session).length !== SESSION_KEYS.size) return false;
   if (session.schemaVersion !== SESSION_SCHEMA_VERSION || !SESSION_ID_PATTERN.test(session.sessionId || "")) return false;
+  try { validateModelId(session.modelId); } catch { return false; }
+  return isValidSessionFields(session);
+}
+
+function isValidSessionFields(session) {
   if (typeof session.cwd !== "string" || !path.isAbsolute(session.cwd) || /[\u0000-\u001f\u007f]/u.test(session.cwd)) return false;
   if (typeof session.providerId !== "string" || !/^[a-z][a-z0-9-]{0,79}$/u.test(session.providerId)) return false;
   if (session.providerConversationId !== null && !isValidConversationId(session.providerConversationId)) return false;
@@ -237,17 +257,28 @@ function validTimestamps(session) {
 
 function normalizeSession(session) {
   if (session.schemaVersion === SESSION_SCHEMA_VERSION) return session;
+  if (session.schemaVersion === PROVIDER_SESSION_SCHEMA_VERSION) {
+    return { ...session, schemaVersion: SESSION_SCHEMA_VERSION, modelId: null };
+  }
   return {
     schemaVersion: SESSION_SCHEMA_VERSION,
     sessionId: session.sessionId,
     cwd: session.cwd,
     providerId: DEFAULT_PROVIDER_ID,
     providerConversationId: session.threadId,
+    modelId: null,
     status: session.threadId ? "active" : "new",
     recovery: null,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
   };
+}
+
+function validateModelId(modelId) {
+  if (modelId === null) return;
+  if (typeof modelId !== "string" || !modelId.trim() || modelId.length > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(modelId)) {
+    throw new TypeError("Session model id is invalid.");
+  }
 }
 
 function withLegacyCodexAlias(session) {

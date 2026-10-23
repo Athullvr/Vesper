@@ -39,7 +39,7 @@ test("tool definitions are explicit, and the public runtime exposes only the inv
   const { runtime } = makeRuntime(root);
   t.after(() => runtime.dispose());
   const definitions = runtime.getDefinitions();
-  assert.deepEqual(definitions.map((entry) => entry.id), ["read_file", "list_files", "search_files", "git_status", "git_diff", "run_command", "propose_file_change", "apply_file_change"]);
+  assert.deepEqual(definitions.map((entry) => entry.id), ["read_file", "list_files", "search_files", "git_status", "git_diff", "git_log", "run_command", "propose_file_change", "apply_file_change"]);
   assert.equal(definitions.find((entry) => entry.id === "run_command").enabled, false);
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.properties.path.format, "project-relative-path");
   assert.equal(definitions.find((entry) => entry.id === "read_file").inputSchema.additionalProperties, false);
@@ -148,15 +148,24 @@ test("Git inspection is read-only, bounded, and scoped to an in-project reposito
   t.after(() => runtime.dispose());
   const status = await runtime.invoke(request(root, sessionId, "git_status", {}));
   const diff = await runtime.invoke(request(root, sessionId, "git_diff", { path: "-nasty-name" }));
+  const history = await runtime.invoke(request(root, sessionId, "git_log", { limit: 4, path: "-nasty-name" }));
+  const invalidHistory = await runtime.invoke(request(root, sessionId, "git_log", { limit: 21 }));
   assert.equal(status.state, "verified");
   assert.equal(status.result.text, "## main\n");
   assert.equal(diff.state, "verified");
-  assert.equal(calls.length, 4);
+  assert.equal(history.state, "verified");
+  assert.equal(invalidHistory.state, "rejected");
+  assert.equal(calls.length, 6);
   assert.ok(calls.every((call) => call.executable === "git" && call.options.shell !== true && call.options.timeout <= 5_000));
   const diffArgs = calls[3].args;
   assert.ok(diffArgs.includes("--no-ext-diff"));
   assert.ok(diffArgs.includes("--no-textconv"));
   assert.ok(diffArgs.includes(":(literal)-nasty-name"));
+  const logArgs = calls[5].args;
+  assert.ok(logArgs.includes("--max-count=4"));
+  assert.ok(logArgs.includes("--format=%h %ad %s"));
+  assert.ok(logArgs.includes(":(literal)-nasty-name"));
+  assert.ok(!logArgs.includes("--all"), "history inspection should stay on the local selected branch graph");
 
   const nestedRoot = path.join(root, "nested");
   fs.mkdirSync(nestedRoot);

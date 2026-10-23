@@ -24,7 +24,7 @@ test("session metadata is private, atomic, and contains only Vesper session iden
   assert.equal(directoryStat.mode & 0o777, 0o700);
   assert.equal(fileStat.mode & 0o777, 0o600);
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(sessionPath, "utf8"))).sort(), [
-    "createdAt", "cwd", "providerConversationId", "providerId", "recovery", "schemaVersion", "sessionId", "status", "updatedAt",
+    "createdAt", "cwd", "modelId", "providerConversationId", "providerId", "recovery", "schemaVersion", "sessionId", "status", "updatedAt",
   ]);
   assert.deepEqual(store.load(session.sessionId), session);
 
@@ -61,10 +61,52 @@ test("legacy Codex thread records migrate in memory and preserve the exact conve
   const persisted = store.touch(legacy.sessionId);
   const raw = JSON.parse(fs.readFileSync(path.join(directory, `${legacy.sessionId}.json`), "utf8"));
   assert.equal(persisted.providerConversationId, "saved-codex-thread");
-  assert.equal(raw.schemaVersion, 2);
+  assert.equal(raw.schemaVersion, 3);
   assert.equal(raw.providerConversationId, "saved-codex-thread");
   assert.equal(Object.hasOwn(raw, "threadId"), false);
   assert.throws(() => store.update(legacy.sessionId, { providerConversationId: "different-thread" }), /cannot be rebound/u);
+});
+
+test("provider-neutral schema v2 sessions migrate without losing provider, conversation, status, or recovery", (t) => {
+  const root = temporaryRoot(t);
+  const directory = path.join(root, "sessions");
+  const store = new SessionStore({ directory });
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const old = {
+    schemaVersion: 2,
+    sessionId: "00000000-0000-4000-8000-000000000002",
+    cwd: "/workspace/project",
+    providerId: "nvidia-nim",
+    providerConversationId: "nim_00000000-0000-4000-8000-000000000003",
+    status: "recovery-required",
+    recovery: { code: "submission-outcome-uncertain", observedAt: "2026-10-19T12:01:00.000Z" },
+    createdAt: "2026-10-19T12:00:00.000Z",
+    updatedAt: "2026-10-19T12:01:00.000Z",
+  };
+  fs.writeFileSync(path.join(directory, `${old.sessionId}.json`), `${JSON.stringify(old)}\n`, { mode: 0o600 });
+
+  const loaded = store.load(old.sessionId);
+  assert.equal(loaded.schemaVersion, 3);
+  assert.equal(loaded.providerId, "nvidia-nim");
+  assert.equal(loaded.providerConversationId, old.providerConversationId);
+  assert.equal(loaded.modelId, null);
+  assert.deepEqual(loaded.recovery, old.recovery);
+  store.touch(old.sessionId);
+  const persisted = JSON.parse(fs.readFileSync(path.join(directory, `${old.sessionId}.json`), "utf8"));
+  assert.equal(persisted.schemaVersion, 3);
+  assert.equal(persisted.providerId, "nvidia-nim");
+  assert.equal(persisted.providerConversationId, old.providerConversationId);
+  assert.equal(persisted.modelId, null);
+  assert.deepEqual(persisted.recovery, old.recovery);
+});
+
+test("session model selection is bounded, persisted, and immutable after creation", (t) => {
+  const root = temporaryRoot(t);
+  const store = new SessionStore({ directory: path.join(root, "sessions") });
+  const session = store.create("/workspace/project", { providerId: "nvidia-nim", modelId: "nim-fixture-model" });
+  assert.equal(store.load(session.sessionId).modelId, "nim-fixture-model");
+  assert.throws(() => store.create("/workspace/project", { providerId: "nvidia-nim", modelId: "bad\nmodel" }), /model id is invalid/u);
+  assert.throws(() => store.update(session.sessionId, { modelId: "another-model" }), /Only the project directory/u);
 });
 
 test("session store rejects symlinked session files and directories", (t) => {

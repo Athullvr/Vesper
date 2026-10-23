@@ -261,7 +261,7 @@ test("Chat Completions streams text and resumes its bounded project-scoped local
     lineIO: { async question() { if (asked) return null; asked = true; return "Draft an implementation outline."; }, onInterrupt() {}, close() {} },
   });
   await terminal.run();
-  assert.match(terminalOutput, /OpenAI API · fixture-model \(text only\)/u);
+  assert.match(terminalOutput, /OpenAI Chat Completions API · fixture-model \(text only; generated text is not executed\)/u);
   assert.match(terminalOutput, /OpenAI text generated · not executed · files unchanged/u);
   assert.match(terminalOutput, /Answer one\./u);
   provider.dispose();

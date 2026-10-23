@@ -12,11 +12,19 @@ const MAX_CONVERSATION_MESSAGE_LENGTH = 256 * 1024;
 const CONVERSATION_ID_PATTERN = /^oai_[0-9a-f-]{36}$/iu;
 
 class OpenAIConversationStore {
-  constructor({ directory } = {}) {
+  constructor({ directory, providerId = OPENAI_PROVIDER_ID, conversationPrefix = "oai" } = {}) {
     if (typeof directory !== "string" || !path.isAbsolute(directory)) {
       throw new TypeError("An absolute OpenAI conversation directory is required.");
     }
+    if (typeof providerId !== "string" || !/^[a-z][a-z0-9-]{0,79}$/u.test(providerId)) {
+      throw new TypeError("A valid provider id is required for conversation storage.");
+    }
+    if (typeof conversationPrefix !== "string" || !/^[a-z][a-z0-9]{1,11}$/u.test(conversationPrefix)) {
+      throw new TypeError("A valid provider conversation prefix is required.");
+    }
     this.directory = path.resolve(directory);
+    this.providerId = providerId;
+    this.conversationPrefix = conversationPrefix;
   }
 
   create({ projectPath, modelId, baseUrlFingerprint }) {
@@ -24,8 +32,8 @@ class OpenAIConversationStore {
     const now = new Date().toISOString();
     const record = {
       schemaVersion: CONVERSATION_SCHEMA_VERSION,
-      providerId: OPENAI_PROVIDER_ID,
-      conversationId: `oai_${crypto.randomUUID()}`,
+      providerId: this.providerId,
+      conversationId: `${this.conversationPrefix}_${crypto.randomUUID()}`,
       projectPath: path.resolve(projectPath),
       modelId: validateSafeField(modelId, "model identifier", 200),
       baseUrlFingerprint: validateSafeField(baseUrlFingerprint, "API base URL fingerprint", 64),
@@ -40,7 +48,7 @@ class OpenAIConversationStore {
   }
 
   load(conversationId, projectPath) {
-    validateConversationId(conversationId);
+    validateConversationId(conversationId, this.conversationPrefix);
     validateProjectPath(projectPath);
     this.ensureDirectory();
     const filePath = this.filePath(conversationId);
@@ -58,7 +66,7 @@ class OpenAIConversationStore {
       }
       const raw = fs.readFileSync(descriptor, "utf8");
       const record = JSON.parse(raw);
-      if (!isValidRecord(record) || record.conversationId !== conversationId) {
+      if (!isValidRecord(record, this.providerId, this.conversationPrefix) || record.conversationId !== conversationId) {
         throw new Error("OpenAI conversation metadata is invalid.");
       }
       if (path.resolve(record.projectPath) !== path.resolve(projectPath)) {
@@ -129,7 +137,7 @@ class OpenAIConversationStore {
   }
 
   write(record) {
-    if (!isValidRecord(record)) throw new TypeError("Invalid OpenAI conversation metadata.");
+    if (!isValidRecord(record, this.providerId, this.conversationPrefix)) throw new TypeError("Invalid provider conversation metadata.");
     this.ensureDirectory();
     const filePath = this.filePath(record.conversationId);
     try {
@@ -162,7 +170,7 @@ class OpenAIConversationStore {
   }
 
   filePath(conversationId) {
-    validateConversationId(conversationId);
+    validateConversationId(conversationId, this.conversationPrefix);
     return path.join(this.directory, `${conversationId}.json`);
   }
 }
@@ -173,15 +181,15 @@ function assertPendingTask(record, taskId) {
   }
 }
 
-function isValidRecord(record) {
+function isValidRecord(record, providerId = OPENAI_PROVIDER_ID, conversationPrefix = "oai") {
   if (!record || typeof record !== "object" || Array.isArray(record)) return false;
   const allowed = new Set([
     "schemaVersion", "providerId", "conversationId", "projectPath", "modelId", "baseUrlFingerprint",
     "status", "pendingTaskId", "messages", "createdAt", "updatedAt",
   ]);
   if (Object.keys(record).some((key) => !allowed.has(key)) || Object.keys(record).length !== allowed.size) return false;
-  if (record.schemaVersion !== CONVERSATION_SCHEMA_VERSION || record.providerId !== OPENAI_PROVIDER_ID) return false;
-  if (!CONVERSATION_ID_PATTERN.test(record.conversationId || "")) return false;
+  if (record.schemaVersion !== CONVERSATION_SCHEMA_VERSION || record.providerId !== providerId) return false;
+  if (!conversationIdPattern(conversationPrefix).test(record.conversationId || "")) return false;
   if (typeof record.projectPath !== "string" || !path.isAbsolute(record.projectPath) || /[\u0000-\u001f\u007f]/u.test(record.projectPath)) return false;
   if (typeof record.modelId !== "string" || !record.modelId || record.modelId.length > 200 || /[\u0000-\u001f\u007f\u009f]/u.test(record.modelId)) return false;
   if (typeof record.baseUrlFingerprint !== "string" || !/^[0-9a-f]{64}$/u.test(record.baseUrlFingerprint)) return false;
@@ -200,8 +208,12 @@ function isValidRecord(record) {
   return Number.isFinite(createdAt) && Number.isFinite(updatedAt) && createdAt <= updatedAt;
 }
 
-function validateConversationId(value) {
-  if (typeof value !== "string" || !CONVERSATION_ID_PATTERN.test(value)) throw new TypeError("OpenAI conversation id is invalid.");
+function validateConversationId(value, conversationPrefix = "oai") {
+  if (typeof value !== "string" || !conversationIdPattern(conversationPrefix).test(value)) throw new TypeError("Provider conversation id is invalid.");
+}
+
+function conversationIdPattern(prefix) {
+  return prefix === "oai" ? CONVERSATION_ID_PATTERN : new RegExp(`^${prefix}_[0-9a-f-]{36}$`, "iu");
 }
 
 function validateProjectPath(value) {

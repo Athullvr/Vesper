@@ -32,6 +32,7 @@ const TOOL_IDS = Object.freeze([
   "search_files",
   "git_status",
   "git_diff",
+  "git_log",
   "run_command",
   "propose_file_change",
   "apply_file_change",
@@ -50,6 +51,8 @@ const TOOL_DEFINITIONS = Object.freeze([
     objectSchema({}), { timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT }),
   definition("git_diff", "Inspect a bounded, read-only Git diff for this project.", "project-git-read", false,
     objectSchema({ path: projectPathSchema() }), { timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT }),
+  definition("git_log", "Inspect a bounded, read-only summary of local Git history.", "project-git-read", false,
+    objectSchema({ limit: { type: "integer", minimum: 1, maximum: 20 }, path: projectPathSchema() }), { defaultLimit: 10, maximumLimit: 20, timeoutMs: MAX_COMMAND_TIMEOUT_MS, maximumOutputCharacters: MAX_TOOL_OUTPUT, remoteAccess: false }),
   definition("run_command", "Run one explicitly approved argv inside a rootless Linux container with network disabled.", "command-execution", true,
     objectSchema({ argv: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1, maxLength: MAX_COMMAND_LENGTH }, "x-maxAggregateUtf8Bytes": MAX_COMMAND_LENGTH },
       workspaceAccess: { type: "string", enum: ["read-only", "read-write"] } }, ["argv"]), { enabledByDefault: false, shell: false, isolation: "rootless-podman-required",
@@ -279,6 +282,7 @@ class PermissionedToolRuntime {
       case "search_files": return this.searchFiles(request.input.query, request.input.path || ".");
       case "git_status": return this.gitRead(["status", "--short", "--branch", "--untracked-files=no"]);
       case "git_diff": return this.gitDiff(request.input.path);
+      case "git_log": return this.gitLog(request.input);
       case "run_command": return this.runCommand(request, commandPlan);
       case "propose_file_change": return this.proposeFileChange(request);
       case "apply_file_change": return this.applyFileChange(request);
@@ -384,6 +388,16 @@ class PermissionedToolRuntime {
     const args = ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--unified=3", "--"];
     if (relativePath !== undefined && relativePath !== "") {
       const parsed = this.files.parseProjectPath(relativePath, { allowRoot: false });
+      args.push(`:(literal)${parsed.relativePath}`);
+    }
+    return this.gitRead(args);
+  }
+
+  async gitLog({ limit = 10, path: relativePath } = {}) {
+    const args = ["log", "--no-ext-diff", "--no-color", `--max-count=${limit}`, "--date=short", "--format=%h %ad %s", "--"];
+    if (relativePath !== undefined && relativePath !== "") {
+      const parsed = this.files.parseProjectPath(relativePath, { allowRoot: false });
+      rejectProtectedPath(parsed.relativePath);
       args.push(`:(literal)${parsed.relativePath}`);
     }
     return this.gitRead(args);
@@ -927,6 +941,12 @@ function validateInput(toolId, input) {
       return { query: input.query, ...(input.path === undefined ? {} : { path: validPathValue(input.path, true) }) };
     case "git_status": exactKeys([]); return {};
     case "git_diff": exactKeys(["path"]); return input.path === undefined ? {} : { path: validPathValue(input.path, false) };
+    case "git_log": {
+      exactKeys(["limit", "path"], ["limit", "path"]);
+      const limit = input.limit === undefined ? 10 : input.limit;
+      if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw toolError("INVALID_ARGUMENT", "git_log limit must be an integer from 1 to 20.", true);
+      return { limit, ...(input.path === undefined ? {} : { path: validPathValue(input.path, false) }) };
+    }
     case "run_command":
       exactKeys(["argv", "workspaceAccess"], ["workspaceAccess"]);
       if (input.workspaceAccess !== undefined && !["read-only", "read-write"].includes(input.workspaceAccess)) {

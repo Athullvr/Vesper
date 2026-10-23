@@ -3,7 +3,7 @@ const { execFile } = require("node:child_process");
 const { randomBytes } = require("node:crypto");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
-const { DEFAULT_PROVIDER_ID, OPENAI_PROVIDER_ID, createExecutionProvider, listProviders, resolveDefaultProviderId } = require("./execution-provider");
+const { DEFAULT_PROVIDER_ID, NVIDIA_PROVIDER_ID, OPENAI_PROVIDER_ID, createExecutionProvider, getProviderStatus, listProviders, resolveDefaultProviderId } = require("./execution-provider");
 const { createLocalHandlers } = require("./local-handlers");
 const { RouteMetrics, classifyRequest, routeRequest } = require("./routing-core");
 const { SessionStore, defaultSessionDirectory } = require("./session-store");
@@ -179,7 +179,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
   try {
     if (!selectedSession) {
       const providerId = selectedProviderForNewSession();
-      selectedSession = sessionStore.create(cwd, { providerId });
+      selectedSession = createProviderSession(cwd, providerId);
       sessionView = {
         state: "new",
         text: `New Vesper session created for ${providerDisplayName(providerId)}.`,
@@ -248,7 +248,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       postToPanel(targetPanel, {
         type: "assistant-error", requestId, state: result.status,
         providerId: session.providerId,
-        text: result.status === "timeout" ? `${providerName} task timed out.` : session.providerId === OPENAI_PROVIDER_ID
+        text: result.status === "timeout" ? `${providerName} task timed out.` : isTextOnlyProvider(session.providerId)
           ? "The request was interrupted locally. The remote service may have completed it; Vesper did not resubmit it. Start a new conversation to continue."
           : "Turn interrupted.", elapsedMs,
       });
@@ -257,7 +257,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
         type: "assistant-done", requestId, elapsedMs, usage: "session saved",
         providerId: session.providerId,
         model: client.getState().model || null,
-        generatedTextOnly: session.providerId === OPENAI_PROVIDER_ID,
+        generatedTextOnly: isTextOnlyProvider(session.providerId),
         truncated: Boolean(result.truncated),
       });
     }
@@ -270,8 +270,8 @@ async function handlePrompt(prompt, targetPanel = panel) {
     if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
       setSessionView(targetPanel, uncertainInterrupt
         ? { state: "recovery-required", text: "The remote request may have completed. Its transcript is retained, and this conversation cannot be submitted again safely.", blocked: true, canStartNew: true }
-        : { state: "connected", text: session.providerId === OPENAI_PROVIDER_ID
-          ? "OpenAI · this Vesper session is saved."
+        : { state: "connected", text: isTextOnlyProvider(session.providerId)
+          ? `${providerSessionName(session.providerId)} · this Vesper session is saved.`
           : "Connected · this Vesper session is saved.", blocked: false });
     }
   } catch (error) {
@@ -435,7 +435,7 @@ function startNewSession(targetPanel) {
     const previousSessionId = selectedSession?.sessionId;
     invalidateHistoryLoad();
     disposeCurrentAppServer();
-    selectedSession = sessionStore.create(project.path, { providerId: selectedProviderForNewSession() });
+    selectedSession = createProviderSession(project.path, selectedProviderForNewSession());
     sessionLookupError = undefined;
     sessionView = {
       state: "new",
@@ -481,6 +481,7 @@ function executionProviderForSession(session, cwd, generation) {
   const providerOptions = {
     providerId: session.providerId,
     environment: process.env,
+    ...(session.modelId ? { modelId: session.modelId } : {}),
     onConversationId: async (conversationId) => {
       const latest = sessionStore.load(sessionId);
       if (latest.cwd !== cwd || latest.providerId !== session.providerId) throw new Error("The Vesper session project or provider identity changed.");
@@ -495,7 +496,7 @@ function executionProviderForSession(session, cwd, generation) {
       if (selectedSession?.sessionId === sessionId && projectGeneration === generation) selectedSession = saved;
     },
   };
-  if (session.providerId === OPENAI_PROVIDER_ID) {
+  if (isTextOnlyProvider(session.providerId)) {
     providerOptions.conversationDirectory = path.join(sessionStore.directory || defaultSessionDirectory(), "provider-conversations");
   } else {
     providerOptions.clientOptions = {
@@ -518,8 +519,8 @@ function executionProviderForSession(session, cwd, generation) {
       if (historyLoadingSessionId === sessionId) {
         setSessionView(panel, { state: "restoring", text: "Saved thread verified; loading conversation history…", blocked: true });
       } else {
-        setSessionView(panel, { state: "connected", text: session.providerId === OPENAI_PROVIDER_ID
-          ? "OpenAI · saved conversation restored."
+        setSessionView(panel, { state: "connected", text: isTextOnlyProvider(session.providerId)
+          ? `${providerSessionName(session.providerId)} · saved conversation restored.`
           : "Connected · saved conversation restored.", blocked: false });
       }
     } else if (event.type === "conversation-state" && event.state === "starting") {
@@ -805,11 +806,14 @@ function postSessionView(targetPanel) {
   postToPanel(targetPanel, { type: "session-state", ...sessionView });
   const providerId = selectedSession?.providerId ||
     (typeof process.env.VESPER_PROVIDER === "string" && process.env.VESPER_PROVIDER.trim()) || DEFAULT_PROVIDER_ID;
+  const configuredModel = listProviders().some((provider) => provider.id === providerId)
+    ? getProviderStatus(providerId, process.env).model
+    : null;
   postToPanel(targetPanel, {
     type: "provider-info",
     providerId,
     displayName: providerDisplayName(providerId),
-    model: providerId === OPENAI_PROVIDER_ID ? String(process.env.VESPER_OPENAI_MODEL || "").slice(0, 200) : null,
+    model: selectedSession?.modelId || configuredModel,
   });
 }
 
@@ -820,13 +824,24 @@ function selectedProviderForNewSession() {
 }
 
 function providerDisplayName(providerId) {
-  if (providerId === OPENAI_PROVIDER_ID) return "OpenAI Chat Completions (text only)";
-  if (providerId === DEFAULT_PROVIDER_ID) return "Codex app-server";
-  return safeMessage(providerId || "unknown provider");
+  const provider = listProviders().find((entry) => entry.id === providerId);
+  const name = provider?.name || safeMessage(providerId || "unknown provider");
+  return isTextOnlyProvider(providerId) ? `${name} (text only)` : name;
 }
 
 function providerSessionName(providerId) {
-  return providerId === OPENAI_PROVIDER_ID ? "OpenAI" : providerId === DEFAULT_PROVIDER_ID ? "Codex" : providerDisplayName(providerId);
+  if (providerId === OPENAI_PROVIDER_ID) return "OpenAI";
+  if (providerId === NVIDIA_PROVIDER_ID) return "NVIDIA NIM";
+  return providerId === DEFAULT_PROVIDER_ID ? "Codex" : providerDisplayName(providerId);
+}
+
+function isTextOnlyProvider(providerId) {
+  return providerId === OPENAI_PROVIDER_ID || providerId === NVIDIA_PROVIDER_ID;
+}
+
+function createProviderSession(cwd, providerId) {
+  const modelId = getProviderStatus(providerId, process.env).model;
+  return sessionStore.create(cwd, { providerId, modelId });
 }
 
 function setSessionView(targetPanel, view) {
@@ -1044,9 +1059,11 @@ function getHtml(webview) {
       if (message.type === 'provider-info') {
         currentProviderId = typeof message.providerId === 'string' ? message.providerId : 'codex-app-server';
         currentProviderName = typeof message.displayName === 'string' ? message.displayName : currentProviderId;
-        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : currentProviderId === 'openai-chat-completions' ? ' · model not configured' : '');
+        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '');
         providerPrivacy.textContent = currentProviderId === 'openai-chat-completions'
           ? 'OpenAI receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.'
+          : currentProviderId === 'nvidia-nim'
+            ? 'NVIDIA NIM receives submitted task and saved conversation text only. Generated text is not executed, applied, or validated; project files are not sent.'
           : 'Codex uses a read-only sandbox; Vesper declines approval requests.';
       }
       if (message.type === 'project') {
@@ -1158,13 +1175,14 @@ function getHtml(webview) {
       }
       if (message.type === 'assistant-done' && message.requestId === activeRequestId && activeAssistant) {
         const generated = message.generatedTextOnly || message.providerId === 'openai-chat-completions';
-        activeAssistant.title.textContent = (generated ? 'OpenAI · generated text · not executed · files unchanged' : 'Codex · completed') + (message.truncated ? ' · response truncated' : '') + ' · ' + message.elapsedMs + ' ms · ' + message.usage + (message.model ? ' · ' + message.model : '');
+        const generatedName = message.providerId === 'nvidia-nim' ? 'NVIDIA NIM' : 'OpenAI';
+        activeAssistant.title.textContent = (generated ? generatedName + ' · generated text · not executed · files unchanged' : 'Codex · completed') + (message.truncated ? ' · response truncated' : '') + ' · ' + message.elapsedMs + ' ms · ' + message.usage + (message.model ? ' · ' + message.model : '');
         activeAssistant = undefined;
       }
       if (message.type === 'assistant-done' && message.requestId === activeRequestId) {
         activeRequestId = undefined;
         status.textContent = message.generatedTextOnly || message.providerId === 'openai-chat-completions'
-          ? 'OpenAI · text generated, not executed' + (message.truncated ? ' · response truncated' : '')
+          ? (message.providerId === 'nvidia-nim' ? 'NVIDIA NIM' : 'OpenAI') + ' · text generated, not executed' + (message.truncated ? ' · response truncated' : '')
           : 'Codex · completed';
         stop.hidden = true;
         setBusy(false);

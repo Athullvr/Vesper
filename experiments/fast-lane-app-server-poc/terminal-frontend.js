@@ -6,7 +6,7 @@ const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
 const { unavailableHistory } = require("./conversation-history");
 const { approvalReview } = require("./approval-review");
-const { createExecutionProvider } = require("./execution-provider");
+const { createExecutionProvider, listProviders } = require("./execution-provider");
 const { assertExecutionProvider } = require("./execution-interface");
 const { codexApprovalResponse, normalizeApprovalRequest } = require("./codex-execution-provider");
 const { getPlanningMetadata } = require("./capability-planner");
@@ -96,7 +96,7 @@ class TerminalFrontend {
     this.write(`Vesper · local routing with ${this.providerDisplayName()} fallback\n`);
     this.write(`Execution provider: ${this.providerDisplayName()}\n`);
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions to list sessions, :switch ID to resume one, :new to start separately, :capabilities status|show ID to inspect local status, :plan TASK for an advisory preview, :routing for session counts, and :quit to exit. Local answers do not start provider tasks.\n\n");
+    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -208,10 +208,10 @@ class TerminalFrontend {
         ? { status: "recovery-required", recovery: { code: result.recoveryCode } }
         : { status: "active", recovery: null });
       this.finishStream();
-      if (result?.status === "completed" && this.executionProvider.id === "openai-chat-completions") {
-        this.write(`\n\n[OpenAI text generated · not executed · files unchanged${result.truncated ? " · response truncated" : ""} · ${elapsedMs} ms]\n`);
+      if (result?.status === "completed" && isTextOnlyProvider(this.executionProvider.id)) {
+        this.write(`\n\n[${safeTerminalText(this.providerShortName())} text generated · not executed · files unchanged${result.truncated ? " · response truncated" : ""} · ${elapsedMs} ms]\n`);
       } else if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
-      else if (result?.status === "interrupted" && uncertainInterrupt) this.write("\n\n[OpenAI request interrupted locally · remote completion unknown · start a new conversation to continue]\n");
+      else if (result?.status === "interrupted" && uncertainInterrupt) this.write(`\n\n[${safeTerminalText(this.providerShortName())} request interrupted locally · remote completion unknown · start a new conversation to continue]\n`);
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
       else if (result?.status === "timeout") this.write("\n\n[Codex · timed out and interrupted]\n");
       else this.write(`\n\n[${this.providerShortName()} · ended with status ${safeTerminalText(result?.status || "unknown")}]\n`);
@@ -242,15 +242,19 @@ class TerminalFrontend {
   }
 
   providerShortName() {
-    return this.executionProvider.id === "openai-chat-completions" ? "OpenAI" : "Codex";
+    if (this.executionProvider.id === "codex-app-server") return "Codex";
+    if (this.executionProvider.id === "openai-chat-completions") return "OpenAI";
+    if (this.executionProvider.id === "nvidia-nim") return "NVIDIA NIM";
+    return listProviders().find((provider) => provider.id === this.executionProvider.id)?.name || this.executionProvider.id;
   }
 
   providerDisplayName() {
     const state = this.executionProvider.getState?.() || {};
-    if (this.executionProvider.id === "openai-chat-completions") {
-      return `OpenAI API${state.model ? ` · ${safeTerminalText(state.model)}` : ""} (text only)`;
-    }
-    return "Codex app-server";
+    const descriptor = listProviders().find((provider) => provider.id === this.executionProvider.id);
+    const name = descriptor?.name || this.executionProvider.id;
+    const model = state.model ? ` · ${safeTerminalText(state.model)}` : "";
+    const textOnly = this.executionProvider.id === "openai-chat-completions" || this.executionProvider.id === "nvidia-nim";
+    return `${name}${model}${textOnly ? " (text only; generated text is not executed)" : ""}`;
   }
 
   requestApproval(request, params, context) {
@@ -658,6 +662,10 @@ function renderRoutingSummary(metrics, sessionId = null) {
   let summary = `${lines.join("\n")}\n`;
   if (summary.length > MAX_ROUTING_SUMMARY_LENGTH) summary = `${summary.slice(0, MAX_ROUTING_SUMMARY_LENGTH - 1)}\n`;
   return summary;
+}
+
+function isTextOnlyProvider(providerId) {
+  return providerId === "openai-chat-completions" || providerId === "nvidia-nim";
 }
 
 function createLineIO(input, output) {
