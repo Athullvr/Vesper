@@ -109,7 +109,10 @@ test("System Model follows local imports progressively and records ordered evide
 
   const result = await systemModel.investigate({ task: "Trace handleCheckout request flow", intent: "trace" });
   const targeted = result.steps.filter((step) => step.operation.toolId === "read_file" && step.operation.input.path.startsWith("src/checkout-"));
-  assert.deepEqual(targeted.map((step) => step.operation.input.path), ["src/checkout-controller.js", "src/checkout-service.js"]);
+  assert.deepEqual(targeted.map((step) => step.operation.input.path), ["src/checkout-controller.js", "src/checkout-service.js", "src/checkout-repository.js"]);
+  assert.ok(result.referenceIndex.status === "partial" || result.referenceIndex.status === "complete");
+  assert.ok(result.findings.some((item) => item.type === "symbol-definition" && item.symbol === "handleCheckout" && item.definitionKind === "function"));
+  assert.ok(result.referenceTrace.every((item) => item.path && item.line && item.confirmedByRead));
   assert.ok(result.findings.some((item) => item.type === "import-edge" && item.path === "src/main.js" && item.relatedPath === "src/checkout-controller.js" && item.lineStart === 1));
   assert.ok(result.findings.some((item) => item.type === "import-edge" && item.path === "src/checkout-controller.js" && item.relatedPath === "src/checkout-service.js" && item.lineStart === 1));
   assert.deepEqual(result.dependencyTrace.slice(0, 2).map((edge) => [edge.from, edge.line, edge.to]), [
@@ -124,6 +127,7 @@ test("System Model follows local imports progressively and records ordered evide
   assert.match(renderSystemModelReport(result), /src\/checkout-controller\.js:1/u);
   const saved = createTaskEvidence({ sessionId, projectRoot: root });
   assert.equal(mergeRepositoryEvidence(saved, result.evidence), true);
+  assert.equal(saved.investigation.referenceIndex.status, result.referenceIndex.status);
   assert.equal(saved.investigation.steps.some((step) => step.operation.input.path === "src/checkout-service.js"), true);
   assert.equal(saved.investigation.steps.find((step) => step.operation.input.path === "src/checkout-service.js").operation.input.maxBytes, 65_536);
   assert.ok(renderTaskEvidenceReport(saved).includes("Investigation stopped:"));

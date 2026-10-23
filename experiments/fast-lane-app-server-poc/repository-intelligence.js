@@ -4,6 +4,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { escapeTerminalOutput, redactSensitiveText } = require("./command-activity");
 const { createTaskEvidence, recordTaskToolOutcome, recordRepositoryFinding } = require("./task-evidence");
+const { SourceReferenceIndex } = require("./source-reference-index");
 
 const MAX_INSPECTION_MS = 10_000;
 // The shared task-evidence ledger stores at most 32 tool outcomes. Keep local
@@ -23,7 +24,10 @@ const MAX_CONTEXT_LENGTH = 7_000;
 const MAX_STRUCTURE_ENTRIES = 48;
 const MAX_FINDINGS = 48;
 const MAX_STEPS = 32;
+const MAX_INDEX_FINDINGS_PER_SYMBOL = 12;
+const MAX_INDEX_QUERY_SYMBOLS = 6;
 const FOLLOWUP_TOOL_IDS = new Set(["read_file"]);
+const REFERENCE_INDEX_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
 
 const MANIFEST_NAMES = new Set([
   "package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "pipfile",
@@ -79,6 +83,9 @@ class RepositoryIntelligenceService {
     this.clock = clock;
     this.createId = createId;
     this.activeController = null;
+    // Kept only to compare content digests between inspections. Cached relations
+    // are never returned: each result uses only files freshly read this run.
+    this.previousSymbolIndex = new Map();
   }
 
   async inspect({ task = "", intent = "overview", includeHistory = true, includeDiff = false, selectNextStep, signal } = {}) {
@@ -108,6 +115,15 @@ class RepositoryIntelligenceService {
       unresolved: [],
       stopReason: null,
       candidates: [],
+      symbolIndex: new SourceReferenceIndex(),
+      indexQuerySymbols: [],
+      indexCandidatePaths: new Set(),
+      indexUnsupportedExtensions: [],
+      indexDigests: new Map(),
+      indexReadPaths: new Set(),
+      indexRejected: 0,
+      indexReferenceCandidates: [],
+      indexInterrupted: false,
       sourceBytes: 0,
       generatedFiles: 0,
       oversizedSourceFiles: 0,
@@ -136,13 +152,17 @@ class RepositoryIntelligenceService {
       task = task.slice(0, 8_192);
       state.incomplete.push("Task search terms were derived from the first 8,192 characters; task text is not retained in repository evidence.");
     }
+    state.indexQuerySymbols = extractSearchTerms(task).filter((term) => /^[\p{L}_$][\p{L}\p{N}_$]{0,119}$/u.test(term)).slice(0, MAX_INDEX_QUERY_SYMBOLS);
     try {
       await this.inspectGit({ state, evidence, signal: controller.signal, includeHistory, includeDiff });
       await this.walkProject({ state, evidence, signal: controller.signal });
+      state.inventoryComplete = state.directories.length < MAX_DIRECTORIES && state.files.length < MAX_FILES &&
+        !state.incomplete.some((note) => /Could not list|Directory .* truncated|Traversal depth or directory budget|directories remain beyond|Git ignore rules could not be evaluated|Ignore rules .* could not be read/u.test(note));
       await this.inspectManifests({ state, evidence, signal: controller.signal });
       this.identifyLanguagesAndEntryPoints(state, evidence);
       const initialEvidence = await this.searchTaskEvidence({ state, evidence, task, intent, signal: controller.signal });
       await this.followEvidence({ state, evidence, task, intent, initialEvidence, selectNextStep, signal: controller.signal });
+      const referenceIndex = this.finalizeReferenceIndex(state, evidence);
       const elapsedMs = this.clock() - startedAt;
       if (elapsedMs > MAX_INSPECTION_MS) state.incomplete.push("Inspection reached the overall time bound.");
       if (state.calls >= MAX_TOOL_CALLS) state.incomplete.push("Inspection reached the permissioned tool-call bound.");
@@ -168,6 +188,7 @@ class RepositoryIntelligenceService {
         unresolved: uniqueText(state.unresolved, 12, 260),
         remainingBudget: this.remainingBudget(state, startedAt),
         stopReason: state.stopReason,
+        referenceIndex,
       };
       return Object.freeze({
         status: evidence.investigation.status,
@@ -183,17 +204,20 @@ class RepositoryIntelligenceService {
         git: Object.freeze({ available: state.gitAvailable, status: safeText(state.statusText, 4_000), history: safeText(state.historyText, 3_000), diff: safeText(state.diffText, 6_000),
           coverage: state.gitAvailable ? "Tracked working-tree status and unstaged tracked diff only; untracked files and staged diff are omitted. Git ignore checks use in-project rules; global excludes are not read." : "Git metadata is unavailable; filesystem findings are independent of Git." }),
         findings: Object.freeze(evidence.findings.slice(0, MAX_FINDINGS).map((item) => Object.freeze({ ...item }))),
+        referenceIndex,
         incomplete: Object.freeze(uniqueText(state.incomplete, 12, 260)),
         evidence,
       });
     } catch (error) {
       const aborted = controller.signal.aborted || error?.name === "AbortError";
+      state.indexInterrupted = true;
       const note = aborted ? "Repository inspection was cancelled before all requested evidence was collected." : safeCode(error?.code) === "INSPECTION_UNAVAILABLE"
         ? "The permissioned repository inspection runtime is unavailable." : "Repository inspection stopped before all requested evidence was collected.";
       state.incomplete.push(note);
+      const referenceIndex = this.finalizeReferenceIndex(state, evidence);
       evidence.investigation = { status: aborted ? "cancelled" : state.files.length || evidence.findings.length ? "partial" : "unavailable", intent: safeToken(intent) || "overview", note, observedAt: this.now().toISOString(),
         steps: state.steps.slice(0, MAX_STEPS), unresolved: uniqueText(state.unresolved, 12, 260), remainingBudget: this.remainingBudget(state, startedAt),
-        stopReason: aborted ? "cancelled" : error?.code === "INSPECTION_BUDGET" ? state.calls >= MAX_TOOL_CALLS ? "operation-budget" : "time-budget" : "investigation-error" };
+        stopReason: aborted ? "cancelled" : error?.code === "INSPECTION_BUDGET" ? state.calls >= MAX_TOOL_CALLS ? "operation-budget" : "time-budget" : "investigation-error", referenceIndex };
       return Object.freeze({ status: evidence.investigation.status, observedAt: evidence.investigation.observedAt, project: Object.freeze({ fileCount: state.files.length, directoryCount: state.directories.length,
         languages: Object.freeze(state.languages.slice(0, 8)), frameworks: Object.freeze(state.frameworks.slice(0, 8)), dependencies: Object.freeze(state.dependencies.slice(0, 20)),
         manifests: Object.freeze(state.manifests.map((item) => Object.freeze({ ...item }))), entryPoints: Object.freeze(state.entryPoints.slice(0, 10)),
@@ -201,7 +225,7 @@ class RepositoryIntelligenceService {
         candidateFiles: Object.freeze(state.candidates.slice(0, 80).map((item) => Object.freeze({ ...item }))), readPaths: Object.freeze([...state.readPaths]), truncated: true }),
         git: Object.freeze({ available: state.gitAvailable, status: safeText(state.statusText, 4_000), history: safeText(state.historyText, 3_000), diff: safeText(state.diffText, 6_000),
           coverage: state.gitAvailable ? "Tracked working-tree status and unstaged tracked diff only; untracked files and staged diff are omitted. Git ignore checks use in-project rules; global excludes are not read." : "Git metadata is unavailable; filesystem findings are independent of Git." }),
-        findings: Object.freeze(evidence.findings.slice(0, MAX_FINDINGS).map((item) => Object.freeze({ ...item }))),
+        findings: Object.freeze(evidence.findings.slice(0, MAX_FINDINGS).map((item) => Object.freeze({ ...item }))), referenceIndex,
         incomplete: Object.freeze(uniqueText(state.incomplete, 12, 260)), evidence });
     } finally {
       signal?.removeEventListener("abort", onAbort);
@@ -413,6 +437,10 @@ class RepositoryIntelligenceService {
     state.generatedFiles += sourceCandidates.length - nonGenerated.length;
     const sourceFiles = nonGenerated.filter((file) => file.sizeBytes === null || file.sizeBytes <= MAX_SOURCE_FILE_BYTES);
     state.oversizedSourceFiles += nonGenerated.length - sourceFiles.length;
+    const indexableSourceFiles = nonGenerated.filter((file) => CODE_EXTENSIONS.has(file.extension) && (file.sizeBytes === null || file.sizeBytes <= MAX_SOURCE_FILE_BYTES));
+    state.indexCandidatePaths = new Set(indexableSourceFiles.filter((file) => REFERENCE_INDEX_EXTENSIONS.has(file.extension)).map((file) => file.path));
+    state.indexRejected += indexableSourceFiles.length - state.indexCandidatePaths.size;
+    state.indexUnsupportedExtensions = uniqueText(indexableSourceFiles.filter((file) => !REFERENCE_INDEX_EXTENSIONS.has(file.extension)).map((file) => file.extension || "[no extension]"), 8, 20);
     const entryPaths = new Set(state.entryPoints.map((item) => item.path));
     const changedPaths = new Set(evidence.findings.filter((item) => item.type === "git-diff").map((item) => item.path).filter(Boolean));
     const scores = sourceFiles.map((file) => ({ file, score: sourceScore(file, taskTerms, entryPaths, changedPaths) }))
@@ -451,6 +479,7 @@ class RepositoryIntelligenceService {
       readContents.set(file.path, content);
       state.readPaths.add(file.path);
       state.pathDepths.set(file.path, 0);
+      this.indexSource({ state, evidence, filePath: file.path, content, digest: result.result?.sha256 });
       const pathMatches = taskTerms.filter((term) => file.path.toLocaleLowerCase("en-US").includes(term.toLocaleLowerCase("en-US")));
       if (pathMatches.length && evidence.findings.filter((item) => item.type === "path-match").length < 8) {
         this.find(evidence, { type: "path-match", description: `Repository-relative path includes task term ${pathMatches[0]}; this is a search signal, not proof of implementation ownership.`,
@@ -556,6 +585,7 @@ class RepositoryIntelligenceService {
     const selector = typeof selectNextStep === "function" ? selectNextStep : defaultNextStep;
     while (state.targetedReads < MAX_TARGETED_READS) {
       this.assertBudget(state, signal);
+      state.indexReferenceCandidates = state.symbolIndex.suggestFiles(state.indexQuerySymbols, state.candidates, state.readPaths);
       const snapshot = Object.freeze({
         intent,
         findings: Object.freeze(evidence.findings.slice(0, MAX_FINDINGS).map((item) => Object.freeze({ ...item }))),
@@ -566,6 +596,7 @@ class RepositoryIntelligenceService {
         unresolved: Object.freeze(uniqueText(state.unresolved, 12, 260)),
         remainingBudget: this.remainingBudget(state, state.startedAt),
         taskTerms: Object.freeze(taskTerms.slice(0, 8)),
+        referenceCandidates: Object.freeze(state.indexReferenceCandidates.slice(0, 8).map((item) => Object.freeze({ ...item }))),
       });
       let proposal;
       try { proposal = selector(snapshot); } catch {
@@ -623,6 +654,7 @@ class RepositoryIntelligenceService {
       state.readPaths.add(input.path);
       state.pathDepths.set(input.path, depth);
       readContents.set(input.path, content);
+      this.indexSource({ state, evidence, filePath: input.path, content, digest: result.result?.sha256 });
       const refs = this.inspectTargetedSource({ state, evidence, file, filePath: input.path, content, taskTerms, symbols });
       this.recordStepEvidence(state, refs);
       this.traceImports(state, evidence, readContents, [input.path], depth);
@@ -666,6 +698,142 @@ class RepositoryIntelligenceService {
     if (lines.length > MAX_SOURCE_LINES) state.incomplete.push(`Targeted source analysis for ${filePath} stopped at ${MAX_SOURCE_LINES} lines.`);
     if (!findingsForFile) state.unresolved.push(`Targeted file ${filePath} did not contain the task terms or tracked symbols in the bounded line scan.`);
     return refs;
+  }
+
+  indexSource({ state, evidence, filePath, content, digest }) {
+    const extension = path.posix.extname(filePath).toLowerCase();
+    if (!REFERENCE_INDEX_EXTENSIONS.has(extension)) return false;
+    state.indexReadPaths.add(filePath);
+    const result = state.symbolIndex.addFile(filePath, content, digest, { querySymbols: state.indexQuerySymbols });
+    if (!result.indexed) {
+      state.indexRejected += 1;
+      if (result.reason === "index-budget" || result.reason === "file-limit" || result.reason === "invalid-path-or-content") {
+        state.incomplete.push(`Symbol/reference indexing skipped ${filePath} because its bounded index input was unavailable or over budget.`);
+      }
+      return false;
+    }
+    state.indexDigests.set(filePath, result.record.sha256);
+    return true;
+  }
+
+  recordReferenceIndexFindings(state, evidence) {
+    for (const symbol of state.indexQuerySymbols.slice(0, MAX_INDEX_QUERY_SYMBOLS)) {
+      for (const relation of state.symbolIndex.matches(symbol, { limit: MAX_INDEX_FINDINGS_PER_SYMBOL })) {
+        const targetName = relation.importedName || relation.symbol;
+        const definitions = ["likely-call-site", "route-handler", "test-reference", "identifier-reference"].includes(relation.type)
+          ? state.symbolIndex.definitions([targetName]) : [];
+        const uniqueDefinition = definitions.length === 1 ? definitions[0] : null;
+        const descriptions = {
+          "symbol-definition": `Language-aware scan found a ${relation.definitionKind || "symbol"} definition of ${relation.symbol}.`,
+          "symbol-import": `Language-aware scan found ${relation.importedName || relation.symbol} imported as ${relation.symbol} from ${relation.moduleSpecifier || "a module"}.`,
+          "symbol-export": `Language-aware scan found ${relation.symbol} exported by this module${relation.importedName ? ` as an alias for ${relation.importedName}` : ""}.`,
+          "likely-call-site": `Language-aware scan found ${symbol} followed by a call argument list. This is a likely syntactic call site, not proof of its runtime target.`,
+          "identifier-reference": `Language-aware scan found an identifier reference to ${symbol}; it does not by itself establish a call.`,
+          "textual-reference": `A text match for ${symbol} occurs in this source line; it may be a comment or string.`,
+          "route-handler": `A framework-like route registration references ${symbol}${relation.route ? ` for ${relation.route}` : ""}; framework behavior is inferred.`,
+          "test-reference": `A test-path source line mentions ${symbol}; test coverage or execution is not established.`,
+        };
+        const description = descriptions[relation.type];
+        if (!description) continue;
+        this.find(evidence, {
+          type: relation.type,
+          description,
+          path: relation.path,
+          ...(uniqueDefinition ? { relatedPath: uniqueDefinition.path, relatedLine: uniqueDefinition.lineStart } : {}),
+          lineStart: relation.lineStart,
+          lineEnd: relation.lineEnd,
+          symbol: relation.symbol,
+          ...(relation.importedName ? { importedName: relation.importedName } : {}),
+          ...(relation.definitionKind ? { definitionKind: relation.definitionKind } : {}),
+          ...(relation.moduleSpecifier ? { moduleSpecifier: relation.moduleSpecifier } : {}),
+          ...(relation.route ? { route: relation.route } : {}),
+          discoveryMethod: relation.discoveryMethod,
+          sourceContextRead: relation.sourceContextRead === true,
+          source: "read_file",
+          confidence: relation.confidence,
+          observation: relation.observation,
+          status: relation.observation === "inferred" ? "unknown" : "confirmed",
+        });
+      }
+    }
+  }
+
+  finalizeReferenceIndex(state, evidence) {
+    this.recordReferenceIndexFindings(state, evidence);
+    this.attachIndexEvidenceRefs(state, evidence);
+    const current = new Map(state.indexDigests);
+    const inventory = new Set(state.files.map((item) => item.path));
+    const previous = this.previousSymbolIndex;
+    const removedPaths = state.inventoryComplete ? [...previous.keys()].filter((filePath) => !inventory.has(filePath)) : [];
+    const renamed = [];
+    const added = [];
+    const changed = [];
+    for (const [filePath, digest] of current) {
+      if (!previous.has(filePath)) {
+        const oldPath = removedPaths.find((candidate) => previous.get(candidate) === digest);
+        if (oldPath) renamed.push({ from: oldPath, to: filePath });
+        else added.push(filePath);
+      } else if (previous.get(filePath) !== digest) changed.push(filePath);
+    }
+    const renamedFrom = new Set(renamed.map((item) => item.from));
+    const removed = removedPaths.filter((filePath) => !renamedFrom.has(filePath));
+    const notRefreshed = [...previous.keys()].filter((filePath) => inventory.has(filePath) && !state.indexReadPaths.has(filePath));
+    for (const symbol of state.indexQuerySymbols.slice(0, MAX_INDEX_QUERY_SYMBOLS)) {
+      const definitions = state.symbolIndex.definitions([symbol]);
+      if (definitions.length <= 1) continue;
+      const paths = [...new Set(definitions.map((item) => item.path))].slice(0, 4);
+      state.unresolved.push(`Indexed symbol ${symbol} has ${definitions.length} definitions${paths.length ? ` across ${paths.join(", ")}` : ""}; no unique implementation was selected.`);
+      this.find(evidence, { type: "ambiguous-symbol", description: `The bounded index found multiple definitions of ${symbol}; Vesper did not select a unique implementation.`,
+        source: "read_file", confidence: "high", observation: "observed", status: "unknown" });
+    }
+    if (notRefreshed.length) {
+      state.unresolved.push(`${notRefreshed.length} previously indexed file(s) were not reread; their cached line references were discarded for this result.`);
+    }
+    const index = state.symbolIndex.summary();
+    const eligibleFiles = state.indexCandidatePaths.size;
+    const partial = index.partial || index.indexedFiles < eligibleFiles || state.indexRejected > 0 || state.indexInterrupted || state.oversizedSourceFiles > 0 || state.generatedFiles > 0;
+    if (index.indexedFiles < eligibleFiles) {
+      state.incomplete.push(`The JavaScript/TypeScript reference index covered ${index.indexedFiles} of ${eligibleFiles} eligible source files within the read and index budgets.`);
+    }
+    if (state.indexRejected) state.incomplete.push(`The symbol index skipped ${state.indexRejected} binary or unsupported-language source file(s); supported extensions are JavaScript and TypeScript only.`);
+    const summary = Object.freeze({
+      language: index.language,
+      status: partial ? "partial" : "complete",
+      freshness: "Current findings use only files read during this inspection; cached relations are discarded unless the file is reread.",
+      indexedFiles: index.indexedFiles,
+      eligibleFiles,
+      indexedBytes: index.indexedBytes,
+      parseTimeMs: index.parseTimeMs,
+      relationships: index.relationships,
+      unsupportedFiles: state.indexRejected,
+      unsupportedExtensions: Object.freeze(state.indexUnsupportedExtensions.slice(0, 8)),
+      malformedFiles: index.malformedFiles,
+      excludedFiles: state.indexRejected + state.oversizedSourceFiles + state.generatedFiles,
+      truncated: partial || index.truncated,
+      changes: Object.freeze({
+        added: Object.freeze(added.slice(0, 8)),
+        changed: Object.freeze(changed.slice(0, 8)),
+        removed: Object.freeze(removed.slice(0, 8)),
+        renamed: Object.freeze(renamed.slice(0, 8).map((item) => Object.freeze({ ...item }))),
+        notRefreshed: notRefreshed.length,
+        inventoryComplete: state.inventoryComplete === true,
+      }),
+    });
+    this.previousSymbolIndex = current;
+    return summary;
+  }
+
+  attachIndexEvidenceRefs(state, evidence) {
+    const indexedTypes = new Set(["symbol-definition", "symbol-import", "symbol-export", "likely-call-site", "identifier-reference", "textual-reference", "route-handler", "test-reference"]);
+    for (const step of state.steps) {
+      if (step.operation?.toolId !== "read_file" || !step.result) continue;
+      const filePath = step.operation.input?.path;
+      const existing = Array.isArray(step.result.evidenceRefs) ? step.result.evidenceRefs : [];
+      const additions = evidence.findings.filter((item) => item.path === filePath && indexedTypes.has(item.type) && Number.isInteger(item.lineStart))
+        .slice(0, 8).map((item) => ({ type: item.type, path: item.path, lineStart: item.lineStart, ...(item.lineEnd ? { lineEnd: item.lineEnd } : {}) }));
+      const seen = new Set(existing.map((item) => `${item.type}:${item.path}:${item.lineStart || ""}`));
+      step.result.evidenceRefs = [...existing, ...additions.filter((item) => !seen.has(`${item.type}:${item.path}:${item.lineStart}`))].slice(0, 8);
+    }
   }
 
   recordDiffFindings(evidence, diff, state) {
@@ -1078,15 +1246,20 @@ function renderRepositoryContext(result) {
   if (result.git?.coverage) lines.push(`Git evidence coverage: ${result.git.coverage}`);
   const investigation = result.evidence?.investigation || {};
   if (investigation.stopReason) lines.push(`Investigation stopped: ${safeStepText(investigation.stopReason.replaceAll("-", " "), 100)}.`);
+  if (investigation.referenceIndex) {
+    lines.push(`JS/TS symbol/reference index: ${investigation.referenceIndex.status} · ${investigation.referenceIndex.indexedFiles}/${investigation.referenceIndex.eligibleFiles} eligible files · ${investigation.referenceIndex.relationships} relationships.`);
+    lines.push(safeStepText(investigation.referenceIndex.freshness, 200));
+  }
   for (const step of (investigation.steps || []).slice(-8)) {
     const target = step.operation?.input?.path ? ` ${safeStepText(step.operation.input.path, 120)}` : "";
     lines.push(`Step ${step.index}: ${safeStepText(step.operation?.toolId || "read-only operation", 80)}${target} (${safeStepText(step.state || "unknown", 40)}): ${safeStepText(step.result?.summary || "result unavailable", 180)}`);
   }
-  const priority = new Map([["symbol", 0], ["reference", 1], ["source-section", 2], ["import-edge", 3], ["git-diff-hunk", 4], ["git-diff", 5]]);
+  const priority = new Map([["symbol-definition", 0], ["symbol", 1], ["likely-call-site", 2], ["route-handler", 3], ["symbol-import", 4], ["symbol-export", 5], ["identifier-reference", 6], ["textual-reference", 7], ["test-reference", 8], ["reference", 9], ["source-section", 10], ["import-edge", 11], ["git-diff-hunk", 12], ["git-diff", 13]]);
   const findings = [...(result.findings || [])].sort((a, b) => (priority.get(a.type) ?? 10) - (priority.get(b.type) ?? 10));
   for (const finding of findings.slice(0, 10)) {
     const location = finding.path ? `${finding.path}${finding.lineStart ? `:${finding.lineStart}${finding.lineEnd && finding.lineEnd !== finding.lineStart ? `-${finding.lineEnd}` : ""}` : ""}` : "project-wide";
-    lines.push(`- ${finding.observation} ${finding.type} at ${location}: ${finding.description} [${finding.confidence} confidence; source ${finding.source}].`);
+    const related = finding.relatedPath ? ` → ${finding.relatedPath}${finding.relatedLine ? `:${finding.relatedLine}` : ""}` : "";
+    lines.push(`- ${finding.observation} ${finding.type} at ${location}${related}: ${finding.description} [${finding.confidence} confidence; source ${finding.source}${finding.discoveryMethod ? `; method ${finding.discoveryMethod}` : ""}${finding.sourceContextRead ? "; inspected source" : ""}].`);
   }
   for (const note of (investigation.unresolved || []).slice(0, 4)) lines.push(`- Unresolved: ${safeStepText(note, 220)}`);
   for (const note of (result.incomplete || []).slice(0, 4)) lines.push(`- Coverage limit: ${note}`);
@@ -1130,11 +1303,14 @@ function defaultNextStep(snapshot) {
     .sort((a, b) => a.depth - b.depth || String(a.relatedPath).localeCompare(String(b.relatedPath)))[0];
   if (edge) return makeReadPlan(edge.relatedPath, edge.depth,
     "Follow the observed local import from " + edge.path + ":" + edge.lineStart + " to inspect its declarations and references.");
+  const indexedCandidate = (snapshot.referenceCandidates || []).find((item) => !readPaths.has(item.path));
+  if (indexedCandidate) return makeReadPlan(indexedCandidate.path, 1,
+    `Read ${indexedCandidate.path} because it is a ${indexedCandidate.reason} for ${indexedCandidate.symbol} defined in ${indexedCandidate.definitionPath}.`);
   const candidate = snapshot.candidateFiles.find((item) => item.score >= 9 && !readPaths.has(item.path));
   if (candidate && snapshot.findings.some((item) => ["symbol", "reference", "path-match", "git-diff"].includes(item.type))) {
     return makeReadPlan(candidate.path, 1, "Inspect the task-matched or changed source candidate " + candidate.path + " to resolve remaining references.");
   }
-  return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
+  return { stop: true, reason: snapshot.findings.some((item) => ["symbol", "reference", "symbol-definition", "identifier-reference", "likely-call-site", "import-edge"].includes(item.type)) ? "no-justified-next-step" : "no-targeted-evidence" };
 }
 
 function isGeneratedSourcePath(value) {

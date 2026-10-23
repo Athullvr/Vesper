@@ -53,7 +53,14 @@ function recordRepositoryFinding(evidence, finding = {}) {
     ...(safeRelativePath(finding.relatedPath) ? { relatedPath: safeRelativePath(finding.relatedPath) } : {}),
     ...(Number.isInteger(finding.lineStart) && finding.lineStart > 0 ? { lineStart: finding.lineStart } : {}),
     ...(Number.isInteger(finding.lineEnd) && finding.lineEnd >= (finding.lineStart || 1) ? { lineEnd: finding.lineEnd } : {}),
+    ...(Number.isInteger(finding.relatedLine) && finding.relatedLine > 0 ? { relatedLine: finding.relatedLine } : {}),
     ...(safeDescription(finding.symbol, 120) ? { symbol: safeDescription(finding.symbol, 120) } : {}),
+    ...(safeDescription(finding.moduleSpecifier, 200) ? { moduleSpecifier: safeDescription(finding.moduleSpecifier, 200) } : {}),
+    ...(safeDescription(finding.importedName, 120) ? { importedName: safeDescription(finding.importedName, 120) } : {}),
+    ...(safeDescription(finding.route, 200) ? { route: safeDescription(finding.route, 200) } : {}),
+    ...(safeToken(finding.definitionKind, 20) ? { definitionKind: safeToken(finding.definitionKind, 20) } : {}),
+    ...(safeToken(finding.discoveryMethod, 80) ? { discoveryMethod: safeToken(finding.discoveryMethod, 80) } : {}),
+    ...(finding.sourceContextRead === true ? { sourceContextRead: true } : {}),
     source,
     confidence: ["high", "medium", "low", "unknown"].includes(finding.confidence) ? finding.confidence : "unknown",
     observation: finding.observation === "inferred" ? "inferred" : "observed",
@@ -86,6 +93,9 @@ function mergeRepositoryEvidence(target, source) {
       ...(safeToken(source.investigation.intent, 40) ? { intent: safeToken(source.investigation.intent, 40) } : {}),
       ...(safeDescription(source.investigation.note, 240) ? { note: safeDescription(source.investigation.note, 240) } : {}),
       ...(safeTimestamp(source.investigation.observedAt) ? { observedAt: safeTimestamp(source.investigation.observedAt) } : {}),
+      ...(source.investigation.referenceIndex && typeof source.investigation.referenceIndex === "object" ? {
+        referenceIndex: normalizeReferenceIndex(source.investigation.referenceIndex),
+      } : {}),
       ...(Array.isArray(source.investigation.steps) ? { steps: normalizeInvestigationSteps(source.investigation.steps) } : {}),
       ...(Array.isArray(source.investigation.unresolved) ? { unresolved: source.investigation.unresolved.slice(0, 12).map((item) => safeDescription(item, 240)).filter(Boolean) } : {}),
       ...(source.investigation.remainingBudget && typeof source.investigation.remainingBudget === "object" ? {
@@ -374,6 +384,37 @@ function boundedInteger(value, minimum, maximum) {
   return Number.isInteger(value) ? Math.min(maximum, Math.max(minimum, value)) : 0;
 }
 
+function normalizeReferenceIndex(value) {
+  const changes = value.changes && typeof value.changes === "object" ? value.changes : {};
+  return {
+    status: ["complete", "partial", "unavailable"].includes(value.status) ? value.status : "partial",
+    language: safeDescription(value.language, 100) || "JavaScript/TypeScript",
+    freshness: safeDescription(value.freshness, 220) || "Freshness is unknown.",
+    indexedFiles: boundedInteger(value.indexedFiles, 0, 12),
+    eligibleFiles: boundedInteger(value.eligibleFiles, 0, 600),
+    indexedBytes: boundedInteger(value.indexedBytes, 0, 512 * 1024),
+    parseTimeMs: boundedInteger(value.parseTimeMs, 0, 750),
+    relationships: boundedInteger(value.relationships, 0, 2_400),
+    unsupportedFiles: boundedInteger(value.unsupportedFiles, 0, 600),
+    unsupportedExtensions: Array.isArray(value.unsupportedExtensions) ? value.unsupportedExtensions.slice(0, 8).map((item) => safeDescription(item, 20)).filter(Boolean) : [],
+    malformedFiles: boundedInteger(value.malformedFiles, 0, 12),
+    excludedFiles: boundedInteger(value.excludedFiles, 0, 600),
+    truncated: value.truncated === true,
+    changes: {
+      added: uniquePaths(changes.added).slice(0, 8),
+      changed: uniquePaths(changes.changed).slice(0, 8),
+      removed: uniquePaths(changes.removed).slice(0, 8),
+      renamed: Array.isArray(changes.renamed) ? changes.renamed.slice(0, 8).flatMap((item) => {
+        const from = safeRelativePath(item?.from);
+        const to = safeRelativePath(item?.to);
+        return from && to ? [{ from, to }] : [];
+      }) : [],
+      notRefreshed: boundedInteger(changes.notRefreshed, 0, 600),
+      inventoryComplete: changes.inventoryComplete === true,
+    },
+  };
+}
+
 function normalizeInvestigationSteps(steps) {
   return steps.slice(0, MAX_EVIDENCE_ENTRIES).flatMap((step, index) => {
     if (!step || typeof step !== "object" || Array.isArray(step)) return [];
@@ -520,6 +561,13 @@ function renderTaskEvidenceReport(evidence) {
   }
   const investigation = evidence?.investigation && typeof evidence.investigation === "object" ? evidence.investigation : null;
   if (investigation?.stopReason) lines.push("Investigation stopped: " + (safeToken(investigation.stopReason, 60) || "unknown") + ".");
+  if (investigation?.referenceIndex) {
+    const index = investigation.referenceIndex;
+    lines.push(`Symbol/reference index: ${index.status} · ${index.indexedFiles}/${index.eligibleFiles} eligible JS/TS files · ${index.relationships} bounded relationships · ${index.parseTimeMs} ms parsing · current-file reads only.`);
+    if (index.changes?.changed?.length || index.changes?.removed?.length || index.changes?.renamed?.length) {
+      lines.push(`Index refresh: ${index.changes.changed.length} changed, ${index.changes.removed.length} removed, ${index.changes.renamed.length} same-content rename(s) observed.`);
+    }
+  }
   for (const step of (investigation?.steps || []).slice(0, 8)) {
     const target = step.operation?.input?.path ? " " + formatPath(step.operation.input.path) : "";
     lines.push("- Step " + step.index + ": " + (safeToken(step.operation?.toolId, 80) || "read-only operation") + target +
@@ -531,7 +579,8 @@ function renderTaskEvidenceReport(evidence) {
     lines.push("Repository findings:");
     for (const finding of findings) {
       const location = finding.path ? `${formatPath(finding.path)}${finding.lineStart ? `:${finding.lineStart}${finding.lineEnd && finding.lineEnd !== finding.lineStart ? `-${finding.lineEnd}` : ""}` : ""}` : "[project]";
-      lines.push(`- ${finding.observation === "inferred" ? "Inferred" : "Observed"} · ${safeToken(finding.type, 40) || "finding"} · ${location}: ${safeDescription(finding.description, 320)} (${safeToken(finding.confidence, 10) || "unknown"} confidence; ${safeToken(finding.status, 20) || "unknown"}; source ${safeToken(finding.source, 80) || "unknown"}).`);
+      const target = finding.relatedPath ? ` → ${formatPath(finding.relatedPath)}${finding.relatedLine ? `:${finding.relatedLine}` : ""}` : "";
+      lines.push(`- ${finding.observation === "inferred" ? "Inferred" : "Observed"} · ${safeToken(finding.type, 40) || "finding"} · ${location}${target}: ${safeDescription(finding.description, 320)} (${safeToken(finding.confidence, 10) || "unknown"} confidence; ${safeToken(finding.status, 20) || "unknown"}; source ${safeToken(finding.source, 80) || "unknown"}${finding.discoveryMethod ? `; method ${safeToken(finding.discoveryMethod, 80) || "unknown"}` : ""}${finding.sourceContextRead ? "; inspected source" : ""}).`);
     }
   }
   if (Array.isArray(evidence?.findings) && evidence.findings.length > findings.length) {
