@@ -89,6 +89,32 @@ function createProvider({ root, project, baseUrl, providerId = "openai-chat-comp
   });
 }
 
+test("a response that needs no project tools stays lightweight without an evidence footer", async (t) => {
+  const root = temporaryRoot(t);
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  const baseUrl = await localServer(t, async (request, response) => {
+    const body = await readJson(request);
+    assert.ok(Array.isArray(body.tools));
+    completeJson(response, "A rebase replays commits onto a new base.");
+  });
+  const provider = createProvider({ root, project, baseUrl });
+  const runtime = createPermissionedToolRuntime({ projectRoot: project, sessionId: SESSION_ID });
+  provider.setToolRuntime(runtime);
+  const text = [];
+  provider.on("event", (event) => { if (event.type === "text-delta") text.push(event.text); });
+  try {
+    const result = await provider.submitTask({ task: "What is a rebase?", projectPath: project });
+    assert.equal(result.status, "completed");
+    assert.equal(result.toolCallCount, 0);
+    assert.equal(result.evidenceReport, undefined);
+    assert.equal(text.join(""), "A rebase replays commits onto a new base.");
+  } finally {
+    await runtime.dispose();
+    provider.dispose();
+  }
+});
+
 test("structured streamed calls assemble fragments, invoke multiple read-only tools, and return bounded results for a final JSON response", async (t) => {
   const root = temporaryRoot(t);
   const project = path.join(root, "project");
@@ -103,6 +129,8 @@ test("structured streamed calls assemble fragments, invoke multiple read-only to
       assert.ok(Array.isArray(body.tools));
       assert.ok(body.tools.some((entry) => entry.function.name === "read_file"));
       assert.ok(body.tools.some((entry) => entry.function.name === "list_files"));
+      assert.equal(body.tools.some((entry) => entry.function.name === "propose_file_change"), false);
+      assert.equal(body.tools.some((entry) => entry.function.name === "apply_file_change"), false);
       assert.ok(body.tools.every((entry) => entry.function.name !== "run_command"));
       sse(response, [
         { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_", type: "function", function: { name: "read_", arguments: "{\"path\":\"READ" } }] }, finish_reason: null }] },
@@ -132,6 +160,12 @@ test("structured streamed calls assemble fragments, invoke multiple read-only to
     assert.equal(result.status, "completed");
     assert.equal(result.toolCallCount, 2);
     assert.equal(result.changedFiles, false);
+    assert.match(result.evidenceReport, /read_file: `README\.md` \(verified\)/u);
+    assert.match(result.evidenceReport, /list_files: `\.` \(verified\)/u);
+    assert.match(result.evidenceReport, /No file change was proposed or applied/u);
+    assert.match(result.evidenceReport, /Tests\/builds: not run by Vesper/u);
+    assert.ok(events.some((event) => event.type === "task-progress" && event.kind === "workflow-stage" && event.stage === "planning"));
+    assert.ok(events.some((event) => event.type === "task-progress" && event.kind === "workflow-stage" && event.stage === "report"));
     assert.deepEqual(events.filter((event) => event.type === "tool-call" && event.state === "requested").map((event) => event.toolId), ["read_file", "list_files"]);
     assert.equal(events.filter((event) => event.type === "tool-result" && event.state === "verified").length, 2);
     const history = await provider.readConversationHistory();
@@ -177,8 +211,83 @@ test("unknown tool names and malformed arguments become explicit tool errors and
   try {
     const result = await provider.submitTask({ task: "Inspect safely.", projectPath: project });
     assert.equal(result.status, "completed");
+    assert.match(result.evidenceReport, /unsupported_tool: rejected \(UNSUPPORTED_TOOL\)/u);
+    assert.match(result.evidenceReport, /read_file: rejected \(INVALID_ARGUMENT\)/u);
     assert.deepEqual(runtime.getAuditEvents(), []);
     assert.equal(requests.length, 2);
+  } finally {
+    await runtime.dispose();
+    provider.dispose();
+  }
+});
+
+test("file proposals are rejected unless the assistant states a plan grounded in inspected evidence", async (t) => {
+  const root = temporaryRoot(t);
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, "src.js"), "const value = 1;\n", "utf8");
+  let requests = 0;
+  const baseUrl = await localServer(t, async (request, response) => {
+    const body = await readJson(request);
+    requests += 1;
+    if (requests === 1) {
+      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read", type: "function", function: {
+        name: "read_file", arguments: JSON.stringify({ path: "src.js" }),
+      } }] }, finish_reason: "tool_calls" }] }]);
+    } else if (requests === 2) {
+      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_propose", type: "function", function: {
+        name: "propose_file_change", arguments: JSON.stringify({ path: "src.js", content: "const value = 2;\n" }),
+      } }] }, finish_reason: "tool_calls" }] }]);
+    } else {
+      const toolResult = body.messages.find((message) => message.role === "tool" && message.tool_call_id === "call_propose");
+      assert.match(toolResult.content, /PLAN_REQUIRED/u);
+      completeJson(response, "I did not propose a change because I did not provide the required plan.");
+    }
+  });
+  const provider = createProvider({ root, project, baseUrl });
+  const runtime = createPermissionedToolRuntime({ projectRoot: project, sessionId: SESSION_ID });
+  provider.setToolRuntime(runtime);
+  try {
+    const result = await provider.submitTask({ task: "Change the value.", projectPath: project });
+    assert.equal(result.status, "completed");
+    assert.match(result.evidenceReport, /propose_file_change: rejected \(PLAN_REQUIRED\)/u);
+    assert.match(result.evidenceReport, /No file change was proposed or applied/u);
+    assert.equal(runtime.getAuditEvents().filter((event) => event.toolId === "propose_file_change").length, 0);
+    assert.equal(requests, 3);
+  } finally {
+    await runtime.dispose();
+    provider.dispose();
+  }
+});
+
+test("a provider failure after project inspection emits an evidence report and is never resubmitted", async (t) => {
+  const root = temporaryRoot(t);
+  const project = path.join(root, "project");
+  fs.mkdirSync(project);
+  fs.writeFileSync(path.join(project, "src.js"), "const answer = 42;\n", "utf8");
+  let requests = 0;
+  const baseUrl = await localServer(t, async (_request, response) => {
+    requests += 1;
+    if (requests === 1) {
+      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_read", type: "function", function: {
+        name: "read_file", arguments: JSON.stringify({ path: "src.js" }),
+      } }] }, finish_reason: "tool_calls" }] }]);
+      return;
+    }
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end("{\"error\":{\"message\":\"fixture error\"}}");
+  });
+  const provider = createProvider({ root, project, baseUrl });
+  const runtime = createPermissionedToolRuntime({ projectRoot: project, sessionId: SESSION_ID });
+  provider.setToolRuntime(runtime);
+  const events = [];
+  provider.on("event", (event) => events.push(event));
+  try {
+    await assert.rejects(provider.submitTask({ task: "Inspect the implementation.", projectPath: project }), (error) => error.code === "SUBMISSION_OUTCOME_UNCERTAIN");
+    assert.equal(requests, 2);
+    const report = events.find((event) => event.type === "task-progress" && event.kind === "workflow-report")?.report;
+    assert.match(report, /read_file: `src\.js` \(verified\)/u);
+    assert.match(report, /Tests\/builds: not run by Vesper/u);
   } finally {
     await runtime.dispose();
     provider.dispose();
@@ -229,17 +338,30 @@ test("model-requested file changes use the terminal's exact one-time approval an
     const body = await readJson(request);
     requestCount += 1;
     if (requestCount === 1) {
-      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_propose", type: "function", function: {
-        name: "propose_file_change", arguments: JSON.stringify({ path: "notes.txt", content: "new value\n" }),
+      assert.equal(body.tools.some((entry) => entry.function.name === "propose_file_change"), false);
+      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_inspect", type: "function", function: {
+        name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }),
       } }] }, finish_reason: "tool_calls" }] }]);
       return;
     }
     if (requestCount === 2) {
-      const proposalToolResult = JSON.parse(body.messages.find((message) => message.role === "tool").content);
+      assert.ok(body.tools.some((entry) => entry.function.name === "propose_file_change"));
+      assert.equal(body.tools.some((entry) => entry.function.name === "apply_file_change"), false);
+      assert.match(body.messages[0].content, /read_file: `notes\.txt` \(verified\)/u);
+      assert.match(body.messages[0].content, /state a concise plan grounded in the paths actually inspected/u);
+      sse(response, [{ choices: [{ delta: { content: "Plan: update `notes.txt` using the inspected original contents, then rely on Vesper's write verification.", tool_calls: [{ index: 0, id: "call_propose", type: "function", function: {
+        name: "propose_file_change", arguments: JSON.stringify({ path: "notes.txt", content: "new value\n" }),
+      } }] }, finish_reason: "tool_calls" }] }]);
+      return;
+    }
+    if (requestCount === 3) {
+      const proposalMessage = body.messages.find((message) => message.role === "tool" && message.tool_call_id === "call_propose");
+      const proposalToolResult = JSON.parse(proposalMessage.content);
       proposalId = proposalToolResult.proposal.proposalId;
       assert.equal(proposalToolResult.state, "proposed");
       assert.equal(proposalToolResult.proposal.message, "Proposal created. No file was changed. A separate Vesper approval is required to apply it.");
       assert.equal(Object.hasOwn(proposalToolResult.proposal, "review"), false);
+      assert.ok(body.tools.some((entry) => entry.function.name === "apply_file_change"));
       sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_apply", type: "function", function: {
         name: "apply_file_change", arguments: JSON.stringify({ proposalId }),
       } }] }, finish_reason: "tool_calls" }] }]);
@@ -278,11 +400,20 @@ test("model-requested file changes use the terminal's exact one-time approval an
     const result = await provider.submitTask({ task: "Update notes.txt.", projectPath: project });
     assert.equal(result.status, "completed");
     assert.equal(result.changedFiles, true);
+    assert.match(result.evidenceReport, /read_file: `notes\.txt` \(verified\)/u);
+    assert.match(result.evidenceReport, /`notes\.txt`: applied/u);
+    assert.match(result.evidenceReport, /Applied and verified by Vesper read-back/u);
+    assert.match(result.evidenceReport, /concise plan referencing inspected project evidence was shown/u);
+    assert.match(result.evidenceReport, /Tests\/builds: not run by Vesper/u);
     assert.equal(approvalPromptCount, 1);
     assert.equal(fs.readFileSync(path.join(project, "notes.txt"), "utf8"), "new value\n");
     assert.match(output.text, /Complete original content:[\s\S]*old value/u);
     assert.match(output.text, /Complete proposed content:[\s\S]*new value/u);
     assert.match(output.text, /approved once/u);
+    assert.match(output.text, /planning from inspected evidence/u);
+    assert.match(output.text, /preparing a reviewable file proposal/u);
+    assert.match(output.text, /waiting for fresh one-time approval/u);
+    assert.match(output.text, /verifying the approved file change/u);
     assert.ok(proposalId);
   } finally {
     await terminal.toolRuntime.dispose();
@@ -303,12 +434,18 @@ test("disposing an active provider interrupts a pending tool approval before any
     const body = await readJson(request);
     requestCount += 1;
     if (requestCount === 1) {
-      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_propose", type: "function", function: {
+      sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_inspect", type: "function", function: {
+        name: "read_file", arguments: JSON.stringify({ path: "notes.txt" }),
+      } }] }, finish_reason: "tool_calls" }] }]);
+      return;
+    }
+    if (requestCount === 2) {
+      sse(response, [{ choices: [{ delta: { content: "Plan: update `notes.txt` using the inspected original contents.", tool_calls: [{ index: 0, id: "call_propose", type: "function", function: {
         name: "propose_file_change", arguments: JSON.stringify({ path: "notes.txt", content: "changed\n" }),
       } }] }, finish_reason: "tool_calls" }] }]);
       return;
     }
-    const proposal = JSON.parse(body.messages.find((message) => message.role === "tool").content).proposal;
+    const proposal = JSON.parse(body.messages.find((message) => message.role === "tool" && message.tool_call_id === "call_propose").content).proposal;
     sse(response, [{ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_apply", type: "function", function: {
       name: "apply_file_change", arguments: JSON.stringify({ proposalId: proposal.proposalId }),
     } }] }, finish_reason: "tool_calls" }] }]);
@@ -328,7 +465,7 @@ test("disposing an active provider interrupts a pending tool approval before any
     await waitingForApproval;
     provider.dispose();
     await assert.rejects(task, (error) => error.code === "CONNECTION_LOST");
-    assert.equal(requestCount, 2);
+    assert.equal(requestCount, 3);
     assert.equal(fs.readFileSync(target, "utf8"), "original\n");
     assert.ok(runtime.getAuditEvents().some((event) => event.toolId === "apply_file_change" && event.state === "interrupted"));
   } finally {

@@ -12,6 +12,16 @@ const {
 const { unavailableHistory } = require("./conversation-history");
 const { OpenAIConversationStore, OPENAI_PROVIDER_ID } = require("./openai-conversation-store");
 const { redactSensitiveText } = require("./command-activity");
+const {
+  createTaskEvidence,
+  hasSuccessfulInspection,
+  hasEvidenceBackedPlan,
+  recordTaskToolOutcome,
+  recordRejectedTaskTool,
+  renderTaskEvidenceReport,
+  renderEvidenceInstructions,
+  MAX_REPORT_LENGTH,
+} = require("./task-evidence");
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
@@ -37,7 +47,8 @@ const MAX_TOOL_ARGUMENT_BYTES = 8 * 1024;
 const MAX_TOOL_CALLS_PER_RESPONSE = 8;
 const MAX_TOOL_CALL_ID_LENGTH = 128;
 const SAFE_TOOL_IDS = new Set(["read_file", "list_files", "search_files", "git_status", "git_diff", "git_log", "propose_file_change", "apply_file_change"]);
-const DEVELOPER_MESSAGE = "You are Vesper's coding assistant. If Vesper tools are provided, use only those tools to inspect the selected project. If no tools are provided, do not claim to have inspected project files. Tool results are bounded evidence, not proof that code was changed or validated. File changes may only be proposed and then applied after Vesper obtains an explicit one-time user approval. These tools cannot run commands. Never claim a file change, command execution, or verification unless Vesper reports it.";
+const READ_ONLY_TOOL_IDS = new Set(["read_file", "list_files", "search_files", "git_status", "git_diff", "git_log"]);
+const DEVELOPER_MESSAGE = "You are Vesper's coding assistant. If no Vesper project tools are provided, do not claim to have inspected project files. For a coding change with project tools available, inspect relevant project files and Git state first. After inspection, state a concise plan grounded in the paths actually inspected before proposing a change. Read-only questions may stay lightweight. Use only the registered Vesper tools; no tool can run commands. A proposal does not change a file. Applying it requires Vesper's fresh one-time approval and result verification. In the final response distinguish inspected facts, assumptions, applied changes, failures, and unverified steps. Never claim tests or builds passed because this workflow cannot run them.";
 const SUPPORTED_FINISH_REASONS = new Set(["stop", "length", "content_filter"]);
 const CHAT_COMPLETIONS_CAPABILITIES = Object.freeze({
   streaming: true,
@@ -341,6 +352,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       toolCallCount: 0,
       toolIterationCount: 0,
       changedFiles: false,
+      evidence: createTaskEvidence(),
     };
     this.active = active;
     active.timer = setTimeout(() => {
@@ -350,10 +362,18 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     }, Math.min(this.config.requestTimeoutMs, this.config.maxAgentElapsedMs));
     active.timer.unref?.();
     this.emitForTask(active, "task-started", { conversationId: active.conversationId, taskId, providerId: this.id, model: this.config.modelId });
+    this.emitWorkflowStage(active, "understanding");
 
     try {
-      return await this.runAgentLoop({ active, taskId, pending, toolDefinitions });
+      return await this.runAgentLoop({ active, taskId, pending });
     } catch (error) {
+      if (this.config.toolCallingEnabled && active.evidence.toolCalls > 0) {
+        this.emitWorkflowStage(active, "report");
+        this.emitForTask(active, "task-progress", {
+          kind: "workflow-report",
+          report: renderTaskEvidenceReport(active.evidence),
+        });
+      }
       if (!active.responseStarted) {
         this.lastReachability = "no";
         this.lastAvailability = "unavailable";
@@ -397,16 +417,22 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     }
   }
 
-  getModelToolDefinitions() {
+  getModelToolDefinitions(evidence = null) {
     if (!this.config.toolCallingEnabled || !this.toolRuntime) return [];
     let definitions;
     try { definitions = this.toolRuntime.getDefinitions(); } catch {
       throw createExecutionError("UNSUPPORTED_OPERATION", "Vesper could not read the safe tool definitions; no API request was sent.", { providerId: this.id });
     }
     if (!Array.isArray(definitions)) throw createExecutionError("UNSUPPORTED_OPERATION", "The attached Vesper tool runtime returned malformed definitions.", { providerId: this.id });
+    const advertisedIds = new Set(READ_ONLY_TOOL_IDS);
+    if (hasSuccessfulInspection(evidence)) {
+      advertisedIds.add("propose_file_change");
+      const hasPendingProposal = evidence.proposals?.some((proposal) => proposal.state === "proposed");
+      if (hasPendingProposal) advertisedIds.add("apply_file_change");
+    }
     try {
       return definitions
-        .filter((entry) => entry && SAFE_TOOL_IDS.has(entry.id) && entry.enabled !== false &&
+        .filter((entry) => entry && advertisedIds.has(entry.id) && SAFE_TOOL_IDS.has(entry.id) && entry.enabled !== false &&
           typeof entry.description === "string" && entry.inputSchema && typeof entry.inputSchema === "object")
         .map((entry) => ({
           type: "function",
@@ -422,14 +448,17 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     }
   }
 
-  async runAgentLoop({ active, taskId, pending, toolDefinitions }) {
+  async runAgentLoop({ active, taskId, pending }) {
     const transcript = pending.messages.map((message) => ({ ...message }));
     let finalText = "";
     let finishReason = null;
     for (let iteration = 0; iteration <= this.config.maxToolIterations; iteration += 1) {
       if (active.interrupted || active.timedOut || active.disposed) throw new Error("Vesper stopped the provider task.");
       this.assertAgentTimeRemaining(active);
-      const apiMessages = [{ role: "developer", content: DEVELOPER_MESSAGE }, ...transcript];
+      const toolDefinitions = this.config.toolCallingEnabled ? this.getModelToolDefinitions(active.evidence) : [];
+      active.advertisedToolIds = new Set(toolDefinitions.map((entry) => entry.function.name));
+      const evidenceInstructions = this.config.toolCallingEnabled ? `\n\n${renderEvidenceInstructions(active.evidence)}` : "";
+      const apiMessages = [{ role: "developer", content: `${DEVELOPER_MESSAGE}${evidenceInstructions}` }, ...transcript];
       const body = {
         model: this.config.modelId,
         messages: apiMessages,
@@ -478,7 +507,8 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       const contentType = response.headers?.get?.("content-type") || "";
       let completion;
       const onText = (delta) => {
-        if (active.totalTextLength + delta.length > MAX_RESPONSE_TEXT_LENGTH) {
+        const reservedEvidenceLength = this.config.toolCallingEnabled ? MAX_REPORT_LENGTH + 2 : 0;
+        if (active.totalTextLength + delta.length > MAX_RESPONSE_TEXT_LENGTH - reservedEvidenceLength) {
           active.controller.abort("vesper-output-limit");
           throw submissionUncertain("The provider response exceeded Vesper's bounded output size; completion is unconfirmed.", this.id);
         }
@@ -534,8 +564,9 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
           active.toolCallCount += 1;
           const requestId = crypto.randomUUID();
           const toolName = SAFE_TOOL_IDS.has(call.function.name) ? call.function.name : "unsupported_tool";
+          this.emitWorkflowStage(active, workflowStageForTool(toolName));
           this.emitForTask(active, "tool-call", { toolCallId: call.id, toolId: toolName, state: "requested", iteration: active.toolIterationCount });
-          const result = await this.invokeModelTool(call, requestId, active);
+          const result = await this.invokeModelTool(call, requestId, active, completion.text);
           this.assertAgentTimeRemaining(active);
           transcript.push({ role: "tool", tool_call_id: call.id, content: result.content });
           this.emitForTask(active, "tool-result", {
@@ -546,6 +577,11 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
             ...(result.summary ? { summary: result.summary } : {}),
             ...(result.errorCode ? { errorCode: result.errorCode } : {}),
           });
+          if (toolName === "apply_file_change" && result.state === "verified" && result.verified) {
+            this.emitWorkflowStage(active, "verification");
+          } else if (READ_ONLY_TOOL_IDS.has(toolName) && hasSuccessfulInspection(active.evidence)) {
+            this.emitWorkflowStage(active, "planning");
+          }
         }
         continue;
       }
@@ -559,6 +595,19 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       }
       finalText = completion.text;
       this.assertAgentTimeRemaining(active);
+      let evidenceReport = "";
+      if (this.config.toolCallingEnabled && active.evidence.toolCalls > 0) {
+        this.emitWorkflowStage(active, "report");
+        evidenceReport = renderTaskEvidenceReport(active.evidence);
+        const suffix = `\n\n${evidenceReport}`;
+        const remaining = Math.max(0, MAX_RESPONSE_TEXT_LENGTH - active.totalTextLength);
+        const boundedSuffix = suffix.length <= remaining ? suffix : suffix.slice(0, remaining);
+        if (boundedSuffix) {
+          active.totalTextLength += boundedSuffix.length;
+          this.emitText(active, boundedSuffix);
+        }
+        finalText += boundedSuffix;
+      }
       const extraMessages = transcript.slice(pending.messages.length);
       const record = this.store.completeTask(active.conversationId, this.projectPath, taskId, finalText, extraMessages);
       this.setConversation(record);
@@ -572,6 +621,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
         toolCallCount: active.toolCallCount,
         toolIterationCount: active.toolIterationCount,
         truncated: finishReason === "length",
+        ...(evidenceReport ? { evidenceReport } : {}),
       });
       return Object.freeze({
         status: "completed",
@@ -583,10 +633,15 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
         truncated: finishReason === "length",
         executedCommands: false,
         changedFiles: active.changedFiles,
+        ...(evidenceReport ? { evidenceReport } : {}),
       });
     }
     this.markUncertainQuietly(active, "uncertain");
     throw createExecutionError("TASK_FAILED", "Vesper reached its bounded tool-loop limit without a final answer.", { providerId: this.id });
+  }
+
+  emitWorkflowStage(active, stage) {
+    this.emitForTask(active, "task-progress", { kind: "workflow-stage", stage });
   }
 
   assertAgentTimeRemaining(active) {
@@ -597,14 +652,25 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     throw submissionUncertain("Vesper reached the configured agent time limit before confirming completion; it will not resubmit the task.", this.id);
   }
 
-  async invokeModelTool(call, requestId, active) {
+  async invokeModelTool(call, requestId, active, assistantText = "") {
     const callId = call && typeof call.id === "string" && call.id.length <= MAX_TOOL_CALL_ID_LENGTH ? call.id : "";
     const name = call?.function?.name;
-    const reject = (code, message) => ({ toolId: typeof name === "string" && SAFE_TOOL_IDS.has(name) ? name : "unsupported_tool",
-      state: "rejected", verified: false, errorCode: code,
-      content: safeToolErrorResult(code, message, this.config.maxToolResultBytes) });
+    const reject = (code, message) => {
+      const rejectedToolId = typeof name === "string" && SAFE_TOOL_IDS.has(name) ? name : "unsupported_tool";
+      recordRejectedTaskTool(active.evidence, { toolId: rejectedToolId, errorCode: code });
+      return { toolId: rejectedToolId, state: "rejected", verified: false, errorCode: code,
+        content: safeToolErrorResult(code, message, this.config.maxToolResultBytes) };
+    };
     if (!callId || !/^[A-Za-z0-9_-]+$/u.test(callId) || typeof name !== "string" || !SAFE_TOOL_IDS.has(name)) {
       return reject("UNSUPPORTED_TOOL", "This tool name or call identity is not allowed by Vesper.");
+    }
+    if (!active.advertisedToolIds?.has(name)) {
+      const code = name === "propose_file_change" && !hasSuccessfulInspection(active.evidence)
+        ? "INSPECTION_REQUIRED"
+        : "TOOL_NOT_AVAILABLE";
+      return reject(code, code === "INSPECTION_REQUIRED"
+        ? "Vesper requires a successful project inspection before a file change can be proposed."
+        : "This tool is not available at the current workflow stage or lacks a supported approval handler.");
     }
     if (typeof call.function.arguments !== "string" || Buffer.byteLength(call.function.arguments, "utf8") > MAX_TOOL_ARGUMENT_BYTES) {
       return reject("INVALID_ARGUMENT", "Tool arguments are missing or exceed Vesper's limit.");
@@ -615,6 +681,12 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     }
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       return reject("INVALID_ARGUMENT", "Tool arguments must be a JSON object. Vesper did not execute the request.");
+    }
+    if (name === "propose_file_change" && !active.evidence.planPresented) {
+      if (!hasEvidenceBackedPlan(assistantText, active.evidence)) {
+        return reject("PLAN_REQUIRED", "Show a concise Plan: statement that references inspected project evidence before proposing a file change.");
+      }
+      active.evidence.planPresented = true;
     }
     const request = Object.freeze({
       toolId: name,
@@ -637,6 +709,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     if (!result || result.requestId !== requestId || result.toolId !== name || typeof result.state !== "string") {
       return reject("TOOL_FAILED", "Vesper did not receive a matching validated tool result.");
     }
+    recordTaskToolOutcome(active.evidence, { toolId: name, input, result });
     const content = serializeModelToolResult(result, this.config.maxToolResultBytes);
     if (name === "apply_file_change" && result.state === "verified" && result.verified === true && result.proposalState === "applied") {
       active.changedFiles = true;
@@ -1071,6 +1144,12 @@ function isLoopbackHost(hostname) {
 
 function endpointFingerprint(baseUrl) {
   return crypto.createHash("sha256").update(baseUrl, "utf8").digest("hex");
+}
+
+function workflowStageForTool(toolId) {
+  if (toolId === "propose_file_change") return "proposal";
+  if (toolId === "apply_file_change") return "approval";
+  return "inspection";
 }
 
 function validateProjectPath(value, providerId = OPENAI_PROVIDER_ID) {

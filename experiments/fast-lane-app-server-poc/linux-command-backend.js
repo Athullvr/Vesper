@@ -1,4 +1,7 @@
-"use strict";
+/
+
+
+\"use strict";
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -98,14 +101,18 @@ class LinuxPodmanCommandBackend {
     let executable;
     try { executable = this.resolvePodmanExecutable(); }
     catch {
-      return freezeStatus({ ...status, unsupported: ["Podman executable is missing or invalid."], reasonCode: "ISOLATION_RUNTIME_MISSING",
-        message: "Rootless Podman was not found. Vesper will not run this command on the host." });
+      return freezeStatus({
+        ...status, unsupported: ["Podman executable is missing or invalid."], reasonCode: "ISOLATION_RUNTIME_MISSING",
+        message: "Rootless Podman was not found. Vesper will not run this command on the host."
+      });
     }
     status.installed = true;
     const executableIdentity = executableFingerprint(this.fs, executable);
     if (this.uid === null || this.uid === 0 || this.gid === null) {
-      return freezeStatus({ ...status, rootless: false, unsupported: ["Vesper must run as a non-root Linux user."],
-        message: "Rootless isolation is unavailable when Vesper runs as root or without a Linux uid/gid." });
+      return freezeStatus({
+        ...status, rootless: false, unsupported: ["Vesper must run as a non-root Linux user."],
+        message: "Rootless isolation is unavailable when Vesper runs as root or without a Linux uid/gid."
+      });
     }
 
     let info;
@@ -116,15 +123,19 @@ class LinuxPodmanCommandBackend {
         maximumBytes: MAX_DIAGNOSTIC_BYTES, timeoutMs: 3_000, env: this.podmanEnvironment(temp),
       });
     } catch (error) {
-      return freezeStatus({ ...status, unsupported: [error.code === "ISOLATION_RUNTIME_MISSING"
-        ? "Podman executable could not be started." : "Podman could not report local runtime status."],
-      reasonCode: error.code || "ISOLATION_RUNTIME_UNAVAILABLE", message: "Podman did not provide verifiable local runtime status." });
+      return freezeStatus({
+        ...status, unsupported: [error.code === "ISOLATION_RUNTIME_MISSING"
+          ? "Podman executable could not be started." : "Podman could not report local runtime status."],
+        reasonCode: error.code || "ISOLATION_RUNTIME_UNAVAILABLE", message: "Podman did not provide verifiable local runtime status."
+      });
     }
     let host;
     try { host = parsePodmanInfo(info.stdout); }
     catch {
-      return freezeStatus({ ...status, unsupported: ["Podman returned malformed or incomplete runtime status."],
-        reasonCode: "ISOLATION_STATUS_UNVERIFIABLE", message: "Podman's isolation status could not be verified." });
+      return freezeStatus({
+        ...status, unsupported: ["Podman returned malformed or incomplete runtime status."],
+        reasonCode: "ISOLATION_STATUS_UNVERIFIABLE", message: "Podman's isolation status could not be verified."
+      });
     }
     status.rootless = host.rootless;
     status.version = host.version;
@@ -142,13 +153,19 @@ class LinuxPodmanCommandBackend {
     for (const controller of ["cpu", "memory", "pids"]) {
       if (!host.controllers.includes(controller)) missingHost.push(`The cgroup ${controller} controller is unavailable.`);
     }
-    if (missingHost.length) return freezeStatus({ ...status, unsupported: missingHost,
-      reasonCode: "ISOLATION_REQUIREMENTS_UNAVAILABLE", message: "The local Podman runtime lacks one or more required isolation controls." });
+    if (missingHost.length) return freezeStatus({
+      ...status, unsupported: missingHost,
+      reasonCode: "ISOLATION_REQUIREMENTS_UNAVAILABLE", message: "The local Podman runtime lacks one or more required isolation controls."
+    });
 
-    if (!status.configured) return freezeStatus({ ...status, unsupported: ["No local sandbox image is configured.", "Vesper never pulls or builds an image."],
-      reasonCode: "ISOLATION_IMAGE_UNCONFIGURED", message: "Set VESPER_SANDBOX_IMAGE to a locally available, trusted Linux image." });
-    if (!validImageReference(this.imageSetting)) return freezeStatus({ ...status, unsupported: ["The configured image reference is malformed."],
-      reasonCode: "ISOLATION_IMAGE_INVALID", message: "The configured sandbox image reference is invalid." });
+    if (!status.configured) return freezeStatus({
+      ...status, unsupported: ["No local sandbox image is configured.", "Vesper never pulls or builds an image."],
+      reasonCode: "ISOLATION_IMAGE_UNCONFIGURED", message: "Set VESPER_SANDBOX_IMAGE to a locally available, trusted Linux image."
+    });
+    if (!validImageReference(this.imageSetting)) return freezeStatus({
+      ...status, unsupported: ["The configured image reference is malformed."],
+      reasonCode: "ISOLATION_IMAGE_INVALID", message: "The configured sandbox image reference is invalid."
+    });
 
     let imageResult;
     try {
@@ -156,29 +173,39 @@ class LinuxPodmanCommandBackend {
         maximumBytes: MAX_DIAGNOSTIC_BYTES, timeoutMs: 3_000,
       });
     } catch {
-      return freezeStatus({ ...status, unsupported: ["The configured image is not present locally or could not be inspected.", "Vesper never pulls or builds an image."],
-        reasonCode: "ISOLATION_IMAGE_UNAVAILABLE", message: "The configured sandbox image is unavailable locally." });
+      return freezeStatus({
+        ...status, unsupported: ["The configured image is not present locally or could not be inspected.", "Vesper never pulls or builds an image."],
+        reasonCode: "ISOLATION_IMAGE_UNAVAILABLE", message: "The configured sandbox image is unavailable locally."
+      });
     }
     let image;
     try { image = parsePodmanImage(imageResult.stdout); }
     catch {
-      return freezeStatus({ ...status, unsupported: ["The local image metadata is malformed or ambiguous."],
-        reasonCode: "ISOLATION_IMAGE_UNVERIFIABLE", message: "The sandbox image could not be verified safely." });
+      return freezeStatus({
+        ...status, unsupported: ["The local image metadata is malformed or ambiguous."],
+        reasonCode: "ISOLATION_IMAGE_UNVERIFIABLE", message: "The sandbox image could not be verified safely."
+      });
     }
     const expectedArchitecture = hostArchitecture(this.platform, this.hostEnv);
     try {
       if (stableStringify(executableIdentity) !== stableStringify(executableFingerprint(this.fs, executable))) {
-        return freezeStatus({ ...status, imagePresent: true, imageId: safeImageId(image.id), unsupported: ["The local Podman executable changed during inspection."],
-          reasonCode: "ISOLATION_STATUS_UNVERIFIABLE", message: "The local Podman executable changed while its status was being checked." });
+        return freezeStatus({
+          ...status, imagePresent: true, imageId: safeImageId(image.id), unsupported: ["The local Podman executable changed during inspection."],
+          reasonCode: "ISOLATION_STATUS_UNVERIFIABLE", message: "The local Podman executable changed while its status was being checked."
+        });
       }
     } catch {
-      return freezeStatus({ ...status, unsupported: ["The local Podman executable could not be revalidated."], reasonCode: "ISOLATION_STATUS_UNVERIFIABLE",
-        message: "The local Podman executable changed while its status was being checked." });
+      return freezeStatus({
+        ...status, unsupported: ["The local Podman executable could not be revalidated."], reasonCode: "ISOLATION_STATUS_UNVERIFIABLE",
+        message: "The local Podman executable changed while its status was being checked."
+      });
     }
     if (image.os !== "linux" || image.architecture !== expectedArchitecture || !IMAGE_ID_PATTERN.test(image.id)) {
-      return freezeStatus({ ...status, imagePresent: true, imageId: safeImageId(image.id),
+      return freezeStatus({
+        ...status, imagePresent: true, imageId: safeImageId(image.id),
         unsupported: ["The local image must have a verified immutable id and match the host Linux architecture."],
-        reasonCode: "ISOLATION_IMAGE_UNSUPPORTED", message: "The local sandbox image is incompatible or lacks a verifiable immutable id." });
+        reasonCode: "ISOLATION_IMAGE_UNSUPPORTED", message: "The local sandbox image is incompatible or lacks a verifiable immutable id."
+      });
     }
     status.imagePresent = true;
     status.imageId = image.id;
@@ -337,10 +364,12 @@ class LinuxPodmanCommandBackend {
         uncertain.executed = true;
         throw uncertain;
       }
-      const output = Object.freeze({ argv: currentPlan.argv, exitCode: state.exitCode, signal: result.signal,
+      const output = Object.freeze({
+        argv: currentPlan.argv, exitCode: state.exitCode, signal: result.signal,
         stdout: redactSensitiveText(result.stdout.toString("utf8")), stderr: redactSensitiveText(result.stderr.toString("utf8")),
         executionStatus: "completed", truncated: false, isolated: true, backend: "podman-rootless", imageId: currentPlan.imageId,
-        workspaceAccess: currentPlan.workspaceAccess, containerConfigurationVerified: true });
+        workspaceAccess: currentPlan.workspaceAccess, containerConfigurationVerified: true
+      });
       if (await this.cleanupContainer(active, executable, temp)) {
         const failure = isolationError("SANDBOX_CLEANUP_FAILED", "Vesper could not confirm sandbox cleanup. Inspect Podman before retrying.", false);
         failure.executed = true;
@@ -358,7 +387,7 @@ class LinuxPodmanCommandBackend {
       }
       throw error;
     } finally {
-      if (createAttempted || active.started) await this.cleanupContainer(active, this.podmanExecutablePath(), this.privateConfig).catch(() => {});
+      if (createAttempted || active.started) await this.cleanupContainer(active, this.podmanExecutablePath(), this.privateConfig).catch(() => { });
       this.active.delete(name);
       activeSandboxes = Math.max(0, activeSandboxes - 1);
     }
@@ -381,7 +410,7 @@ class LinuxPodmanCommandBackend {
       const abort = (reason) => {
         if (settled) return;
         active.abortReason = reason;
-        void this.cleanupContainer(active, executable, temp).catch(() => {});
+        void this.cleanupContainer(active, executable, temp).catch(() => { });
         terminatePodmanClient(child, process.platform === "linux");
       };
       const onAbort = () => abort("interrupted");
@@ -458,8 +487,10 @@ class LinuxPodmanCommandBackend {
   }
 
   basePolicy(executable, imageId, host) {
-    return Object.freeze({ podman: executable, imageId, rootless: host.rootless,
-      version: host.version, seccompEnabled: host.seccomp, cgroupVersion: host.cgroupVersion, controllers: host.controllers });
+    return Object.freeze({
+      podman: executable, imageId, rootless: host.rootless,
+      version: host.version, seccompEnabled: host.seccomp, cgroupVersion: host.cgroupVersion, controllers: host.controllers
+    });
   }
 
   assertExecutableCurrent(plan) {
@@ -597,13 +628,13 @@ function verifyEffectivePolicy(container, plan, uid, gid, expectedName) {
   }
   if (!/keep-id/iu.test(stringValue(host.usernsMode))) throw isolationError("ISOLATION_VERIFY_FAILED", "The container user namespace mapping could not be verified.", true);
   if (stringValue(host.pidMode).toLowerCase() !== "private" || stringValue(host.ipcMode).toLowerCase() !== "private" ||
-      stringValue(host.utsMode).toLowerCase() !== "private" || stringValue(host.cgroupMode).toLowerCase() !== "private") {
+    stringValue(host.utsMode).toLowerCase() !== "private" || stringValue(host.cgroupMode).toLowerCase() !== "private") {
     throw isolationError("ISOLATION_VERIFY_FAILED", "The container process, IPC, UTS, or cgroup namespace is not private.", true);
   }
   const requestedEntry = config.entrypoint;
   const requestedArgs = arrayValue(config.cmd);
   if (!(typeof requestedEntry === "string" ? requestedEntry === plan.argv[0] : arrayValue(requestedEntry).join("\0") === plan.argv[0]) ||
-      requestedArgs.join("\0") !== plan.argv.slice(1).join("\0")) {
+    requestedArgs.join("\0") !== plan.argv.slice(1).join("\0")) {
     throw isolationError("ISOLATION_VERIFY_FAILED", "The container command differs from the reviewed argv.", true);
   }
   const env = arrayValue(config.env).map((value) => String(value));
@@ -616,7 +647,7 @@ function verifyEffectivePolicy(container, plan, uid, gid, expectedName) {
   if (binds.length !== 1) throw isolationError("ISOLATION_VERIFY_FAILED", "The container has unexpected host bind mounts.", true);
   const workspace = binds[0];
   if (path.resolve(stringValue(workspace.source)) !== plan.workspaceRoot || stringValue(workspace.destination) !== "/workspace" ||
-      Boolean(workspace.rw) !== (plan.workspaceAccess === "read-write")) {
+    Boolean(workspace.rw) !== (plan.workspaceAccess === "read-write")) {
     throw isolationError("ISOLATION_VERIFY_FAILED", "The workspace mount does not match the reviewed path or permissions.", true);
   }
   const unexpectedMount = mounts.some((mount) => {
@@ -644,8 +675,10 @@ function parsePodmanInfo(text) {
   const rootless = rootlessSignals.length && rootlessSignals.every((value) => value === rootlessSignals[0]) ? rootlessSignals[0] : null;
   const seccomp = security.seccompEnabled === true ? true : security.seccompEnabled === false ? false : null;
   const version = typeof data.version?.Version === "string" ? data.version.Version.slice(0, 64) : null;
-  return { rootless, seccomp, cgroupVersion: typeof host.cgroupVersion === "string" ? host.cgroupVersion.toLowerCase() : null,
-    controllers: Array.isArray(host.cgroupControllers) ? host.cgroupControllers.filter((entry) => typeof entry === "string").map((entry) => entry.toLowerCase()) : [], version };
+  return {
+    rootless, seccomp, cgroupVersion: typeof host.cgroupVersion === "string" ? host.cgroupVersion.toLowerCase() : null,
+    controllers: Array.isArray(host.cgroupControllers) ? host.cgroupControllers.filter((entry) => typeof entry === "string").map((entry) => entry.toLowerCase()) : [], version
+  };
 }
 
 function parsePodmanImage(text) {
@@ -654,8 +687,10 @@ function parsePodmanImage(text) {
   if (images.length !== 1 || !images[0] || typeof images[0] !== "object") throw new Error("ambiguous image");
   const image = images[0];
   const id = typeof image.Id === "string" ? image.Id : image.ID;
-  return { id: normalizeImageId(id), os: typeof image.Os === "string" ? image.Os.toLowerCase() : typeof image.OS === "string" ? image.OS.toLowerCase() : null,
-    architecture: typeof image.Architecture === "string" ? image.Architecture.toLowerCase() : null };
+  return {
+    id: normalizeImageId(id), os: typeof image.Os === "string" ? image.Os.toLowerCase() : typeof image.OS === "string" ? image.OS.toLowerCase() : null,
+    architecture: typeof image.Architecture === "string" ? image.Architecture.toLowerCase() : null
+  };
 }
 
 function parsePodmanContainer(text) {
@@ -687,8 +722,10 @@ function lowerKeys(value) {
 
 function executableFingerprint(fileSystem, executable) {
   const stat = fileSystem.statSync(executable, { bigint: true });
-  return Object.freeze({ path: executable, dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
-    mtimeNs: String(stat.mtimeNs), ctimeNs: String(stat.ctimeNs) });
+  return Object.freeze({
+    path: executable, dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+    mtimeNs: String(stat.mtimeNs), ctimeNs: String(stat.ctimeNs)
+  });
 }
 
 function inspectWorkspaceMounts(root, readMountInfo) {

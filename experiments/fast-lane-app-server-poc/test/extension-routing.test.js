@@ -136,7 +136,11 @@ test("VS Code routes opted-in OpenAI read-only calls through the project runtime
   await panel.send({ type: "ready" });
   await panel.send({ type: "submit", text: "Inspect the README." });
   assert.equal(calls.length, 2);
-  assert.equal(panel.all("assistant-delta").map((message) => message.text).join(""), "I inspected the project README.");
+  const assistantText = panel.all("assistant-delta").map((message) => message.text).join("");
+  assert.match(assistantText, /^I inspected the project README\./u);
+  assert.match(assistantText, /Vesper execution evidence[\s\S]*read_file: `README\.md` \(verified\)/u);
+  assert.match(assistantText, /Tests\/builds: not run by Vesper/u);
+  assert.ok(panel.all("workflow-stage").some((message) => message.stage === "planning"));
   const toolEvents = panel.all("tool-activity");
   assert.ok(toolEvents.some((event) => event.toolId === "read_file" && event.state === "requested"));
   assert.ok(toolEvents.some((event) => event.toolId === "read_file" && event.state === "verified" && event.verified));

@@ -132,6 +132,17 @@ function makeFrontend({ answers, appServer, handlers, lineIO, onWrite, metrics, 
   return { frontend, io, output: () => outputText };
 }
 
+test("terminal renders controlled workflow progress and the evidence report without unsafe control text", () => {
+  const { frontend, output } = makeFrontend();
+  frontend.handleExecutionEvent({ type: "task-progress", kind: "workflow-stage", stage: "planning" });
+  frontend.handleExecutionEvent({ type: "task-progress", kind: "workflow-stage", stage: "approval" });
+  frontend.handleExecutionEvent({ type: "task-progress", kind: "workflow-report", report: "Vesper execution evidence\nTests/builds: not run.\u001b[31m" });
+  assert.match(output(), /planning from inspected evidence/u);
+  assert.match(output(), /waiting for fresh one-time approval/u);
+  assert.match(output(), /Vesper execution evidence\nTests\/builds: not run/u);
+  assert.doesNotMatch(output(), /\u001b\[31m/u);
+});
+
 test("local question is labeled local, uses no app-server turn, and Codex fallback streams in the same terminal", async () => {
   const appServer = new FakeAppServer(async ({ prompt, cwd, onDelta }) => {
     assert.equal(prompt, "Explain a rebase in one sentence.");

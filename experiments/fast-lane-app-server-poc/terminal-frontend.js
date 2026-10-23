@@ -567,7 +567,12 @@ class TerminalFrontend {
         this.renderFileChangeActivities([event.activity]);
         break;
       case "task-progress":
-        if (event.kind === "aggregate-diff") {
+        if (event.kind === "workflow-stage") {
+          const label = workflowStageLabel(event.stage);
+          if (label) this.write(`[Vesper · ${label}]\n`);
+        } else if (event.kind === "workflow-report" && typeof event.report === "string") {
+          this.write(`\n\n${safeStreamText(event.report)}\n`);
+        } else if (event.kind === "aggregate-diff") {
           if (event.stage === "update") this.updateTurnDiffActivity(event.activity);
           else this.renderTurnDiffActivity(event.activity);
         } else if (event.kind === "approval-declined") {
@@ -1013,6 +1018,19 @@ function safeFileSummaryField(value) {
     text += escaped;
   }
   return { text, truncated };
+}
+
+function workflowStageLabel(stage) {
+  switch (stage) {
+    case "understanding": return "understanding task and project scope";
+    case "inspection": return "inspecting selected project evidence";
+    case "planning": return "planning from inspected evidence";
+    case "proposal": return "preparing a reviewable file proposal";
+    case "approval": return "waiting for fresh one-time approval";
+    case "verification": return "verifying the approved file change";
+    case "report": return "preparing the evidence-based report";
+    default: return "";
+  }
 }
 
 module.exports = {

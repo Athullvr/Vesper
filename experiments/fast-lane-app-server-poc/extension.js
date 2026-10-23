@@ -234,6 +234,10 @@ async function handlePrompt(prompt, targetPanel = panel) {
         ...(event.errorCode ? { errorCode: event.errorCode } : {}),
         ...(event.summary ? { summary: event.summary } : {}),
       });
+    } else if (event?.type === "task-progress" && event.kind === "workflow-stage" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      postToPanel(targetPanel, { type: "workflow-stage", requestId, stage: event.stage });
+    } else if (event?.type === "task-progress" && event.kind === "workflow-report" && typeof event.report === "string" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      postToPanel(targetPanel, { type: "assistant-delta", requestId, text: `\n\n${event.report}\n` });
     }
   };
   client.on("event", onExecutionEvent);
@@ -1194,6 +1198,14 @@ function getHtml(webview) {
         const state = message.state || 'unknown';
         const title = 'Vesper tool · ' + (message.toolId || 'unknown') + ' · ' + state + (message.verified ? ' · verified' : ' · not verified') + (message.errorCode ? ' · ' + message.errorCode : '');
         addMessage('activity', title, message.summary || 'No result preview is available.');
+      }
+      if (message.type === 'workflow-stage' && message.requestId === activeRequestId) {
+        const labels = { understanding: 'Understanding task', inspection: 'Inspecting project', planning: 'Planning from evidence', proposal: 'Preparing file proposal', approval: 'Waiting for approval', verification: 'Verifying file change', report: 'Preparing evidence report' };
+        const label = labels[message.stage];
+        if (label) {
+          status.textContent = currentProviderName + ' · ' + label.toLowerCase();
+          if (activeAssistant) activeAssistant.title.textContent = currentProviderName + ' · ' + label.toLowerCase() + '…';
+        }
       }
       if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
         status.textContent = 'Interrupt sent · waiting for ' + currentProviderName + ' to stop…';
