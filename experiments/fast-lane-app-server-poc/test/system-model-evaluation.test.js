@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { before, test } = require("node:test");
-const { compareSavedBaseline, createBoundedLivePlanner, parseArgs, runEvaluation, validateLiveOptions, validateResultOutputPaths } = require("../benchmark/run-system-model");
+const { compareSavedBaseline, createBoundedLivePlanner, loadFixtures, parseArgs, runEvaluation, validateLiveOptions, validateResultOutputPaths } = require("../benchmark/run-system-model");
 const { OPENAI_PROVIDER_ID, NVIDIA_PROVIDER_ID } = require("../execution-provider");
 
 const savedBaselineText = fs.readFileSync(path.join(__dirname, "../benchmark/system-model-baseline-v1.json"), "utf8");
@@ -232,6 +232,53 @@ test("held-out inventory and hypotheses distinguish available evidence from miss
   ]);
   assert.equal(unsupported.evidence.hypotheses.explicitlyUnverified, 1);
   assert.equal(unsupported.evidence.hypotheses.properlyCited, 1);
+});
+
+test("multi-package snapshots are pinned, separated, paired, and expose candidate failure stages", async () => {
+  const development = loadFixtures("multipackage-development");
+  const heldout = loadFixtures("multipackage-heldout");
+  assert.equal(development.cases.length, 10);
+  assert.deepEqual(development.repositories.map((repository) => repository.id).sort(), ["changesets", "vite"]);
+  assert.equal(heldout.cases.length, 5);
+  assert.deepEqual(heldout.repositories.map((repository) => repository.id), ["vue-core"]);
+  assert.equal(development.thresholdTunedOnThisSet, false);
+  assert.equal(heldout.thresholdTunedOnThisSet, false);
+  for (const item of [...development.cases, ...heldout.cases]) {
+    assert.ok(item.expectedEvidenceLocations.length > 0, item.id);
+    assert.ok(item.expectedEvidenceLocations.every((location) => location.path && location.why), item.id);
+  }
+  for (const repository of [...development.repositories, ...heldout.repositories]) {
+    assert.match(repository.revision, /^[a-f0-9]{40}$/u);
+    assert.match(repository.source, /^https:\/\/github\.com\//u);
+    assert.match(repository.license, /MIT/u);
+  }
+
+  const report = await runEvaluation({ dataset: "multipackage-heldout", maxCases: 4 });
+  assert.equal(report.execution.offline, true);
+  assert.equal(report.execution.providerApiCalls, 0);
+  assert.equal(report.execution.targetRepositoryCommandsExecuted, false);
+  assert.deepEqual(report.benchmark.repositories.map((repository) => repository.id), ["vue-core"]);
+  for (const mode of ["deterministic", "assisted"]) {
+    const rows = report.modes[mode].cases;
+    assert.deepEqual(rows.map((row) => [row.id, row.fixtureSha256]),
+      report.modes[mode === "deterministic" ? "assisted" : "deterministic"].cases.map((row) => [row.id, row.fixtureSha256]));
+    assert.ok(rows.every((row) => row.repositoryRevision === heldout.repositories[0].revision));
+    for (const row of rows) {
+      const coverage = row.evidence.candidateCoverage;
+      assert.ok(coverage.requiredEvidence.checks.length > 0, row.id);
+      for (const check of coverage.requiredEvidence.checks) {
+        assert.ok(["retrieved", "not_a_source_candidate", "1_not_present_in_permitted_inventory",
+          "2_present_but_not_discovered", "3_discovered_but_ranked_below_read_window",
+          "4_ranked_but_not_read_before_stop_or_budget", "5_read_but_not_extracted_or_included_in_report",
+          "6_correctly_excluded_or_genuinely_unverifiable"].includes(check.failureClass), `${row.id}: ${check.path}`);
+      }
+      assert.ok(coverage.evidenceLocations.every((location) =>
+        typeof location.runtimeExcludedByIgnoreRules === "boolean" && "expectedUnavailabilityReason" in location), row.id);
+    }
+  }
+  const compilerCase = report.modes.assisted.cases.find((row) => row.id === "vue_compiler_boundary_and_generated_output_uncertainty");
+  assert.equal(compilerCase.evidence.candidateCoverage.evidenceLocations.find((location) =>
+    location.path === "packages/compiler-dom/src/index.ts").expectedUnavailabilityReason, "The package is outside this curated fixture.");
 });
 
 test("live evaluation requires explicit provider and charge confirmation and protects saved baselines", () => {

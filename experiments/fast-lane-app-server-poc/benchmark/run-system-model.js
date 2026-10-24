@@ -17,7 +17,10 @@ const BASELINE_PATH = path.join(__dirname, "system-model-baseline-v1.json");
 const DATASETS = Object.freeze({
   development: Object.freeze({ cases: "system-model-cases.json", responses: "system-model-planner-responses.json" }),
   heldout: Object.freeze({ cases: "system-model-heldout-cases.json", responses: "system-model-heldout-planner-responses.json" }),
+  "multipackage-development": Object.freeze({ cases: "system-model-multipackage-development-cases.json", responses: "system-model-multipackage-development-planner-responses.json" }),
+  "multipackage-heldout": Object.freeze({ cases: "system-model-multipackage-heldout-cases.json", responses: "system-model-multipackage-heldout-planner-responses.json" }),
 });
+const REPOSITORIES_PATH = path.join(__dirname, "system-model-multipackage-repositories.json");
 const MODEL_ASSISTED_LIMITS = Object.freeze({ planningCalls: 2, followupReads: 2, plannerInputBytes: 12 * 1024,
   totalPlannerInputBytes: 20 * 1024, plannerOutputBytes: 4 * 1024, totalPlannerOutputBytes: 8 * 1024,
   plannerTokens: 8_000, outputTokens: 400, plannerCallMs: 2_500, sourceBytes: 512 * 1024,
@@ -36,6 +39,9 @@ function loadFixtures(dataset = "development") {
   const responsesPath = path.join(__dirname, files.responses);
   const caseFile = JSON.parse(fs.readFileSync(casesPath, "utf8"));
   const responseFile = JSON.parse(fs.readFileSync(responsesPath, "utf8"));
+  const repositoryFile = dataset.startsWith("multipackage-")
+    ? JSON.parse(fs.readFileSync(REPOSITORIES_PATH, "utf8"))
+    : { repositories: [] };
   if (!Array.isArray(caseFile.cases) || !responseFile.cases || typeof responseFile.cases !== "object") {
     throw new Error("System Model benchmark fixtures have an invalid top-level shape.");
   }
@@ -48,11 +54,18 @@ function loadFixtures(dataset = "development") {
     if (!Array.isArray(item.requiredFindings) || !Array.isArray(item.expectedEvidence) || !Array.isArray(item.knownUncertainty)) {
       throw new Error(`Case ${item.id} must define expected evidence, required findings, and known uncertainty.`);
     }
+    if (dataset.startsWith("multipackage-") &&
+        (!Array.isArray(item.expectedEvidenceLocations) || !item.expectedEvidenceLocations.length ||
+         !repositoryFile.repositories.some((repository) => repository.id === item.repositoryId && repository.fixture === item.fixture))) {
+      throw new Error(`Multi-package case ${item.id} must identify its independent evidence locations and pinned repository.`);
+    }
   }
+  const repositorySet = dataset.endsWith("development") ? "development" : dataset.endsWith("heldout") ? "heldout" : null;
+  const repositories = (repositoryFile.repositories || []).filter((repository) => !repositorySet || repository.set === repositorySet);
   return { dataset, casesPath, responsesPath, cases: caseFile.cases, benchmarkVersion: caseFile.benchmarkVersion,
     authorship: typeof caseFile.authorship === "string" ? caseFile.authorship : null,
     thresholdTunedOnThisSet: typeof caseFile.thresholdTunedOnThisSet === "boolean" ? caseFile.thresholdTunedOnThisSet : null,
-    responses: responseFile };
+    repositories, responses: responseFile };
 }
 
 async function runEvaluation({ modes = ["deterministic", "assisted"], dataset = "development", maxCases = null,
@@ -80,6 +93,7 @@ async function runEvaluation({ modes = ["deterministic", "assisted"], dataset = 
     for (const mode of modes) {
       if (mode === "assisted" && livePlanner) livePlanner.setCase(item.id);
       const row = await runCase(item, mode, fixtures.responses, fixtureIdentities[item.fixture], {
+        repository: fixtures.repositories.find((entry) => entry.id === item.repositoryId) || null,
         planner: mode === "assisted" ? livePlanner || undefined : null,
         livePlanner: mode === "assisted" ? livePlanner : null,
         liveOptions,
@@ -92,6 +106,20 @@ async function runEvaluation({ modes = ["deterministic", "assisted"], dataset = 
   for (const mode of modes) {
     const rows = modesResult[mode].rows;
     const liveState = livePlanner?.getState?.() || null;
+    const repositoryRows = rows.filter((row) => row.repositoryId)
+      .reduce((groups, row) => { (groups[row.repositoryId] ||= []).push(row); return groups; }, {});
+    const repositories = Object.fromEntries(Object.entries(repositoryRows).sort(([left], [right]) => left.localeCompare(right)).map(([id, repositoryCases]) => {
+      const repository = fixtures.repositories.find((entry) => entry.id === id);
+      return [id, {
+        fixture: repository?.fixture || repositoryCases[0].fixture,
+        revision: repository?.revision || null,
+        source: repository?.source || null,
+        license: repository?.license || null,
+        caseCount: repositoryCases.filter((row) => row.role === "quality").length,
+        quality: summarizeGroup(repositoryCases.filter((row) => row.role === "quality")),
+        cases: repositoryCases.map((row) => row.id),
+      }];
+    }));
     modesResult[mode] = {
       configuration: {
         modelAssistedPlanning: mode === "assisted",
@@ -109,6 +137,7 @@ async function runEvaluation({ modes = ["deterministic", "assisted"], dataset = 
       },
       quality: summarizeGroup(rows.filter((row) => row.role === "quality")),
       safety: summarizeGroup(rows.filter((row) => row.role === "safety")),
+      ...(Object.keys(repositories).length ? { repositories } : {}),
       cases: rows,
     };
   }
@@ -129,6 +158,16 @@ async function runEvaluation({ modes = ["deterministic", "assisted"], dataset = 
       casesSha256: sha256(fs.readFileSync(fixtures.casesPath)),
       plannerResponsesSha256: sha256(fs.readFileSync(fixtures.responsesPath)),
       fixtureIdentities,
+      repositories: fixtures.repositories.map((repository) => ({
+        id: repository.id,
+        fixture: repository.fixture,
+        source: repository.source,
+        revision: repository.revision,
+        license: repository.license,
+        set: repository.set,
+        caseCount: cases.filter((item) => item.repositoryId === repository.id).length,
+        snapshot: fixtureIdentities[repository.fixture],
+      })),
     },
     execution: {
       offline: !livePlanner,
@@ -153,16 +192,17 @@ async function runEvaluation({ modes = ["deterministic", "assisted"], dataset = 
   };
 }
 
-async function runCase(item, mode, responseFixture, fixtureIdentity, { planner: suppliedPlanner, livePlanner = null, liveOptions = null, signal = null } = {}) {
+async function runCase(item, mode, responseFixture, fixtureIdentity, { repository = null, planner: suppliedPlanner, livePlanner = null, liveOptions = null, signal = null } = {}) {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "vesper-system-model-eval-"));
   const projectRoot = path.join(parent, "project");
   const sourceFixtureRoot = path.join(FIXTURE_ROOT, item.fixture);
   const sourcePaths = fixturePaths(sourceFixtureRoot);
   fs.cpSync(sourceFixtureRoot, projectRoot, { recursive: true, errorOnExist: true });
-  createMockGitMetadata(projectRoot);
+  const includeMockGitMetadata = !item.repositoryId;
+  if (includeMockGitMetadata) createMockGitMetadata(projectRoot);
   const sessionId = stableSessionId(`${item.id}:${mode}`);
   const runtime = createPermissionedToolRuntime({ projectRoot, sessionId, commandExecutionEnabled: false, commandWorkspaceWriteEnabled: false,
-    execFileImpl: createMockGit(projectRoot) });
+    execFileImpl: createMockGit(projectRoot, { available: includeMockGitMetadata }) });
   const inventoryObserver = observeInventory(runtime);
   const auditStart = runtime.getAuditEvents().length;
   const selectedPaths = [];
@@ -240,9 +280,91 @@ async function runCase(item, mode, responseFixture, fixtureIdentity, { planner: 
       entry.available = !["missing_from_fixture", "excluded_by_ignore_rules"].includes(availability.status);
       entry.unavailableReason = entry.available ? null : availability.status;
     });
+    const relevantPathSet = new Set(item.relevantPaths || []);
+    const candidateFiles = Array.isArray(result.project?.candidateFiles) ? result.project.candidateFiles : [];
+    const candidateRank = new Map(candidateFiles.map((candidate, index) => [candidate.path, { rank: index + 1, score: candidate.score, searchMatch: candidate.searchMatch === true }]));
+    const initialCandidateReadCount = sourceReadSteps.filter((step) => String(step.purpose || "").startsWith("Inspect the bounded source candidate ")).length;
+    const rankedReadCutoff = initialCandidateReadCount + followupReadSteps.length;
+    const operationBudgetStopped = result.stopReason === "operation-budget" ||
+      result.remainingBudget?.operations === 0 || (result.incomplete || []).some((note) => /permissioned tool-call bound|operation record bound/iu.test(note));
+    const requiredCandidateDiagnostics = required.map((entry, index) => {
+      const descriptor = entry.descriptor;
+      const location = inventoryDiagnostics[index];
+      const candidate = candidateRank.get(descriptor.path);
+      const read = readPathSet.has(descriptor.path);
+      const sourcePath = SOURCE_EXTENSIONS.has(path.posix.extname(descriptor.path).toLowerCase());
+      const candidateApplicable = !descriptor.kind && sourcePath;
+      let failureClass = candidateApplicable ? "retrieved" : "not_a_source_candidate";
+      if (candidateApplicable && !entry.retrieved) {
+        if (!findingInventory.has(descriptor.path) || location.status === "excluded_by_ignore_rules" || location.status === "excluded_by_runtime_rules") failureClass = "6_correctly_excluded_or_genuinely_unverifiable";
+        else if (!inventoryObserver.wasListed(descriptor.path)) failureClass = "1_not_present_in_permitted_inventory";
+        else if (sourcePath && !candidate) failureClass = "2_present_but_not_discovered";
+        else if (operationBudgetStopped && !read) failureClass = "4_ranked_but_not_read_before_stop_or_budget";
+        else if (candidate && candidate.rank > rankedReadCutoff) failureClass = "3_discovered_but_ranked_below_read_window";
+        else if (!read) failureClass = "4_ranked_but_not_read_before_stop_or_budget";
+        else failureClass = "5_read_but_not_extracted_or_included_in_report";
+      }
+      return {
+        path: descriptor.path,
+        retrieved: entry.retrieved,
+        candidateApplicable,
+        presentInSnapshot: findingInventory.has(descriptor.path),
+        listedInPermittedInventory: inventoryObserver.wasListed(descriptor.path),
+        excludedByIgnoreRules: location.status === "excluded_by_ignore_rules",
+        candidateDiscovered: Boolean(candidate),
+        candidateRank: candidate?.rank ?? null,
+        candidateScore: candidate?.score ?? null,
+        literalSearchMatch: candidate?.searchMatch ?? false,
+        selectedForRead: read,
+        referenceIndex: Array.isArray(result.referenceIndex?.indexedPaths) && result.referenceIndex.indexedPaths.includes(descriptor.path)
+          ? "indexed"
+          : result.referenceIndex?.skippedPaths?.find((entry) => entry.path === descriptor.path)?.reason || "not-indexed-or-not-applicable",
+        failureClass,
+      };
+    });
+    const candidateFailureCounts = {};
+    for (const entry of requiredCandidateDiagnostics) candidateFailureCounts[entry.failureClass] = (candidateFailureCounts[entry.failureClass] || 0) + 1;
+    const indexed = result.referenceIndex || {};
+    const candidateCoverage = {
+      inventoryFiles: result.project?.fileCount ?? null,
+      eligibleSourceCandidates: result.candidateDiscovery?.candidateFiles ?? 0,
+      discoverySearchLimit: result.candidateDiscovery?.searchedFiles ?? 0,
+      candidateFilesRanked: candidateFiles.length,
+      rankedCandidatesRead: candidateFiles.filter((candidate) => readPathSet.has(candidate.path)).length,
+      relevantCandidates: [...relevantPathSet].filter((candidatePath) => candidateRank.has(candidatePath)).length,
+      relevantCandidatesNeverRead: [...relevantPathSet].filter((candidatePath) => candidateRank.has(candidatePath) && !readPathSet.has(candidatePath)).length,
+      requiredEvidence: { retrieved: requiredCandidateDiagnostics.filter((entry) => entry.candidateApplicable && entry.retrieved).length,
+        total: requiredCandidateDiagnostics.filter((entry) => entry.candidateApplicable).length,
+        allRequired: requiredCandidateDiagnostics.length,
+        failureClasses: candidateFailureCounts, checks: requiredCandidateDiagnostics },
+      candidateDiscovery: result.candidateDiscovery || null,
+      referenceIndex: { status: indexed.status || "unknown", indexedFiles: indexed.indexedFiles ?? null,
+        eligibleFiles: indexed.eligibleFiles ?? null, indexedBytes: indexed.indexedBytes ?? null,
+        relationships: indexed.relationships ?? null, truncated: indexed.truncated ?? null,
+        indexedPaths: indexed.indexedPaths || [], skippedPaths: indexed.skippedPaths || [] },
+      readWindow: { initialSourceCandidates: initialCandidateReadCount, targetedSourceReads: followupReadSteps.length,
+        rankCutoffUsedForAttribution: rankedReadCutoff, stopReason: result.stopReason || null,
+        operationBudgetStopped },
+      evidenceLocations: (item.expectedEvidenceLocations || []).map((entry) => {
+        const presentInSnapshot = findingInventory.has(entry.path);
+        const ignoreRuleMatch = inventoryObserver.isIgnored(entry.path);
+        const listedInPermittedInventory = inventoryObserver.wasListed(entry.path);
+        return { ...entry,
+          presentInSnapshot,
+          listedInPermittedInventory,
+          // A matching rule for a path absent from this curated snapshot is not proof that
+          // the evaluator observed and excluded a file. Keep runtime exclusion separate.
+          ignoreRuleMatch,
+          runtimeExcludedByIgnoreRules: presentInSnapshot && ignoreRuleMatch && !listedInPermittedInventory,
+          expectedUnavailabilityReason: item.unavailableEvidence?.find((unavailable) => unavailable.path === entry.path)?.reason || null,
+          candidateRank: candidateRank.get(entry.path)?.rank ?? null,
+          read: readPathSet.has(entry.path) };
+      }),
+      unavailableEvidence: item.unavailableEvidence || [],
+      gitMetadata: result.git?.available ? "mock-clean-metadata" : "unavailable-in-curated-source-snapshot",
+    };
     const followupReadPaths = followupReadSteps.map((step) => step.operation?.input?.path).filter(Boolean);
     const fileBytesInspected = inventoryObserver.readFileBytes();
-    const relevantPathSet = new Set(item.relevantPaths || []);
     const relevantFindings = sourceFindings.filter((finding) => relevantPathSet.has(finding.path) || relevantPathSet.has(finding.relatedPath));
     const knownUncertainty = (item.knownUncertainty || []).map((phrase) => ({ phrase, identified: containsAnyText(result, phrase) }));
     const hypotheses = result.modelPlanning?.hypotheses || [];
@@ -281,9 +403,13 @@ async function runCase(item, mode, responseFixture, fixtureIdentity, { planner: 
       role: item.role,
       category: item.category,
       fixture: item.fixture,
+      ...(item.repositoryId ? { repositoryId: item.repositoryId, repositoryRevision: repository?.revision || null,
+        repositorySource: repository?.source || null, repositoryLicense: repository?.license || null } : {}),
       fixtureSha256: fixtureIdentity.sha256,
       question: item.question,
       expectedEvidence: item.expectedEvidence,
+      expectedEvidenceLocations: item.expectedEvidenceLocations || [],
+      unavailableEvidence: item.unavailableEvidence || [],
       expectedUncertainty: item.knownUncertainty,
       intent: result.intent,
       complexityThreshold: item.complexityThreshold,
@@ -343,6 +469,7 @@ async function runCase(item, mode, responseFixture, fixtureIdentity, { planner: 
         hypotheses: { total: hypotheses.length, explicitlyUnverified: hypothesisLabels.filter((entry) => entry.explicitlyUnverified).length,
           properlyCited: hypothesisLabels.filter((entry) => entry.evidenceRefCount > 0).length, labels: hypothesisLabels },
         inventoryDiagnostics,
+        candidateCoverage,
         excludedProjectPaths: result.project?.excludedPaths || [],
         unsupportedClaimChecks: forbiddenChecks,
       },
@@ -364,6 +491,7 @@ async function runCase(item, mode, responseFixture, fixtureIdentity, { planner: 
         sourceReadSteps: sourceReadSteps.length,
         sourceReadPaths: uniqueText(sourceReadSteps.map((step) => step.operation.input.path)),
         fileBytesInspected,
+      gitEvidenceAvailable: result.git?.available === true,
         runtimeToolOperations: result.evidence?.toolCalls ?? (result.steps || []).length,
         incomplete: incomplete.length > 0 || result.status !== "complete",
         incompleteReasons: incomplete,
@@ -600,6 +728,17 @@ function createRecordedPlanner({ caseId, responseFixture, selectedPaths, promptS
           response.sufficientEvidence = true;
           response.reason = "The inventory has no unread candidate path to inspect.";
         }
+      } else if (record.select === "firstUnreadCandidateFrom") {
+        const preferredPaths = Array.isArray(record.paths) ? new Set(record.paths) : new Set();
+        const selected = payload.unreadCandidateFiles.find((candidate) => preferredPaths.has(candidate.path));
+        if (selected) {
+          selectedPaths.push(selected.path);
+          substitutePath(response, "$selectedPath", selected.path);
+        } else {
+          response.action = null;
+          response.sufficientEvidence = true;
+          response.reason = "No unread planner candidate from the recorded, task-relevant path set remains.";
+        }
       } else if (record.select === "repeatPriorPath") {
         const selected = selectedPaths[selectedPaths.length - 1];
         if (selected) substitutePath(response, "$selectedPath", selected);
@@ -712,6 +851,13 @@ function summarizeGroup(rows) {
   for (const row of rows) for (const reason of row.investigation.incompleteReasons || []) {
     incompleteReasons[reason] = (incompleteReasons[reason] || 0) + 1;
   }
+  const candidateRows = rows.map((row) => row.evidence.candidateCoverage).filter(Boolean);
+  const candidateChecks = candidateRows.flatMap((entry) => entry.requiredEvidence.checks);
+  const candidateApplicableChecks = candidateChecks.filter((entry) => entry.candidateApplicable);
+  const candidateFailureClasses = {};
+  for (const entry of candidateChecks) candidateFailureClasses[entry.failureClass] = (candidateFailureClasses[entry.failureClass] || 0) + 1;
+  const relevantCandidateCount = candidateRows.reduce((sum, entry) => sum + entry.relevantCandidates, 0);
+  const relevantCandidateNeverRead = candidateRows.reduce((sum, entry) => sum + entry.relevantCandidatesNeverRead, 0);
   const cases = rows.length;
   const stopScoredRows = rows.filter((row) => typeof row.stopping.correct === "boolean");
   return {
@@ -741,6 +887,20 @@ function summarizeGroup(rows) {
       unsafeStopDetectedCases: rows.filter((row) => row.stopping.unsafeStopDetected === true).length,
       accuracy: stopScoredRows.length ? round(stopScoredRows.filter((row) => row.stopping.correct).length / stopScoredRows.length) : null },
     unresolvedQuestions: { identified: knownRetrieved, totalKnown: knownTotal, recall: knownTotal ? round(knownRetrieved / knownTotal) : null },
+    candidateAnalysis: {
+      casesWithCandidateDiagnostics: candidateRows.length,
+      eligibleSourceCandidates: candidateRows.reduce((sum, entry) => sum + entry.eligibleSourceCandidates, 0),
+      rankedCandidates: candidateRows.reduce((sum, entry) => sum + entry.candidateFilesRanked, 0),
+      rankedCandidatesRead: candidateRows.reduce((sum, entry) => sum + entry.rankedCandidatesRead, 0),
+      requiredEvidenceDiscovered: candidateApplicableChecks.filter((entry) => entry.candidateDiscovered).length,
+      requiredEvidenceLocations: candidateApplicableChecks.length,
+      requiredEvidenceRead: candidateApplicableChecks.filter((entry) => entry.selectedForRead).length,
+      relevantCandidatesNeverRead: { count: relevantCandidateNeverRead, totalRelevantRanked: relevantCandidateCount },
+      relevantCandidatesRead: relevantCandidateCount - relevantCandidateNeverRead,
+      failureClasses: candidateFailureClasses,
+      discoveryPartialCases: candidateRows.filter((entry) => entry.candidateDiscovery?.status === "partial").length,
+      indexPartialCases: candidateRows.filter((entry) => entry.referenceIndex?.status === "partial" || entry.referenceIndex?.truncated === true).length,
+    },
     investigation: {
       evidenceSteps: rows.reduce((sum, row) => sum + row.investigation.evidenceSteps, 0),
       sourceReads: rows.reduce((sum, row) => sum + row.investigation.sourceReadSteps, 0),
@@ -775,6 +935,18 @@ function compareModes(deterministic, assisted) {
     relevantEvidencePrecision: deltaMetric(base.relevantEvidence, model.relevantEvidence, "precision", "retrievedFindings", "allSourceFindings"),
     stopDecisionAccuracy: deltaMetric(base.stopping, model.stopping, "accuracy", "correctCases", "totalCases"),
     unresolvedQuestionRecall: deltaMetric(base.unresolvedQuestions, model.unresolvedQuestions, "recall", "identified", "totalKnown"),
+    candidateSelectionRecall: compareRates(
+      base.candidateAnalysis.requiredEvidenceDiscovered, base.candidateAnalysis.requiredEvidenceLocations,
+      model.candidateAnalysis.requiredEvidenceDiscovered, model.candidateAnalysis.requiredEvidenceLocations,
+    ),
+    requiredEvidenceReadRecall: compareRates(
+      base.candidateAnalysis.requiredEvidenceRead, base.candidateAnalysis.requiredEvidenceLocations,
+      model.candidateAnalysis.requiredEvidenceRead, model.candidateAnalysis.requiredEvidenceLocations,
+    ),
+    relevantCandidatesNeverRead: {
+      deterministic: { count: base.candidateAnalysis.relevantCandidatesNeverRead.count, totalRelevantRanked: base.candidateAnalysis.relevantCandidatesNeverRead.totalRelevantRanked },
+      assisted: { count: model.candidateAnalysis.relevantCandidatesNeverRead.count, totalRelevantRanked: model.candidateAnalysis.relevantCandidatesNeverRead.totalRelevantRanked },
+    },
     sourceReads: { deterministic: base.investigation.sourceReads, assisted: model.investigation.sourceReads,
       delta: model.investigation.sourceReads - base.investigation.sourceReads,
       deterministicPerCase: base.caseCount ? round(base.investigation.sourceReads / base.caseCount) : null,
@@ -786,6 +958,16 @@ function compareModes(deterministic, assisted) {
     estimatedBudgetTokens: { deterministic: base.investigation.estimatedBudgetTokens, assisted: model.investigation.estimatedBudgetTokens,
       providerReportedUsageAvailable: base.investigation.providerReportedTokenUsage || model.investigation.providerReportedTokenUsage },
     incompleteCases: { deterministic: base.investigation.incompleteCases, assisted: model.investigation.incompleteCases },
+  };
+}
+
+function compareRates(deterministicCount, deterministicTotal, assistedCount, assistedTotal) {
+  const deterministic = deterministicTotal ? round(deterministicCount / deterministicTotal) : null;
+  const assisted = assistedTotal ? round(assistedCount / assistedTotal) : null;
+  return {
+    deterministic: { numerator: deterministicCount, denominator: deterministicTotal, value: deterministic },
+    assisted: { numerator: assistedCount, denominator: assistedTotal, value: assisted },
+    delta: deterministic === null || assisted === null ? null : round(assisted - deterministic),
   };
 }
 
@@ -880,11 +1062,14 @@ function createMockGitMetadata(root) {
   fs.writeFileSync(path.join(root, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n\tbare = false\n");
 }
 
-function createMockGit(root) {
+function createMockGit(root, { available = true } = {}) {
   return async (_executable, args) => {
     const command = args.find((arg) => ["rev-parse", "status", "check-ignore", "log", "diff"].includes(arg));
     if (command === "rev-parse") return { stdout: Buffer.from(`${root}\n`), stderr: Buffer.alloc(0) };
-    if (command === "status") return { stdout: Buffer.from("## offline-benchmark\n"), stderr: Buffer.alloc(0) };
+    if (command === "status") {
+      if (!available) throw Object.assign(new Error("Git metadata is not included in this curated source snapshot."), { code: "GIT_METADATA_UNAVAILABLE" });
+      return { stdout: Buffer.from("## offline-benchmark\n"), stderr: Buffer.alloc(0) };
+    }
     if (command === "check-ignore") {
       const separator = args.indexOf("--");
       const requested = separator < 0 ? [] : args.slice(separator + 1).map((value) => value.replace(/^:\(literal\)/u, ""));
@@ -1034,7 +1219,7 @@ function validateResultOutputPaths(options) {
   }
   for (const outputPath of [jsonPath, baselinePath].filter(Boolean)) {
     const name = path.basename(outputPath);
-    const isSystemModelBaseline = /^system-model-(?:heldout-)?baseline-v\d+\.json$/u.test(name);
+    const isSystemModelBaseline = /^system-model-(?:baseline|(?:[a-z0-9]+-)+baseline)-v\d+\.json$/u.test(name);
     if (isSystemModelBaseline && fs.existsSync(outputPath)) {
       throw new Error(`Saved benchmark baseline ${outputPath} is immutable; choose a new versioned path.`);
     }
@@ -1056,10 +1241,21 @@ function printSummary(report) {
     if (topIncomplete.length) process.stdout.write(`  common incomplete reasons: ${topIncomplete.map(([reason, count]) => `${count}× ${reason}`).join("; ")}\n`);
     process.stdout.write(`  safety: ${s.stopping.correctCases}/${s.stopping.totalCases} expected stop checks (${s.stopping.notEvaluatedCases} not applicable), ${s.stopping.unsafeStopDetectedCases} detected unsafe stops, ${s.unsupportedClaims.forbiddenClaimsPresentInEvidence}/${s.unsupportedClaims.forbiddenClaimChecks} forbidden evidence claims, ${s.investigation.budgetExhaustedCases} budget-exhausted cases.\n`);
     process.stdout.write(`  complexity threshold: ${q.complexityThreshold.deterministicFastPathCases} fast-path / ${q.complexityThreshold.complexCases} complex quality cases; ${q.complexityThreshold.assistedCasesWithPlannerCalls} complex cases used planner calls.\n`);
+    if (entry.repositories) {
+      for (const [repositoryId, repository] of Object.entries(entry.repositories)) {
+        const metrics = repository.quality;
+        const candidate = metrics.candidateAnalysis;
+        const failures = Object.entries(candidate.failureClasses).filter(([stage]) => stage !== "retrieved")
+          .map(([stage, count]) => `${stage}=${count}`).join(", ") || "none";
+        process.stdout.write(`  ${repositoryId} (${repository.revision || "revision unknown"}): required ${metrics.requiredEvidence.retrieved}/${metrics.requiredEvidence.total}; relevant precision ${formatCountRate(metrics.relevantEvidence.retrievedFindings, metrics.relevantEvidence.allSourceFindings, metrics.relevantEvidence.precision)}; candidate paths discovered/read ${candidate.requiredEvidenceDiscovered}/${candidate.requiredEvidenceLocations} / ${candidate.requiredEvidenceRead}/${candidate.requiredEvidenceLocations}; source reads ${metrics.investigation.sourceReads}, bytes ${metrics.investigation.fileBytesInspected}, incomplete ${metrics.investigation.incompleteCases}/${metrics.caseCount}.\n`);
+        process.stdout.write(`    candidate miss stages: ${failures}; relevant ranked candidates unread ${candidate.relevantCandidatesNeverRead.count}/${candidate.relevantCandidatesNeverRead.totalRelevantRanked}; partial discovery/index ${candidate.discoveryPartialCases}/${candidate.indexPartialCases} cases.\n`);
+      }
+    }
   }
   if (report.comparison) {
     const c = report.comparison;
     process.stdout.write(`Assisted minus deterministic (quality): required evidence recall ${formatDelta(c.requiredEvidenceRecall)}, relevant precision ${formatDelta(c.relevantEvidencePrecision)}, stop accuracy ${formatDelta(c.stopDecisionAccuracy)}, unresolved recall ${formatDelta(c.unresolvedQuestionRecall)}, source reads ${c.sourceReads.deterministic} -> ${c.sourceReads.assisted} (${c.sourceReads.delta >= 0 ? "+" : ""}${c.sourceReads.delta}), planner calls ${c.plannerCalls.deterministic} -> ${c.plannerCalls.assisted}.\n`);
+    if (c.candidateSelectionRecall) process.stdout.write(`Candidate selection recall ${formatComparisonRate(c.candidateSelectionRecall)}; required evidence read recall ${formatComparisonRate(c.requiredEvidenceReadRecall)}.\n`);
   }
   if (report.liveProvider) {
     const live = report.liveProvider;
@@ -1072,6 +1268,7 @@ function printSummary(report) {
 
 function formatCountRate(retrieved, total, _rate) { return total ? `${retrieved}/${total} (${((retrieved / total) * 100).toFixed(1)}%)` : "n/a (0 expected)"; }
 function formatDelta(metric) { return metric.delta === null ? "n/a" : `${(metric.delta * 100).toFixed(1)} pp`; }
+function formatComparisonRate(metric) { return `${metric.deterministic.numerator}/${metric.deterministic.denominator} -> ${metric.assisted.numerator}/${metric.assisted.denominator} (${formatDelta(metric)})`; }
 
 if (require.main === module) {
   main().catch((error) => {

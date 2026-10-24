@@ -1,0 +1,70 @@
+{
+  "responseFixtureVersion": "1.0.0-multipackage-recorded",
+  "providerMode": "recorded-deterministic-mock",
+  "cases": {
+    "changesets_status_cross_package_pipeline": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/read/src/index.ts", "packages/assemble-release-plan/src/index.ts", "packages/cli/src/commands/status/__tests__/status.test.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect an unread package boundary or related test in the recorded task evidence set.", "unresolvedQuestions": ["Static relationships do not establish runtime call order or publication.", "Test coverage is not established by a source reference."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The selected bounded evidence is enough to report the local package relationships.", "unresolvedQuestions": ["Static relationships do not establish runtime call order or publication.", "Test coverage is not established by a source reference."], "hypotheses": [] } }
+    ],
+    "changesets_reader_change_impact": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/read/src/index.test.ts", "packages/cli/src/commands/status/index.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect an unread consumer or related reader test before assessing a shared signature change.", "unresolvedQuestions": ["The curated snapshot cannot establish the complete consumer set.", "Test coverage is not established by test names or references."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The bounded consumer and test evidence is sufficient for a partial impact assessment.", "unresolvedQuestions": ["The curated snapshot cannot establish the complete consumer set.", "Test coverage is not established by test names or references."], "hypotheses": [] } }
+    ],
+    "changesets_misleading_changeset_filename_literal": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/read/src/index.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect the reader implementation containing the filename literal and its filtering context.", "unresolvedQuestions": ["The named file's presence in this curated snapshot is not established."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The literal's source context answers the bounded filename question.", "unresolvedQuestions": ["The named file's presence in this curated snapshot is not established."], "hypotheses": [] } }
+    ],
+    "changesets_assembler_change_impact": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/cli/src/commands/status/index.ts", "packages/assemble-release-plan/src/index.test.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect an unread cross-package consumer or assembler test for this interface change.", "unresolvedQuestions": ["The curated snapshot cannot establish the complete consumer set.", "The evaluator does not run release commands or tests."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The available consumer and test references support a bounded impact report.", "unresolvedQuestions": ["The curated snapshot cannot establish the complete consumer set.", "The evaluator does not run release commands or tests."], "hypotheses": [] } }
+    ],
+    "vite_create_server_definition_consumers_tests": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/vite/src/node/server/index.ts", "packages/vite/src/node/__tests__/dev.spec.ts", "packages/vite/src/node/index.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect the server implementation or a related development-server test.", "unresolvedQuestions": ["A source test reference does not establish that the server was started or the test ran."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The public export, implementation, and bounded test evidence are sufficient for this trace.", "unresolvedQuestions": ["A source test reference does not establish that the server was started or the test ran."], "hypotheses": [] } }
+    ],
+    "vite_shared_normalize_path_cross_package": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/vite/src/node/utils.ts", "packages/plugin-legacy/src/index.ts", "packages/vite/src/node/__tests__/utils.spec.ts", "packages/vite/src/node/index.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect an unread definition, consumer, public export, or related test from the cross-package evidence set.", "unresolvedQuestions": ["The bounded snapshot cannot prove this is the complete workspace consumer list."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The observed package references are sufficient for a partial consumer trace.", "unresolvedQuestions": ["The bounded snapshot cannot prove this is the complete workspace consumer list."], "hypotheses": [] } }
+    ],
+    "vite_normalize_path_change_impact": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/plugin-legacy/src/index.ts", "packages/vite/src/node/__tests__/utils.spec.ts", "packages/vite/src/node/utils.ts", "packages/vite/src/node/index.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect a cross-package consumer or test before describing the impact of a shared helper change.", "unresolvedQuestions": ["The bounded snapshot cannot establish every workspace consumer.", "Test coverage is not established by the test source."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The bounded consumer evidence is enough for a partial impact summary.", "unresolvedQuestions": ["The bounded snapshot cannot establish every workspace consumer.", "Test coverage is not established by the test source."], "hypotheses": [] } }
+    ],
+    "vite_lazy_babel_load_boundary": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/plugin-legacy/src/index.ts", "packages/plugin-legacy/src/__tests__/index.spec.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect the lazy loader and the bounded package test context.", "unresolvedQuestions": ["The source does not establish that every build follows the Babel loading branch."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The dynamic import and local call context are identified; runtime branch behavior remains unresolved.", "unresolvedQuestions": ["The source does not establish that every build follows the Babel loading branch."], "hypotheses": [] } }
+    ]
+  }
+}

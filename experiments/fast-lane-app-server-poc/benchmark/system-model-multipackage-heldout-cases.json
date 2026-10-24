@@ -1,0 +1,126 @@
+{
+  "benchmarkVersion": "1.0.0-multipackage-heldout",
+  "authorship": "Independently authored held-out tasks for vuejs/core; task evidence and stop criteria were fixed before writing recorded planner responses",
+  "thresholdTunedOnThisSet": false,
+  "cases": [
+    {
+      "id": "vue_create_app_cross_package_trace",
+      "repositoryId": "vue-core",
+      "category": "multi_package_runtime_entry_trace",
+      "role": "quality",
+      "fixture": "multipackage-vue-core",
+      "question": "Trace the DOM createApp API across runtime-dom and runtime-core: identify the public creation function, renderer construction, core app creation path, and a related test. Do not claim that mounting or rendering was executed.",
+      "intent": "trace",
+      "expectedEvidence": ["runtime-dom createApp definition", "runtime-core createRenderer definition", "core app creation path", "related test reference", "static imports do not prove execution"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/runtime-dom/src/index.ts", "role": "DOM entry", "why": "Defines createApp and lazily creates the DOM renderer." },
+        { "path": "packages/runtime-core/src/renderer.ts", "role": "renderer definition", "why": "Defines createRenderer used by runtime-dom." },
+        { "path": "packages/runtime-core/src/apiCreateApp.ts", "role": "core app factory", "why": "Defines the app object and its mount behavior." },
+        { "path": "packages/runtime-core/src/index.ts", "role": "package exports", "why": "Shows the runtime-core package's exported createRenderer and createApp API." },
+        { "path": "packages/runtime-core/__tests__/apiCreateApp.spec.ts", "role": "test reference", "why": "Shows related test source without a test execution result." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/runtime-dom/src/index.ts", "types": ["symbol-definition"], "symbol": "createApp" },
+        { "path": "packages/runtime-core/src/renderer.ts", "types": ["symbol-definition"], "symbol": "createRenderer" },
+        { "path": "packages/runtime-core/src/apiCreateApp.ts", "types": ["symbol-definition", "symbol"], "symbol": "createApp" },
+        { "path": "packages/runtime-core/__tests__/apiCreateApp.spec.ts", "types": ["test-reference", "likely-call-site", "identifier-reference"], "symbol": "createApp" }
+      ],
+      "relevantPaths": ["packages/runtime-dom/src/index.ts", "packages/runtime-core/src/renderer.ts", "packages/runtime-core/src/apiCreateApp.ts", "packages/runtime-core/src/index.ts", "packages/runtime-core/__tests__/apiCreateApp.spec.ts"],
+      "knownUncertainty": ["mounting was not executed", "test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "vue_shared_is_object_change_impact",
+      "repositoryId": "vue-core",
+      "category": "shared_utility_impact",
+      "role": "quality",
+      "fixture": "multipackage-vue-core",
+      "question": "Assess the impact of changing the shared isObject helper: find its definition and the runtime-core consumers in app creation and VNode handling, then identify a related test opportunity. Treat indexed identifier matches as references, not a complete call graph.",
+      "intent": "impact",
+      "expectedEvidence": ["shared helper definition", "runtime-core API consumer", "VNode consumer", "test opportunity", "heuristic index does not establish a complete call graph"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/shared/src/general.ts", "role": "definition", "why": "Defines isObject in the shared package." },
+        { "path": "packages/shared/src/index.ts", "role": "export surface", "why": "Re-exports shared utilities for package consumers." },
+        { "path": "packages/runtime-core/src/apiCreateApp.ts", "role": "consumer", "why": "Uses isObject while validating root props." },
+        { "path": "packages/runtime-core/src/vnode.ts", "role": "consumer", "why": "Uses isObject when interpreting VNode inputs and props." },
+        { "path": "packages/runtime-core/__tests__/apiCreateApp.spec.ts", "role": "test opportunity", "why": "Contains app creation tests; exact isObject coverage is not assumed." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/shared/src/general.ts", "types": ["symbol-definition"], "symbol": "isObject" },
+        { "path": "packages/runtime-core/src/apiCreateApp.ts", "types": ["identifier-reference", "likely-call-site", "textual-reference"], "symbol": "isObject" },
+        { "path": "packages/runtime-core/src/vnode.ts", "types": ["identifier-reference", "likely-call-site", "textual-reference"], "symbol": "isObject" },
+        { "path": "packages/runtime-core/__tests__/apiCreateApp.spec.ts", "types": ["test-reference", "likely-call-site", "identifier-reference"], "symbol": "createApp" }
+      ],
+      "relevantPaths": ["packages/shared/src/general.ts", "packages/shared/src/index.ts", "packages/runtime-core/src/apiCreateApp.ts", "packages/runtime-core/src/vnode.ts", "packages/runtime-core/__tests__/apiCreateApp.spec.ts"],
+      "knownUncertainty": ["complete call graph", "exact isObject test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "vue_create_vnode_literal_and_test_trace",
+      "repositoryId": "vue-core",
+      "category": "definition_references_and_misleading_literals",
+      "role": "quality",
+      "fixture": "multipackage-vue-core",
+      "question": "Find the createVNode implementation, a renderer reference, and related tests. Distinguish comments and examples containing the same literal from the exported implementation, and do not infer full test coverage.",
+      "intent": "trace",
+      "expectedEvidence": ["createVNode implementation", "renderer reference", "test source", "comments/examples are not additional implementations"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/runtime-core/src/vnode.ts", "role": "definition and comments", "why": "Contains both documentation occurrences and the implementation." },
+        { "path": "packages/runtime-core/src/index.ts", "role": "public export", "why": "Exports createVNode from runtime-core." },
+        { "path": "packages/runtime-core/src/renderer.ts", "role": "consumer", "why": "Uses createVNode while rendering." },
+        { "path": "packages/runtime-core/__tests__/vnode.spec.ts", "role": "test reference", "why": "Contains test source for VNode behavior." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/runtime-core/src/vnode.ts", "types": ["symbol-definition"], "symbol": "createVNode" },
+        { "path": "packages/runtime-core/src/renderer.ts", "types": ["symbol-import", "identifier-reference", "likely-call-site"], "symbol": "createVNode" },
+        { "path": "packages/runtime-core/__tests__/vnode.spec.ts", "types": ["test-reference", "likely-call-site", "identifier-reference"], "symbol": "createVNode" }
+      ],
+      "relevantPaths": ["packages/runtime-core/src/vnode.ts", "packages/runtime-core/src/index.ts", "packages/runtime-core/src/renderer.ts", "packages/runtime-core/__tests__/vnode.spec.ts"],
+      "knownUncertainty": ["full test coverage"],
+      "expectedStop": { "classification": "stop_after_bounded_reads", "maximumFollowupReads": 3 }
+    },
+    {
+      "id": "vue_compiler_boundary_and_generated_output_uncertainty",
+      "repositoryId": "vue-core",
+      "category": "unavailable_package_and_generated_code",
+      "role": "quality",
+      "fixture": "multipackage-vue-core",
+      "question": "Can this checkout establish how Vue compiles an in-DOM template and what generated render code will do? Inspect the included runtime entry and report which compiler or generated files are unavailable before making a behavioral claim.",
+      "intent": "investigate",
+      "expectedEvidence": ["The included runtime entry identifies its compiler dependency and compile-to-function boundary", "Compiler package source is outside this curated snapshot", "Generated behavior remains unverified"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/vue/src/index.ts", "role": "included runtime boundary", "why": "Shows the compileToFunction entry and compiler-dom import." },
+        { "path": "packages/compiler-dom/src/index.ts", "role": "unavailable evidence", "why": "The compiler package is intentionally omitted from the held-out curated snapshot." },
+        { "path": "packages/vue/dist/vue.runtime.esm-bundler.js", "role": "ignored generated artifact", "why": "Generated distribution output is ignored by the upstream repository rules and is not included." },
+        { "path": ".gitignore", "role": "ignore evidence", "why": "The upstream ignore rules include dist output." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/vue/src/index.ts", "types": ["symbol-definition", "symbol", "reference"], "symbol": "compileToFunction" }
+      ],
+      "relevantPaths": ["packages/vue/src/index.ts", ".gitignore"],
+      "unavailableEvidence": [
+        { "path": "packages/compiler-dom/src/index.ts", "reason": "The package is outside this curated fixture." },
+        { "path": "packages/vue/dist/vue.runtime.esm-bundler.js", "reason": "Generated dist output is excluded by the upstream ignore rule and omitted from the snapshot." }
+      ],
+      "knownUncertainty": ["compiler internals are outside the curated snapshot", "generated render behavior is unverified"],
+      "expectedStop": { "classification": "stop_unresolved" }
+    },
+    {
+      "id": "vue_root_test_unit_script_fast_path",
+      "repositoryId": "vue-core",
+      "category": "deterministic_fast_path",
+      "role": "quality",
+      "fixture": "multipackage-vue-core",
+      "question": "What command does the root test-unit script declare?",
+      "intent": "overview",
+      "expectedEvidence": ["The root test-unit script declaration"],
+      "expectedEvidenceLocations": [
+        { "path": "package.json", "role": "declared command", "why": "The root workspace manifest records the command without running it." }
+      ],
+      "requiredFindings": [{ "kind": "projectCommand", "path": "package.json", "name": "test-unit" }],
+      "relevantPaths": ["package.json"],
+      "knownUncertainty": ["test execution result"],
+      "expectedStop": { "classification": "stop_without_adaptive_read", "maximumFollowupReads": 0 }
+    }
+  ]
+}

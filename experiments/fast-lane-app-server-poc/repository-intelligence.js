@@ -135,6 +135,7 @@ class RepositoryIntelligenceService {
       indexUnsupportedExtensions: [],
       indexDigests: new Map(),
       indexReadPaths: new Set(),
+      indexSkippedPaths: new Map(),
       indexRejected: 0,
       indexReferenceCandidates: [],
       indexInterrupted: false,
@@ -821,11 +822,13 @@ class RepositoryIntelligenceService {
     const result = state.symbolIndex.addFile(filePath, content, digest, { querySymbols: state.indexQuerySymbols });
     if (!result.indexed) {
       state.indexRejected += 1;
+      state.indexSkippedPaths.set(filePath, result.reason || "unknown");
       if (result.reason === "index-budget" || result.reason === "file-limit" || result.reason === "invalid-path-or-content") {
         state.incomplete.push(`Symbol/reference indexing skipped ${filePath} because its bounded index input was unavailable or over budget.`);
       }
       return false;
     }
+    state.indexSkippedPaths.delete(filePath);
     state.indexDigests.set(filePath, result.record.sha256);
     return true;
   }
@@ -921,6 +924,8 @@ class RepositoryIntelligenceService {
       relationships: index.relationships,
       unsupportedFiles: state.indexRejected,
       unsupportedExtensions: Object.freeze(state.indexUnsupportedExtensions.slice(0, 8)),
+      indexedPaths: Object.freeze([...state.indexDigests.keys()].slice(0, 80)),
+      skippedPaths: Object.freeze([...state.indexSkippedPaths].slice(0, 80).map(([filePath, reason]) => Object.freeze({ path: filePath, reason }))),
       malformedFiles: index.malformedFiles,
       excludedFiles: state.indexRejected + state.oversizedSourceFiles + state.generatedFiles,
       truncated: partial || index.truncated,

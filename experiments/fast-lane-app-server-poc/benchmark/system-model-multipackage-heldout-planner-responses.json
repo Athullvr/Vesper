@@ -1,0 +1,38 @@
+{
+  "responseFixtureVersion": "1.0.0-multipackage-heldout-recorded",
+  "providerMode": "recorded-deterministic-mock",
+  "cases": {
+    "vue_create_app_cross_package_trace": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/runtime-dom/src/index.ts", "packages/runtime-core/src/renderer.ts", "packages/runtime-core/src/apiCreateApp.ts", "packages/runtime-core/__tests__/apiCreateApp.spec.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect an unread package layer or related app-creation test.", "unresolvedQuestions": ["Static relationships do not prove mounting was executed.", "Test coverage is not established by a source reference."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The selected source files support a bounded cross-package creation trace.", "unresolvedQuestions": ["Static relationships do not prove mounting was executed.", "Test coverage is not established by a source reference."], "hypotheses": [] } }
+    ],
+    "vue_shared_is_object_change_impact": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/shared/src/general.ts", "packages/runtime-core/src/apiCreateApp.ts", "packages/runtime-core/src/vnode.ts", "packages/runtime-core/__tests__/apiCreateApp.spec.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect an unread helper consumer or related API test before summarizing the impact.", "unresolvedQuestions": ["The syntactic index cannot establish a complete call graph.", "The test source does not establish exact isObject coverage."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The bounded definitions and consumers support a partial shared-helper impact report.", "unresolvedQuestions": ["The syntactic index cannot establish a complete call graph.", "The test source does not establish exact isObject coverage."], "hypotheses": [] } }
+    ],
+    "vue_create_vnode_literal_and_test_trace": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/runtime-core/src/vnode.ts", "packages/runtime-core/src/renderer.ts", "packages/runtime-core/__tests__/vnode.spec.ts", "packages/runtime-core/src/index.ts"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect the VNode declaration, renderer use, or related VNode test.", "unresolvedQuestions": ["The source index cannot establish full test coverage."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The implementation, renderer reference, and selected test source answer the bounded request.", "unresolvedQuestions": ["The source index cannot establish full test coverage."], "hypotheses": [] } }
+    ],
+    "vue_compiler_boundary_and_generated_output_uncertainty": [
+      {
+        "select": "firstUnreadCandidateFrom",
+        "paths": ["packages/vue/src/index.ts", "packages/runtime-dom/src/index.ts", ".gitignore"],
+        "response": { "sufficientEvidence": false, "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 }, "reason": "Inspect the included runtime boundary before deciding whether compiler behavior can be verified.", "unresolvedQuestions": ["Compiler internals are outside the curated snapshot.", "Generated render behavior is unverified."], "hypotheses": [] }
+      },
+      { "response": { "sufficientEvidence": true, "action": null, "reason": "The available runtime boundary and inventory limits are enough to stop with the compiler behavior unresolved.", "unresolvedQuestions": ["Compiler internals are outside the curated snapshot.", "Generated render behavior is unverified."], "hypotheses": [] } }
+    ]
+  }
+}

@@ -1,0 +1,225 @@
+{
+  "benchmarkVersion": "1.0.0-multipackage-development",
+  "authorship": "Vesper-authored development cases; evidence expectations written from the pinned source snapshots before recorded planner responses",
+  "thresholdTunedOnThisSet": false,
+  "cases": [
+    {
+      "id": "changesets_status_cross_package_pipeline",
+      "repositoryId": "changesets",
+      "category": "multi_package_feature_trace",
+      "role": "quality",
+      "fixture": "multipackage-changesets",
+      "question": "Trace the Changesets status command from its CLI definition through readChangesets and assembleReleasePlan, and identify a related test. Separate import and identifier evidence from proof that a release was published.",
+      "intent": "trace",
+      "expectedEvidence": ["The status handler definition", "The package boundary imports and definitions for the changeset reader and release-plan assembler", "A test reference", "A limitation on claims about publication or runtime ordering"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/cli/src/commands/status/index.ts", "role": "entry and caller", "why": "Imports and invokes both downstream packages." },
+        { "path": "packages/read/src/index.ts", "role": "definition", "why": "Defines readChangesets, which loads changeset files." },
+        { "path": "packages/assemble-release-plan/src/index.ts", "role": "definition", "why": "Defines the release-plan assembly function called by the CLI." },
+        { "path": "packages/read/src/index.test.ts", "role": "reader test reference", "why": "Shows a related changeset-reader test source without proving it ran or covers the status path." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/cli/src/commands/status/index.ts", "types": ["symbol-definition"], "symbol": "status" },
+        { "path": "packages/read/src/index.ts", "types": ["symbol-definition"], "symbol": "readChangesets" },
+        { "path": "packages/assemble-release-plan/src/index.ts", "types": ["symbol-definition"], "symbol": "assembleReleasePlan" },
+        { "path": "packages/read/src/index.test.ts", "types": ["test-reference", "likely-call-site", "identifier-reference"] }
+      ],
+      "relevantPaths": ["packages/cli/src/commands/status/index.ts", "packages/read/src/index.ts", "packages/assemble-release-plan/src/index.ts", "packages/read/src/index.test.ts"],
+      "knownUncertainty": ["runtime call order", "test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "changesets_reader_change_impact",
+      "repositoryId": "changesets",
+      "category": "shared_interface_change_impact",
+      "role": "quality",
+      "fixture": "multipackage-changesets",
+      "question": "Assess the impact of changing the readChangesets signature: locate its definition, the CLI status consumer, a related reader test, and any limits on claiming that this is the complete consumer set.",
+      "intent": "impact",
+      "expectedEvidence": ["The function definition", "A cross-package CLI consumer", "A source-backed test reference", "The bounded snapshot does not prove every workspace consumer"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/read/src/index.ts", "role": "definition", "why": "Defines the interface under review." },
+        { "path": "packages/cli/src/commands/status/index.ts", "role": "consumer", "why": "The status command imports and calls readChangesets." },
+        { "path": "packages/read/src/index.test.ts", "role": "test reference", "why": "Contains tests for the reader implementation; test names do not establish full coverage." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/read/src/index.ts", "types": ["symbol-definition"], "symbol": "readChangesets" },
+        { "path": "packages/cli/src/commands/status/index.ts", "types": ["symbol-import", "likely-call-site", "identifier-reference"], "symbol": "readChangesets" },
+        { "path": "packages/read/src/index.test.ts", "types": ["test-reference", "symbol-import", "likely-call-site", "identifier-reference"] }
+      ],
+      "relevantPaths": ["packages/read/src/index.ts", "packages/cli/src/commands/status/index.ts", "packages/read/src/index.test.ts"],
+      "unavailableEvidence": [{ "path": "packages/cli/src/commands/version/index.ts", "reason": "The upstream file is outside this curated snapshot." }],
+      "knownUncertainty": ["complete consumer set", "test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "changesets_misleading_changeset_filename_literal",
+      "repositoryId": "changesets",
+      "category": "misleading_literal_match",
+      "role": "quality",
+      "fixture": "multipackage-changesets",
+      "question": "In the Changesets reader, what does the AGENTS.md string represent? Check the surrounding filtering code and distinguish a filename excluded from changeset input from a repository instruction file that Vesper should follow.",
+      "intent": "investigate",
+      "expectedEvidence": ["The literal appears in the ignored markdown filename list", "The function filters discovered changeset filenames", "The string does not make the file repository instructions or prove it is present in this curated snapshot"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/read/src/index.ts", "role": "literal and behavior", "why": "The ignoredMdFiles list and filter are adjacent to the reader function." },
+        { "path": ".gitignore", "role": "repository exclusion context", "why": "Provides actual upstream ignore rules for paths omitted from the inventory." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/read/src/index.ts", "types": ["symbol-definition", "symbol", "reference"], "symbol": "readChangesets" }
+      ],
+      "relevantPaths": ["packages/read/src/index.ts", ".gitignore"],
+      "knownUncertainty": ["whether the named file is present in this snapshot"],
+      "expectedStop": { "classification": "stop_after_bounded_reads", "maximumFollowupReads": 2 }
+    },
+    {
+      "id": "changesets_assembler_change_impact",
+      "repositoryId": "changesets",
+      "category": "cross_package_change_impact_and_tests",
+      "role": "quality",
+      "fixture": "multipackage-changesets",
+      "question": "If assembleReleasePlan changes its input or output shape, trace the status command consumer and find a related assembler test. Do not infer that a release command or package write was executed during this inspection.",
+      "intent": "impact",
+      "expectedEvidence": ["Assembler definition", "Status and version CLI consumers", "Related test source", "No execution result is available"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/assemble-release-plan/src/index.ts", "role": "definition", "why": "Defines the package interface being changed." },
+        { "path": "packages/cli/src/commands/status/index.ts", "role": "consumer", "why": "Status builds a release plan." },
+        { "path": "packages/assemble-release-plan/src/index.test.ts", "role": "test reference", "why": "Shows tests associated with plan assembly; tests are not run by the harness." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/assemble-release-plan/src/index.ts", "types": ["symbol-definition"], "symbol": "assembleReleasePlan" },
+        { "path": "packages/cli/src/commands/status/index.ts", "types": ["symbol-import", "likely-call-site", "identifier-reference"], "symbol": "assembleReleasePlan" },
+        { "path": "packages/assemble-release-plan/src/index.test.ts", "types": ["test-reference", "symbol-import", "likely-call-site", "identifier-reference"], "symbol": "assembleReleasePlan" }
+      ],
+      "relevantPaths": ["packages/assemble-release-plan/src/index.ts", "packages/cli/src/commands/status/index.ts", "packages/assemble-release-plan/src/index.test.ts"],
+      "knownUncertainty": ["complete consumer set", "test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "changesets_root_test_command_fast_path",
+      "repositoryId": "changesets",
+      "category": "deterministic_fast_path",
+      "role": "quality",
+      "fixture": "multipackage-changesets",
+      "question": "What command does the root package's test script declare?",
+      "intent": "overview",
+      "expectedEvidence": ["The root package manifest test script"],
+      "expectedEvidenceLocations": [
+        { "path": "package.json", "role": "declared command", "why": "The root workspace manifest declares scripts without running them." }
+      ],
+      "requiredFindings": [{ "kind": "projectCommand", "path": "package.json", "name": "test" }],
+      "relevantPaths": ["package.json"],
+      "knownUncertainty": ["test execution result"],
+      "expectedStop": { "classification": "stop_without_adaptive_read", "maximumFollowupReads": 0 }
+    },
+    {
+      "id": "vite_create_server_definition_consumers_tests",
+      "repositoryId": "vite",
+      "category": "entry_definition_and_test_trace",
+      "role": "quality",
+      "fixture": "multipackage-vite",
+      "question": "Trace the exported Vite createServer entry to its implementation and a relevant development-server test. Distinguish the local export path from a claim that a server was started.",
+      "intent": "trace",
+      "expectedEvidence": ["Public node entry export", "createServer implementation", "Development-server test reference", "No server execution result"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/vite/src/node/index.ts", "role": "public export", "why": "Re-exports createServer from the server module." },
+        { "path": "packages/vite/src/node/server/index.ts", "role": "definition", "why": "Contains createServer implementation." },
+        { "path": "packages/vite/src/node/__tests__/dev.spec.ts", "role": "test reference", "why": "Contains development-server test source, not a test result." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/vite/src/node/index.ts", "types": ["symbol-export", "symbol-import", "reference"], "symbol": "createServer" },
+        { "path": "packages/vite/src/node/server/index.ts", "types": ["symbol-definition"], "symbol": "createServer" },
+        { "path": "packages/vite/src/node/__tests__/dev.spec.ts", "types": ["test-reference", "likely-call-site", "identifier-reference"], "symbol": "createServer" }
+      ],
+      "relevantPaths": ["packages/vite/src/node/index.ts", "packages/vite/src/node/server/index.ts", "packages/vite/src/node/__tests__/dev.spec.ts"],
+      "knownUncertainty": ["server was started", "test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "vite_shared_normalize_path_cross_package",
+      "repositoryId": "vite",
+      "category": "shared_utility_cross_package",
+      "role": "quality",
+      "fixture": "multipackage-vite",
+      "question": "Find the Vite normalizePath definition, its public export, a consumer in the plugin-legacy package, and a related core test. Do not describe the heuristic search results as the complete workspace consumer list.",
+      "intent": "trace",
+      "expectedEvidence": ["normalizePath definition", "Vite public re-export", "plugin-legacy cross-package import and use", "A related utility test", "Consumer inventory is bounded"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/vite/src/node/utils.ts", "role": "definition", "why": "Defines the shared path normalization helper." },
+        { "path": "packages/vite/src/node/index.ts", "role": "public export", "why": "Exposes normalizePath through Vite's node entry." },
+        { "path": "packages/plugin-legacy/src/index.ts", "role": "cross-package consumer", "why": "Imports normalizePath from vite and calls it in plugin code." },
+        { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "role": "test reference", "why": "Contains tests of utilities exported by the core package." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/vite/src/node/utils.ts", "types": ["symbol-definition"], "symbol": "normalizePath" },
+        { "path": "packages/vite/src/node/index.ts", "types": ["symbol-export", "symbol-import"], "symbol": "normalizePath" },
+        { "path": "packages/plugin-legacy/src/index.ts", "types": ["symbol-import", "identifier-reference", "likely-call-site"], "symbol": "normalizePath" },
+        { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "types": ["symbol-import", "test-reference", "likely-call-site"], "symbol": "normalizePath" }
+      ],
+      "relevantPaths": ["packages/vite/src/node/utils.ts", "packages/vite/src/node/index.ts", "packages/plugin-legacy/src/index.ts", "packages/vite/src/node/__tests__/utils.spec.ts"],
+      "knownUncertainty": ["complete workspace consumer list"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "vite_normalize_path_change_impact",
+      "repositoryId": "vite",
+      "category": "shared_interface_change_impact",
+      "role": "quality",
+      "fixture": "multipackage-vite",
+      "question": "Assess the impact of changing normalizePath's behavior: identify its implementation, public export, a plugin-legacy use, and a relevant test, while stating whether the bounded snapshot can establish all consumers.",
+      "intent": "impact",
+      "expectedEvidence": ["Shared helper implementation", "Cross-package consumer", "Public surface", "Related test source", "Incomplete consumer coverage"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/vite/src/node/utils.ts", "role": "definition", "why": "Defines the changed behavior." },
+        { "path": "packages/plugin-legacy/src/index.ts", "role": "consumer", "why": "Uses the helper across a package boundary." },
+        { "path": "packages/vite/src/node/index.ts", "role": "export", "why": "Shows the public package surface." },
+        { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "role": "test opportunity", "why": "Shows relevant test source; it is not executed." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/vite/src/node/utils.ts", "types": ["symbol-definition"], "symbol": "normalizePath" },
+        { "path": "packages/plugin-legacy/src/index.ts", "types": ["symbol-import", "likely-call-site", "identifier-reference"], "symbol": "normalizePath" },
+        { "path": "packages/vite/src/node/index.ts", "types": ["symbol-export", "symbol-import"], "symbol": "normalizePath" },
+        { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "types": ["test-reference", "symbol-import", "likely-call-site"], "symbol": "normalizePath" }
+      ],
+      "relevantPaths": ["packages/vite/src/node/utils.ts", "packages/plugin-legacy/src/index.ts", "packages/vite/src/node/index.ts", "packages/vite/src/node/__tests__/utils.spec.ts"],
+      "knownUncertainty": ["complete workspace consumer list", "test coverage"],
+      "expectedStop": { "classification": "continue_then_stop", "minimumFollowupReads": 1 }
+    },
+    {
+      "id": "vite_lazy_babel_load_boundary",
+      "repositoryId": "vite",
+      "category": "dynamic_load_and_uncertainty",
+      "role": "quality",
+      "fixture": "multipackage-vite",
+      "question": "Investigate when plugin-legacy loads Babel: locate its lazy loader and a nearby call site or test, and leave unresolved whether every build follows that branch.",
+      "intent": "investigate",
+      "expectedEvidence": ["The lazy dynamic import of Babel", "A call site for the loader", "An unresolved runtime branch question"],
+      "expectedEvidenceLocations": [
+        { "path": "packages/plugin-legacy/src/index.ts", "role": "dynamic loader and use", "why": "Defines loadBabel and performs the dynamic import." }
+      ],
+      "requiredFindings": [
+        { "path": "packages/plugin-legacy/src/index.ts", "types": ["symbol-definition", "symbol", "reference"], "symbol": "loadBabel" }
+      ],
+      "relevantPaths": ["packages/plugin-legacy/src/index.ts", "packages/plugin-legacy/src/__tests__/index.spec.ts"],
+      "knownUncertainty": ["every build follows that branch"],
+      "expectedStop": { "classification": "stop_unresolved" }
+    },
+    {
+      "id": "vite_root_test_unit_script_fast_path",
+      "repositoryId": "vite",
+      "category": "deterministic_fast_path",
+      "role": "quality",
+      "fixture": "multipackage-vite",
+      "question": "What command does Vite's root test-unit script declare?",
+      "intent": "overview",
+      "expectedEvidence": ["The root manifest's test-unit script"],
+      "expectedEvidenceLocations": [
+        { "path": "package.json", "role": "declared command", "why": "The root workspace manifest records the command without executing it." }
+      ],
+      "requiredFindings": [{ "kind": "projectCommand", "path": "package.json", "name": "test-unit" }],
+      "relevantPaths": ["package.json"],
+      "knownUncertainty": ["test execution result"],
+      "expectedStop": { "classification": "stop_without_adaptive_read", "maximumFollowupReads": 0 }
+    }
+  ]
+}

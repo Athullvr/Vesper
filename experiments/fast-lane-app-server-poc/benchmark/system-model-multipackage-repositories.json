@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "snapshotPolicy": "Curated source and test files copied from immutable upstream commits; no repository commands, builds, or tests are run by the evaluator.",
+  "repositories": [
+    {
+      "id": "changesets",
+      "fixture": "multipackage-changesets",
+      "set": "development",
+      "source": "https://github.com/changesets/changesets",
+      "revision": "e2ee472cc6c901a0bb29781dac12603f6e4d5215",
+      "license": "MIT; upstream LICENSE file included",
+      "includedPackages": ["@changesets/cli", "@changesets/read", "@changesets/assemble-release-plan"],
+      "snapshotNotes": "Root workspace metadata and selected package entrypoints/tests are included. Other workspace packages, generated output, node_modules, and unrelated docs are omitted."
+    },
+    {
+      "id": "vite",
+      "fixture": "multipackage-vite",
+      "set": "development",
+      "source": "https://github.com/vitejs/vite",
+      "revision": "82e7aa0374a15e1c67594557ab5893c91578f897",
+      "license": "MIT; upstream LICENSE file included",
+      "includedPackages": ["vite", "@vitejs/plugin-legacy"],
+      "snapshotNotes": "Root workspace metadata and selected source, test, and package files are included. Other workspace packages, generated output, node_modules, and unrelated docs are omitted."
+    },
+    {
+      "id": "vue-core",
+      "fixture": "multipackage-vue-core",
+      "set": "heldout",
+      "source": "https://github.com/vuejs/core",
+      "revision": "0ff253bfba3ee8d3d65448bd44ad890fd01b0ecd",
+      "license": "MIT; upstream LICENSE file included",
+      "includedPackages": ["vue", "@vue/runtime-dom", "@vue/runtime-core", "@vue/shared"],
+      "snapshotNotes": "Independently held-out repository. Root workspace metadata and selected source/tests are included. Compiler packages and generated output are intentionally omitted, so compiler internals cannot be evaluated from this snapshot."
+    }
+  ]
+}
