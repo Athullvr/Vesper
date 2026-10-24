@@ -8,6 +8,9 @@ const os = require("node:os");
 const path = require("node:path");
 const { EventEmitter } = require("node:events");
 const { TerminalFrontend } = require("../terminal-frontend");
+const { createExecutionProvider } = require("../execution-provider");
+
+const COMPLEX_TASK = "Trace checkout from its route through the service and validation layers, then compare how related tests exercise error handling and explain which evidence is missing across the request path.";
 
 class FakeLineIO {
   constructor() { this.interruptHandler = null; }
@@ -79,11 +82,54 @@ test("interactive :inspect prints a local report and never submits a provider ta
   const { terminal, text } = makeTerminal(root, appServer);
   await terminal.handlePrompt(":inspect Trace checkoutRoute");
   assert.equal(appServer.turns.length, 0);
-  assert.match(text(), /deterministic and read-only/u);
+  assert.match(text(), /read-only/u);
   assert.match(text(), /checkoutRoute/u);
   assert.match(text(), /no commands or scripts will run/u);
   await terminal.toolRuntime.dispose();
   terminal.executionProvider.dispose();
+});
+
+test("terminal :inspect uses the shared model-assisted System Model only for complex questions", async (t) => {
+  const root = project(t);
+  const priorAssisted = process.env.VESPER_SYSTEM_MODEL_ASSISTED;
+  const priorLocalOnly = process.env.VESPER_LOCAL_ONLY;
+  process.env.VESPER_SYSTEM_MODEL_ASSISTED = "1";
+  delete process.env.VESPER_LOCAL_ONLY;
+  t.after(() => {
+    if (priorAssisted === undefined) delete process.env.VESPER_SYSTEM_MODEL_ASSISTED;
+    else process.env.VESPER_SYSTEM_MODEL_ASSISTED = priorAssisted;
+    if (priorLocalOnly === undefined) delete process.env.VESPER_LOCAL_ONLY;
+    else process.env.VESPER_LOCAL_ONLY = priorLocalOnly;
+  });
+  const calls = [];
+  const provider = createExecutionProvider({
+    providerId: "openai-chat-completions",
+    environment: { OPENAI_API_KEY: "fixture-key", VESPER_OPENAI_MODEL: "fixture-model", VESPER_OPENAI_BASE_URL: "https://api.fixture.test/v1" },
+    conversationDirectory: path.join(root, ".provider-conversations"),
+    fetchImpl: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ sufficientEvidence: true, action: null, reason: "The existing evidence is sufficient to stop.", unresolvedQuestions: [], hypotheses: [] }) }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 40, completion_tokens: 20, total_tokens: 60 },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  let text = "";
+  const terminal = new TerminalFrontend({ cwd: root, handlers: {}, executionProvider: provider, input: {},
+    output: { write(value) { text += String(value); } }, lineIO: new FakeLineIO(), sessionId: crypto.randomUUID() });
+  await terminal.handlePrompt(":inspect Trace checkoutRoute");
+  assert.equal(calls.length, 0);
+  assert.match(text, /deterministic-fast-path/u);
+
+  await terminal.handlePrompt(`:inspect ${COMPLEX_TASK}`);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].body.model, "fixture-model");
+  assert.equal(calls[0].body.stream, false);
+  assert.match(text, /Adaptive planning: model-assisted · 1 model calls/u);
+  assert.match(text, /Evidence coverage:/u);
+  assert.equal(provider.getState().conversationId, null, "local inspection does not start or save a provider conversation");
+  await terminal.toolRuntime.dispose();
+  provider.dispose();
 });
 
 test("Ctrl+C during local investigation cancels before provider submission", async (t) => {

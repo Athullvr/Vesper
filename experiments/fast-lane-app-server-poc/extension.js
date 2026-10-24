@@ -283,7 +283,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
           providerId: session.providerId,
           getConversationId,
         });
-        systemModel = createSystemModel({ repositoryIntelligence });
+        systemModel = createSystemModel({ repositoryIntelligence, planner: client });
         preflight.systemModel = systemModel;
         const investigation = await systemModel.investigate({ task: prompt, routeDecision: decision, signal: controller.signal });
         if (controller.signal.aborted || investigation.status === "cancelled") {
@@ -745,6 +745,16 @@ function summarizeRepositoryPreflight(result, evidenceIncluded) {
     `${status} · ${Number.isSafeInteger(result?.project?.fileCount) ? result.project.fileCount : 0} files discovered · ${Array.isArray(result?.findings) ? result.findings.length : 0} findings.`,
     evidenceIncluded ? "Bounded findings attached to this provider task only." : "No repository evidence attached to the provider task.",
   ];
+  if (result?.modelPlanning) {
+    const planning = result.modelPlanning;
+    lines.push(`Planning: ${planning.mode} · ${planning.calls} model calls · stop reason ${result.stopReason || "unknown"}.`);
+    if (planning.tokenUsage?.reportedByProvider) lines.push(`Planner usage: ${planning.tokenUsage.inputTokens ?? 0} input and ${planning.tokenUsage.outputTokens ?? 0} output tokens.`);
+    for (const hypothesis of (planning.hypotheses || []).slice(0, 2)) {
+      const refs = (hypothesis.evidenceRefs || []).map((item) => `${item.path || "project-wide"}${item.lineStart ? `:${item.lineStart}` : ""}`).join(", ");
+      lines.push(`Unverified model hypothesis: ${hypothesis.text}${refs ? ` [${refs}]` : ""}`);
+    }
+    lines.push(`Evidence coverage: ${result.findings?.length || 0} findings · ${result.inspectedPaths?.length || 0} cited paths · ${planning.sourceBytesSent || 0} source bytes sent to planner.`);
+  }
   const impact = result?.impactReport;
   if (impact) lines.push(`Impact: ${impact.definitions.length} definitions · ${impact.callSites.length} call candidates · ${impact.dependencies.length} dependencies · ${impact.tests.length} test references.`);
   for (const finding of (result?.findings || []).slice(0, 3)) {
@@ -754,6 +764,7 @@ function summarizeRepositoryPreflight(result, evidenceIncluded) {
   }
   const gap = result?.incomplete?.[0] || impact?.gaps?.[0];
   if (gap) lines.push(`Coverage: ${gap}`);
+  for (const question of (result?.unresolved || []).slice(0, 2)) lines.push(`Unresolved: ${question}`);
   return redactSensitiveText(lines.join("\n")).slice(0, MAX_PREFLIGHT_SUMMARY_LENGTH);
 }
 

@@ -434,7 +434,7 @@ test("CLI inspection is explicit, local-only, and does not instantiate an execut
   assert.equal(code, 0);
   assert.equal(providerCreated, false);
   assert.equal(errorOutput.value, "");
-  assert.match(output.value, /Vesper repository investigation · deterministic and read-only/u);
+  assert.match(output.value, /Vesper repository investigation · read-only/u);
   assert.match(output.value, /src\/main.js/u);
   assert.match(output.value, /Ordered investigation steps/u);
   assert.match(output.value, /not executed/u);

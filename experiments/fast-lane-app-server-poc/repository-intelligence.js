@@ -678,9 +678,9 @@ class RepositoryIntelligenceService {
         referenceCandidates: Object.freeze(state.indexReferenceCandidates.slice(0, 8).map((item) => Object.freeze({ ...item }))),
       });
       let proposal;
-      try { proposal = selector(snapshot); } catch {
+      try { proposal = await selector(snapshot, signal); } catch {
         state.stopReason = "planner-error";
-        state.unresolved.push("The deterministic step selector failed; no further operation was dispatched.");
+        state.unresolved.push("The investigation step selector failed; no further operation was dispatched.");
         break;
       }
       if (!proposal) {
@@ -695,6 +695,10 @@ class RepositoryIntelligenceService {
       }
       if (proposal.stop === true) {
         state.stopReason = safeToken(proposal.reason, 48) || "no-justified-next-step";
+        if (state.stopReason === "model-followup-budget") {
+          state.incomplete.push("Adaptive investigation stopped at its follow-up read limit; other candidate files remain uninspected.");
+          state.unresolved.push("Additional candidate files may contain relevant evidence beyond the adaptive follow-up limit.");
+        }
         break;
       }
       if (!validateFollowupPlan(proposal, state)) {
@@ -1325,6 +1329,14 @@ function renderRepositoryContext(result) {
   if (result.git?.coverage) lines.push(`Git evidence coverage: ${result.git.coverage}`);
   const investigation = result.evidence?.investigation || {};
   if (investigation.stopReason) lines.push(`Investigation stopped: ${safeStepText(investigation.stopReason.replaceAll("-", " "), 100)}.`);
+  if (investigation.modelPlanning) {
+    const planning = investigation.modelPlanning;
+    lines.push(`Investigation planner: ${safeStepText(planning.mode, 40)} · ${planning.calls || 0} model calls · ${planning.followupSteps || 0} model-selected reads · ${safeStepText(planning.reason, 100)}.`);
+    for (const hypothesis of (planning.hypotheses || []).slice(0, 3)) {
+      const refs = (hypothesis.evidenceRefs || []).map((item) => `${item.type} ${item.path || "project-wide"}${item.lineStart ? `:${item.lineStart}` : ""} (${item.confidence || "unknown"}${item.sourceContextRead ? ", source read" : ", source context not read"})`).join(", ");
+      lines.push(`Unverified model hypothesis: ${safeStepText(hypothesis.text, 180)}${refs ? ` [evidence: ${safeStepText(refs, 180)}]` : ""}`);
+    }
+  }
   if (investigation.referenceIndex) {
     lines.push(`JS/TS symbol/reference index: ${investigation.referenceIndex.status} · ${investigation.referenceIndex.indexedFiles}/${investigation.referenceIndex.eligibleFiles} eligible files · ${investigation.referenceIndex.relationships} relationships.`);
     lines.push(safeStepText(investigation.referenceIndex.freshness, 200));

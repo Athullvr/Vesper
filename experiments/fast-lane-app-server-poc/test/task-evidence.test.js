@@ -8,6 +8,7 @@ const {
   hasEvidenceBackedPlan,
   recordTaskToolOutcome,
   recordProviderExecutionEvent,
+  mergeRepositoryEvidence,
   renderTaskEvidenceReport,
   renderEvidenceInstructions,
 } = require("../task-evidence");
@@ -45,6 +46,34 @@ test("Git ignore checks are retained as bounded, project-relative inspection evi
   const report = renderTaskEvidenceReport(evidence);
   assert.match(report, /git_check_ignore \(verified\)/u);
   assert.doesNotMatch(report, /\/repo/u);
+});
+
+test("scoped repository evidence retains model hypotheses, provenance, usage bounds, and unresolved questions", () => {
+  const target = createTaskEvidence({ providerId: "openai-chat-completions", sessionId: "session-a", projectRoot: "/repo-a" });
+  const source = createTaskEvidence({ providerId: "openai-chat-completions", sessionId: "session-a", projectRoot: "/repo-a" });
+  source.findings.push({ type: "symbol-definition", description: "Checkout route declaration.", path: "src/checkout.js", lineStart: 4,
+    source: "read_file", confidence: "high", observation: "observed", status: "confirmed", sourceContextRead: true });
+  source.investigation = { status: "partial", unresolved: ["The validation branch has not been inspected."], modelPlanning: {
+    mode: "model-assisted", enabled: true, reason: "model-selected-sufficient-evidence", calls: 1, followupSteps: 0,
+    sourceBytesSent: 0, tokenUsage: { reportedByProvider: true, inputTokens: 30, outputTokens: 12, totalTokens: 42,
+      budgetTokensUsed: 42, budgetTokensIncludeEstimates: false },
+    unresolvedQuestions: ["Does the route reject invalid tax values before calling the service?"],
+    hypotheses: [{ text: "The route may pass unvalidated tax values to the service.", confidence: "low", provenance: "model-generated",
+      evidenceRefs: [{ type: "symbol-definition", path: "src/checkout.js", lineStart: 4, lineEnd: 4, confidence: "high", observation: "observed", sourceContextRead: true }] }],
+  } };
+  assert.equal(mergeRepositoryEvidence(target, source), true);
+  assert.equal(target.investigation.modelPlanning.tokenUsage.budgetTokensUsed, 42);
+  assert.equal(target.investigation.modelPlanning.hypotheses[0].evidenceRefs[0].path, "src/checkout.js");
+  const report = renderTaskEvidenceReport(target);
+  assert.match(report, /Model-generated hypothesis \(unverified\): The route may pass unvalidated tax values/u);
+  assert.match(report, /src\/checkout\.js/u);
+  assert.match(report, /:4 \(high, source read\)/u);
+  assert.match(report, /Does the route reject invalid tax values/u);
+
+  const foreign = createTaskEvidence({ providerId: "openai-chat-completions", sessionId: "session-b", projectRoot: "/repo-a" });
+  foreign.investigation = source.investigation;
+  assert.equal(mergeRepositoryEvidence(target, foreign), false);
+  assert.equal(target.investigation.modelPlanning.hypotheses.length, 1);
 });
 
 test("proposal and apply evidence distinguish a proposal from an approved verified write", () => {

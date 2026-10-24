@@ -32,6 +32,9 @@ const MAX_REQUEST_BODY_BYTES = 768 * 1024;
 const MAX_STREAM_BYTES = 3 * 1024 * 1024;
 const MAX_SSE_RECORD_BYTES = 64 * 1024;
 const MAX_MODEL_LIST_BODY_BYTES = 64 * 1024;
+const MAX_PLANNER_REQUEST_BYTES = 24 * 1024;
+const MAX_PLANNER_RESPONSE_BYTES = 16 * 1024;
+const MAX_PLANNER_CONTENT_BYTES = 8 * 1024;
 const MAX_RESPONSE_TEXT_LENGTH = 256 * 1024;
 const MAX_TEXT_EVENT_LENGTH = 32 * 1024;
 const MAX_HISTORY_MESSAGES = 120;
@@ -95,6 +98,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     this.conversationId = null;
     this.conversation = null;
     this.active = null;
+    this.activePlanning = null;
     this.lastReachability = "unknown";
     this.lastAvailability = "unknown";
     this.projectPath = null;
@@ -121,6 +125,83 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       apiKeyConfigured: this.config.apiKeyConfigured,
       reachability: this.lastReachability,
     });
+  }
+
+  async planInvestigation({ systemPrompt, userPrompt, signal, timeoutMs, maxOutputTokens = 400, maxOutputBytes = MAX_PLANNER_CONTENT_BYTES } = {}) {
+    this.assertLive();
+    if (this.config.errors.length || !this.config.apiKey || !this.config.modelId || typeof this.fetchImpl !== "function") {
+      throw createExecutionError("PROVIDER_UNAVAILABLE", "The selected provider is not configured for model-assisted investigation.", { providerId: this.id });
+    }
+    if (this.active || this.activePlanning) {
+      throw createExecutionError("UNSUPPORTED_OPERATION", "The selected provider already has an active request; investigation planning was not started.", { providerId: this.id });
+    }
+    if (typeof systemPrompt !== "string" || typeof userPrompt !== "string" ||
+        Buffer.byteLength(systemPrompt, "utf8") > 2_048 || Buffer.byteLength(userPrompt, "utf8") > 12 * 1024 ||
+        !Number.isInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 400 ||
+        !Number.isInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_PLANNER_CONTENT_BYTES) {
+      throw createExecutionError("INVALID_REQUEST", "The bounded investigation planning request failed local size validation.", { providerId: this.id });
+    }
+    const body = JSON.stringify({
+      model: this.config.modelId,
+      messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }],
+      temperature: 0,
+      n: 1,
+      store: false,
+      max_tokens: maxOutputTokens,
+      stream: false,
+    });
+    if (Buffer.byteLength(body, "utf8") > MAX_PLANNER_REQUEST_BYTES) {
+      throw createExecutionError("INVALID_REQUEST", "The bounded investigation planning request exceeded Vesper's input limit.", { providerId: this.id });
+    }
+    const boundedTimeout = Number.isInteger(timeoutMs)
+      ? Math.max(250, Math.min(timeoutMs, this.config.requestTimeoutMs, 3_000))
+      : Math.min(this.config.requestTimeoutMs, 2_500);
+    const controller = new AbortController();
+    this.activePlanning = controller;
+    const onAbort = () => controller.abort(signal?.reason || "vesper-investigation-cancelled");
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    const deadline = Date.now() + boundedTimeout;
+    const timer = setTimeout(() => controller.abort("vesper-investigation-timeout"), boundedTimeout);
+    timer.unref?.();
+    try {
+      if (controller.signal.aborted) throw plannerAbortError();
+      let response;
+      try {
+        response = await this.fetchImpl(`${this.config.baseUrl}/chat/completions`, {
+          method: "POST",
+          redirect: "error",
+          headers: { Authorization: `Bearer ${this.config.apiKey}`, "Content-Type": "application/json" },
+          body,
+          signal: controller.signal,
+        });
+      } catch {
+        if (signal?.aborted) throw plannerAbortError();
+        throw createExecutionError("PROVIDER_UNAVAILABLE", controller.signal.aborted
+          ? "The selected provider did not complete its bounded investigation planning request in time."
+          : "The selected provider could not complete its bounded investigation planning request.", { providerId: this.id, retryable: true });
+      }
+      if (!response.ok) {
+        await cancelResponse(response);
+        throw createExecutionError("PROVIDER_UNAVAILABLE", `The selected provider rejected the bounded investigation planning request with HTTP ${response.status}.`, { providerId: this.id, retryable: response.status === 429 || response.status >= 500 });
+      }
+      let rawBody;
+      try {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new Error("The bounded investigation planning request timed out.");
+        rawBody = await readBoundedResponseBody(response, MAX_PLANNER_RESPONSE_BYTES, remainingMs, controller.signal);
+      } catch {
+        if (signal?.aborted) throw plannerAbortError();
+        throw createExecutionError("PROVIDER_UNAVAILABLE", "The selected provider returned an interrupted, timed out, or oversized investigation response.", { providerId: this.id, retryable: true });
+      }
+      if (signal?.aborted) throw plannerAbortError();
+      const parsed = parsePlannerCompletion(rawBody, { providerId: this.id, modelId: this.config.modelId, maxOutputBytes });
+      return Object.freeze(parsed);
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (this.activePlanning === controller) this.activePlanning = null;
+    }
   }
 
   setToolRuntime(toolRuntime) {
@@ -767,6 +848,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       try { this.toolRuntime?.interrupt?.(); } catch { /* Provider shutdown must still complete. */ }
       if (active.reader) void active.reader.cancel().catch(() => undefined);
     }
+    if (this.activePlanning) this.activePlanning.abort("vesper-provider-dispose");
     this.emitEvent("connection-state", { state: "closed" });
     this.removeAllListeners();
   }
@@ -884,6 +966,47 @@ function parseCompletedChatResponse(rawBody, { providerId, onText } = {}) {
     legacyFunctionCallSeen: message.function_call !== undefined && message.function_call !== null,
     text,
   };
+}
+
+function parsePlannerCompletion(rawBody, { providerId, modelId, maxOutputBytes }) {
+  let response;
+  try { response = JSON.parse(rawBody); } catch {
+    throw createExecutionError("INVALID_RESPONSE", "The selected provider returned malformed investigation planning JSON.", { providerId });
+  }
+  if (!response || !Array.isArray(response.choices) || response.choices.length !== 1) {
+    throw createExecutionError("INVALID_RESPONSE", "The selected provider returned an unsupported investigation planning response.", { providerId });
+  }
+  const choice = response.choices[0];
+  const message = choice?.message;
+  if (!message || typeof message !== "object" || Array.isArray(message) || typeof message.content !== "string" ||
+      choice.finish_reason !== "stop" || (message.tool_calls !== undefined && message.tool_calls !== null &&
+        (!Array.isArray(message.tool_calls) || message.tool_calls.length > 0)) ||
+      (message.function_call !== undefined && message.function_call !== null)) {
+    throw createExecutionError("INVALID_RESPONSE", "The selected provider returned malformed or tool-directed investigation planning output.", { providerId });
+  }
+  const outputBytes = Buffer.byteLength(message.content, "utf8");
+  if (!message.content.trim() || outputBytes > maxOutputBytes || outputBytes > MAX_PLANNER_CONTENT_BYTES) {
+    throw createExecutionError("INVALID_RESPONSE", "The selected provider exceeded Vesper's bounded investigation output limit.", { providerId });
+  }
+  const usage = response.usage && typeof response.usage === "object" && !Array.isArray(response.usage) ? response.usage : {};
+  const inputTokens = safeTokenCount(usage.prompt_tokens ?? usage.input_tokens);
+  const outputTokens = safeTokenCount(usage.completion_tokens ?? usage.output_tokens);
+  const totalTokens = safeTokenCount(usage.total_tokens) ??
+    (inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null);
+  return {
+    text: message.content,
+    usage: Object.freeze({ inputTokens, outputTokens, totalTokens }),
+    providerId,
+    modelId,
+  };
+}
+
+function safeTokenCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= 10_000_000 ? value : null;
+}
+
+function plannerAbortError() {
+  return Object.assign(new Error("Investigation planning was cancelled."), { name: "AbortError" });
 }
 
 function appendToolCallDeltas(calls, deltas, providerId, { positionFallback = false } = {}) {

@@ -213,6 +213,12 @@ class TerminalFrontend {
         investigation = await this.systemModel.investigate({ task: prompt, routeDecision: decision });
         repositoryEvidence = investigation.evidence;
         this.write(`[Repository intelligence · ${safeTerminalText(investigation.status)} · ${investigation.project?.fileCount || 0} files discovered · ${investigation.findings?.length || 0} findings]\n`);
+        if (investigation.modelPlanning) {
+          const planning = investigation.modelPlanning;
+          this.write(`[Investigation planning · ${safeTerminalText(planning.mode)} · ${planning.calls} model calls · stopped: ${safeTerminalText(investigation.stopReason || "unknown")} · ${investigation.findings?.length || 0} findings across ${investigation.inspectedPaths?.length || 0} paths · ${planning.sourceBytesSent || 0} source bytes sent · ${safeTerminalText(planning.reason)}]\n`);
+          for (const question of (investigation.unresolved || planning.unresolvedQuestions || []).slice(0, 2)) this.write(`  Unresolved: ${safeTerminalText(question)}\n`);
+          for (const hypothesis of (planning.hypotheses || []).slice(0, 2)) this.write(`  Model hypothesis (unverified): ${safeTerminalText(hypothesis.text)}\n`);
+        }
         if (investigation.candidateDiscovery) {
           const discovery = investigation.candidateDiscovery;
           this.write(`[Cross-file search · ${safeTerminalText(discovery.status)} · ${discovery.scannedFiles || 0}/${discovery.searchedFiles || 0} selected files · ${discovery.matches || 0} literal candidates${discovery.partialReason ? ` · ${safeTerminalText(discovery.partialReason)}` : ""}]\n`);
@@ -529,7 +535,7 @@ class TerminalFrontend {
       conversationId: getConversationId(),
       getConversationId,
     });
-    return createSystemModel({ repositoryIntelligence });
+    return createSystemModel({ repositoryIntelligence, planner: provider });
   }
 
   async requestToolApproval(snapshot, { signal } = {}) {

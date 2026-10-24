@@ -34,7 +34,7 @@ const { TerminalFrontend, safeTerminalText } = require("./terminal-frontend");
 const { escapeTerminalOutput, redactSensitiveText } = require("./command-activity");
 const { createPermissionedToolRuntime, renderToolApproval, renderToolDefinitions } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
-const { createSystemModel, renderSystemModelReport } = require("./system-model");
+const { createSystemModel, isComplexInvestigation, isModelAssistedEnabled, renderSystemModelReport } = require("./system-model");
 
 const USAGE = `Vesper terminal frontend
 
@@ -76,7 +76,7 @@ Inside Vesper, use :sessions to list this project's sessions, :switch SESSION_ID
 :capabilities status|show ID to inspect local capability state,
 :plan TASK to preview an advisory plan, :impact TASK for a focused change-impact report,
 :routing to inspect current-session routing counts, and :quit to exit.
-Use :inspect [TASK] for a bounded local repository investigation. It does not call a model or run commands.
+Use :inspect [TASK] for a bounded read-only repository investigation. Model-assisted planning is opt-in and limited to complex questions; investigation never runs commands.
 Ctrl+C interrupts an active turn and returns to the prompt when the turn ends.
 
 The tools command inspects or manually invokes the permissioned Vesper tool runtime. Compatible
@@ -461,7 +461,7 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   if (options.help) {
-    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "inspect" ? "Vesper repository intelligence\n\nUsage:\n  vesper inspect [TASK] [--project PROJECT_DIRECTORY]\n\nInspects bounded local filesystem and Git evidence through the permissioned read-only tool runtime. It does not call a model, run project commands, modify files, or claim a complete call graph.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
+    output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  VESPER_SYSTEM_MODEL_ASSISTED=1 opts complex repository investigations into bounded planning calls through the selected OpenAI/NVIDIA provider and model; Codex uses deterministic planning. VESPER_LOCAL_ONLY=1 disables those calls.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "inspect" ? "Vesper repository intelligence\n\nUsage:\n  vesper inspect [TASK] [--project PROJECT_DIRECTORY]\n\nInspects bounded local filesystem and Git evidence through the permissioned read-only tool runtime. Deterministic planning is the default; when explicitly enabled, complex questions may send bounded, redacted task and evidence metadata to the selected OpenAI/NVIDIA model. No commands are run, files are modified, or complete call graphs claimed.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
@@ -609,9 +609,27 @@ async function runPlan(options, dependencies, output, errorOutput) {
 async function runInspect(options, dependencies, output, errorOutput) {
   let runtime;
   let systemModel;
+  let planningProvider;
   const onInterrupt = () => { void systemModel?.interrupt?.(); };
   try {
     const cwd = resolveProjectDirectory(options.projectDirectory || process.cwd());
+    const environment = dependencies.environment || process.env;
+    const task = options.task || "";
+    const providerId = resolveDefaultProviderId(environment);
+    if (isModelAssistedEnabled(environment) && isComplexInvestigation(task) &&
+        [OPENAI_PROVIDER_ID, NVIDIA_PROVIDER_ID].includes(providerId)) {
+      try {
+        planningProvider = typeof dependencies.investigationPlannerFactory === "function"
+          ? await dependencies.investigationPlannerFactory({ providerId, environment })
+          : createExecutionProvider({ providerId, environment, ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}) });
+        if (typeof planningProvider?.planInvestigation !== "function") {
+          try { await planningProvider?.dispose?.(); } catch { /* No stateless planner is available for this provider. */ }
+          planningProvider = null;
+        }
+      } catch {
+        planningProvider = null;
+      }
+    }
     const sessionId = dependencies.inspectionSessionId || crypto.randomUUID();
     const runtimeOptions = {
       projectRoot: cwd,
@@ -629,10 +647,13 @@ async function runInspect(options, dependencies, output, errorOutput) {
       sessionId,
       providerId: null,
     });
-    systemModel = createSystemModel({ repositoryIntelligence });
+    systemModel = createSystemModel({ repositoryIntelligence, planner: planningProvider,
+      plannerUnavailableReason: isModelAssistedEnabled(environment) && isComplexInvestigation(task) &&
+        [OPENAI_PROVIDER_ID, NVIDIA_PROVIDER_ID].includes(providerId) && !planningProvider ? "selected-provider-setup-unavailable" : null,
+      environment });
     process.once("SIGINT", onInterrupt);
     const result = await systemModel.investigate({
-      task: options.task || "",
+      task,
       signal: dependencies.signal,
     });
     output.write(renderSystemModelReport(result));
@@ -643,6 +664,7 @@ async function runInspect(options, dependencies, output, errorOutput) {
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     await runtime?.dispose?.();
+    try { await planningProvider?.dispose?.(); } catch { /* Planning cleanup must not hide the inspection result. */ }
   }
 }
 

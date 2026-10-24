@@ -102,6 +102,9 @@ function mergeRepositoryEvidence(target, source) {
       ...(source.investigation.impactReport && typeof source.investigation.impactReport === "object" ? {
         impactReport: normalizeImpactReport(source.investigation.impactReport),
       } : {}),
+      ...(source.investigation.modelPlanning && typeof source.investigation.modelPlanning === "object" ? {
+        modelPlanning: normalizeModelPlanning(source.investigation.modelPlanning),
+      } : {}),
       ...(Array.isArray(source.investigation.steps) ? { steps: normalizeInvestigationSteps(source.investigation.steps) } : {}),
       ...(Array.isArray(source.investigation.unresolved) ? { unresolved: source.investigation.unresolved.slice(0, 12).map((item) => safeDescription(item, 240)).filter(Boolean) } : {}),
       ...(source.investigation.remainingBudget && typeof source.investigation.remainingBudget === "object" ? {
@@ -513,6 +516,51 @@ function normalizeInvestigationSteps(steps) {
   });
 }
 
+function normalizeModelPlanning(value) {
+  const hypotheses = (Array.isArray(value.hypotheses) ? value.hypotheses : []).slice(0, 6).flatMap((item) => {
+    const text = safeDescription(item?.text, 240);
+    if (!text) return [];
+    const evidenceRefs = (Array.isArray(item.evidenceRefs) ? item.evidenceRefs : []).slice(0, 4).flatMap((reference) => {
+      const type = safeToken(reference?.type, 48);
+      const pathValue = safeRelativePath(reference?.path);
+      if (!type) return [];
+      return [{ type, ...(pathValue ? { path: pathValue } : {}),
+        ...(Number.isInteger(reference.lineStart) && reference.lineStart > 0 ? { lineStart: reference.lineStart } : {}),
+        ...(Number.isInteger(reference.lineEnd) && reference.lineEnd >= (reference.lineStart || 1) ? { lineEnd: reference.lineEnd } : {}),
+        confidence: ["high", "medium", "low", "unknown"].includes(reference.confidence) ? reference.confidence : "unknown",
+        observation: reference.observation === "inferred" ? "inferred" : "observed",
+        sourceContextRead: reference.sourceContextRead === true }];
+    });
+    if (!evidenceRefs.length) return [];
+    return [{ label: "model-generated hypothesis (unverified)", text, confidence: "low", provenance: "model-generated", evidenceRefs }];
+  });
+  const tokenUsage = value.tokenUsage && typeof value.tokenUsage === "object" ? value.tokenUsage : {};
+  return {
+    mode: ["deterministic", "model-assisted", "deterministic-fallback", "cancelled"].includes(value.mode) ? value.mode : "deterministic",
+    enabled: value.enabled === true,
+    ...(safeDescription(value.reason, 120) ? { reason: safeDescription(value.reason, 120) } : {}),
+    ...(safeToken(value.providerId, 80) ? { providerId: safeToken(value.providerId, 80) } : {}),
+    ...(safeDescription(value.modelId, 120) ? { modelId: safeDescription(value.modelId, 120) } : {}),
+    calls: boundedInteger(value.calls, 0, 2),
+    followupSteps: boundedInteger(value.followupSteps, 0, 2),
+    rejectedProposals: boundedInteger(value.rejectedProposals, 0, 2),
+    elapsedMs: boundedInteger(value.elapsedMs, 0, 10_000),
+    inputBytes: boundedInteger(value.inputBytes, 0, 20 * 1024),
+    outputBytes: boundedInteger(value.outputBytes, 0, 8 * 1024),
+    sourceBytesSent: boundedInteger(value.sourceBytesSent, 0, 0),
+    tokenUsage: {
+      reportedByProvider: tokenUsage.reportedByProvider === true,
+      inputTokens: tokenUsage.inputTokens === null || tokenUsage.inputTokens === undefined ? null : boundedInteger(tokenUsage.inputTokens, 0, 8_000),
+      outputTokens: tokenUsage.outputTokens === null || tokenUsage.outputTokens === undefined ? null : boundedInteger(tokenUsage.outputTokens, 0, 8_000),
+      totalTokens: tokenUsage.totalTokens === null || tokenUsage.totalTokens === undefined ? null : boundedInteger(tokenUsage.totalTokens, 0, 8_000),
+      budgetTokensUsed: boundedInteger(tokenUsage.budgetTokensUsed, 0, 8_000),
+      budgetTokensIncludeEstimates: tokenUsage.budgetTokensIncludeEstimates === true,
+    },
+    unresolvedQuestions: Array.isArray(value.unresolvedQuestions) ? value.unresolvedQuestions.slice(0, 8).map((item) => safeDescription(item, 180)).filter(Boolean) : [],
+    hypotheses,
+  };
+}
+
 function hasSuccessfulInspection(evidence) {
   return Boolean(evidence && evidence.inspections && evidence.inspections.length);
 }
@@ -620,6 +668,17 @@ function renderTaskEvidenceReport(evidence) {
   }
   const investigation = evidence?.investigation && typeof evidence.investigation === "object" ? evidence.investigation : null;
   if (investigation?.stopReason) lines.push("Investigation stopped: " + (safeToken(investigation.stopReason, 60) || "unknown") + ".");
+  if (investigation?.modelPlanning) {
+    const planning = investigation.modelPlanning;
+    const tokens = planning.tokenUsage?.reportedByProvider
+      ? ` · ${planning.tokenUsage.totalTokens ?? ((planning.tokenUsage.inputTokens || 0) + (planning.tokenUsage.outputTokens || 0))} provider-reported tokens`
+      : " · provider token usage unavailable";
+    lines.push(`Adaptive planning: ${safeToken(planning.mode, 40) || "deterministic"} · ${boundedInteger(planning.calls, 0, 2)} model calls · ${boundedInteger(planning.followupSteps, 0, 2)} selected reads${tokens}; source bytes sent ${boundedInteger(planning.sourceBytesSent, 0, 0)}.`);
+    for (const hypothesis of (planning.hypotheses || []).slice(0, 3)) {
+      const refs = (hypothesis.evidenceRefs || []).map((item) => `${safeToken(item.type, 48) || "finding"} ${formatPath(item.path)}${item.lineStart ? `:${item.lineStart}` : ""} (${item.confidence || "unknown"}${item.sourceContextRead ? ", source read" : ", source context not read"})`).join(", ");
+      lines.push(`- Model-generated hypothesis (unverified): ${safeDescription(hypothesis.text, 220)}${refs ? ` [evidence: ${refs}]` : ""}`);
+    }
+  }
   if (investigation?.referenceIndex) {
     const index = investigation.referenceIndex;
     lines.push(`Symbol/reference index: ${index.status} · ${index.indexedFiles}/${index.eligibleFiles} eligible JS/TS files · ${index.relationships} bounded relationships · ${index.parseTimeMs} ms parsing · current-file reads only.`);
@@ -641,7 +700,11 @@ function renderTaskEvidenceReport(evidence) {
     lines.push("- Step " + step.index + ": " + (safeToken(step.operation?.toolId, 80) || "read-only operation") + target +
       " (" + (safeToken(step.state, 40) || "unknown") + "): " + (safeDescription(step.result?.summary, 180) || "result unavailable"));
   }
-  for (const note of (investigation?.unresolved || []).slice(0, 5)) lines.push("- Unresolved: " + safeDescription(note, 240));
+  const unresolved = [...new Set([
+    ...(investigation?.unresolved || []),
+    ...(investigation?.modelPlanning?.unresolvedQuestions || []),
+  ])];
+  for (const note of unresolved.slice(0, 5)) lines.push("- Unresolved: " + safeDescription(note, 240));
   const findings = Array.isArray(evidence?.findings) ? evidence.findings.slice(0, 20) : [];
   if (findings.length) {
     lines.push("Repository findings:");

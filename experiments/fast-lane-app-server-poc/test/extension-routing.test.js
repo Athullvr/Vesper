@@ -83,6 +83,64 @@ test("VS Code preflights a code task and submits only scoped bounded evidence on
   assert.equal(panel.last("assistant-done").providerId, "codex-app-server");
 });
 
+test("VS Code preflight uses bounded model-assisted investigation for a complex task", async (t) => {
+  const root = makeTempDirectory("vesper-vscode-model-preflight-");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const project = path.join(root, "project");
+  fs.mkdirSync(path.join(project, "src"), { recursive: true });
+  const sourceMarker = "PLANNER_MUST_NOT_RECEIVE_SOURCE_EXCERPT";
+  fs.writeFileSync(path.join(project, "src", "checkout.js"), `export function checkoutRoute() { return ${JSON.stringify(sourceMarker)}; }\n`);
+  const previousFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push({ url, authorization: options.headers.Authorization, body });
+    if (body.stream === false) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ sufficientEvidence: true, action: null, reason: "Current evidence is sufficient for the preflight summary.", unresolvedQuestions: [], hypotheses: [] }) }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 80, completion_tokens: 30, total_tokens: 110 },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    const events = [
+      { choices: [{ delta: { content: "Planner-assisted preflight completed." }, finish_reason: null }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ].map((item) => `data: ${JSON.stringify(item)}\n\n`).join("");
+    return new Response(`${events}data: [DONE]\n\n`, { status: 200, headers: { "content-type": "text/event-stream" } });
+  };
+  t.after(() => { globalThis.fetch = previousFetch; });
+
+  const harness = createHarness(t, [{ name: "Project", uri: { fsPath: project } }], {
+    environment: {
+      VESPER_PROVIDER: "openai-chat-completions",
+      VESPER_SYSTEM_MODEL_ASSISTED: "1",
+      OPENAI_API_KEY: "fixture-only-secret",
+      VESPER_OPENAI_MODEL: "fixture-model",
+      VESPER_OPENAI_BASE_URL: "https://api.fixture.test/v1",
+    },
+  });
+  const panel = harness.openPanel();
+  await panel.send({ type: "ready" });
+  const task = "Assess how checkout requests flow from the route through its service and validation dependencies, compare the related tests, and identify what evidence is still missing before changing error handling.";
+  await panel.send({ type: "submit", text: task });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, "https://api.fixture.test/v1/chat/completions");
+  assert.equal(calls[0].authorization, "Bearer fixture-only-secret");
+  assert.equal(calls[0].body.model, "fixture-model");
+  assert.equal(calls[0].body.stream, false);
+  assert.equal(calls[0].body.store, false);
+  assert.equal(Object.hasOwn(calls[0].body, "tools"), false);
+  assert.doesNotMatch(JSON.stringify(calls[0].body), new RegExp(sourceMarker, "u"));
+  assert.match(calls[1].body.messages.find((message) => message.role === "user").content, /Vesper local repository evidence/u);
+  const preflight = panel.all("repository-preflight").at(-1);
+  assert.equal(preflight.evidenceIncluded, true);
+  assert.match(preflight.text, /Planning: model-assisted · 1 model calls · stop reason/u);
+  assert.match(preflight.text, /Evidence coverage:/u);
+  assert.match(preflight.text, /0 source bytes sent to planner/u);
+  assert.equal(panel.all("assistant-done").length, 1);
+  assert.equal(panel.last("assistant-done").providerId, "openai-chat-completions");
+});
+
 test("VS Code preflight failure explicitly falls back to the original task without duplicate submission", async (t) => {
   const root = makeTempDirectory("vesper-vscode-preflight-fail-");
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
