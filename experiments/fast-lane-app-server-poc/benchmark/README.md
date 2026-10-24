@@ -180,3 +180,60 @@ The expanded prompt benchmark also kept pushed-state questions, test questions w
 Across the 75 local answers, the median local-answer latency was 3.382 ms; the median fallback decision latency was 0.011 ms. No local route invoked the fallback callback. The 50 Codex-routed benchmark decisions invoked only the mock callback; this Phase 1A run started **zero live Codex turns** and makes no end-to-end fallback claim.
 
 This improves the measured surface-form failure class without adding a model. The evidence supports keeping deterministic rules for these narrowly phrased, directly evidenced intents. It does not establish broad natural-language coverage: the held-out set contains only six hand-written prompts, and status/test evidence reflects one local snapshot. A larger independently authored paraphrase set would be needed before claiming general coverage.
+
+## Phase 4G offline System Model evaluation
+
+Run the versioned investigation benchmark with Vesper's repository-intelligence service, System Model coordinator, source-reference index, and permissioned runtime:
+
+```sh
+npm run evaluate:system-model -- --json /tmp/vesper-system-model-results.json
+```
+
+The runner also accepts `--compare benchmark/system-model-baseline-v1.json` to report per-case changes against the saved result, or `--write-baseline PATH` to write a reviewed replacement baseline. The focused regression command is `node test/system-model-evaluation.test.js`. The evaluator uses isolated copies of its checked-in fixtures, a deterministic mock for the runtime's read-only Git operations, and recorded planner responses. It makes no provider/API calls and does not run fixture package scripts, tests, builds, or other target-repository commands. Each case/mode gets a new runtime, project copy, and task-evidence context.
+
+The cases in `system-model-cases.json` cover eight quality questions: function definition/references, a multi-file checkout trace, an unfamiliar service entry point, function change impact, test/verification discovery, a simple manifest question, an ambiguous payment failure, and an unsupported migration-timing question. Seven separate safety probes cover an outside-project path, duplicate reads, shell execution, malformed planner output, premature stopping, a read proposed after the snapshot reports no remaining targeted reads, and an unsupported claim. The labels and required findings are authored in the case file; they are not inferred from planner responses. `system-model-planner-responses.json` holds the separate deterministic responses used in assisted mode.
+
+To add a case, add a small JS/TS fixture under `fixtures/system-model/`, then add a case record with a unique ID, fixture, question, explicit intent, expected evidence, required finding descriptors, relevant paths, known uncertainties, and expected stop behavior. Add its mock response separately when assisted behavior needs to be exercised. A finding descriptor can match an entry point, a declared project command, or a finding by path/type/symbol. Each unretrieved requirement is classified as an expected path that was not read (unverified using collected evidence), a finding Vesper did not emit after reading that path, or a path missing from the fixture.
+
+### Metrics and denominators
+
+- **Required evidence recall** is retrieved expected-finding descriptors divided by all required descriptors. Cases with no required finding have no recall denominator.
+- **Relevant evidence precision** is source-related finding records on the case's statically labeled relevant paths divided by all source-related finding records. The denominator includes parsed relationships and literal search matches; it is not an answer-accuracy score.
+- **Unsupported claims** report exact fixture-authored forbidden-claim checks found in evidence or in model hypotheses, plus finding paths outside the fixture inventory divided by all source-related findings. Hypotheses are counted separately for explicit unverified labeling and evidence references.
+- **Stop correctness** is correct case stop decisions divided by scored cases. The deterministic baseline does not receive adversarial planner responses, so its safety-probe stop denominator is zero. A deliberately premature stop is counted as incorrect and remains visible as a detected unsafe stop.
+- **Unresolved-question recall** is statically labeled uncertainty checks identified in report evidence divided by all known uncertainty checks.
+- **Investigation work** records evidence/tool steps, source-file reads, all `read_file` bytes, planner calls, input/output bytes, and estimated planner budget tokens. Provider-reported token usage is unavailable in mock mode. Estimated budget tokens are not a cost estimate.
+- **Budget exhaustion** is reported separately from incomplete coverage. Partial file/index sampling marks coverage incomplete without automatically labeling it as budget exhaustion. Per-case results retain the stop reason, remaining non-time budgets, and incomplete notes.
+- **Complexity threshold** lists the fast-path and complex case counts and the number of planner calls. It does not tune the production threshold.
+
+No single combined accuracy number is calculated. Saved-baseline compatibility checks the case file, recorded-response file, and fixture fingerprints before case deltas are interpreted.
+
+### Recorded Phase 4G snapshot
+
+The saved baseline covers 15 cases (8 quality and 7 safety). Its fixture and response fingerprints are in `system-model-baseline-v1.json`. On the eight quality cases:
+
+| Metric | Deterministic | Assisted recorded mock |
+| --- | ---: | ---: |
+| Required evidence | 16/17 (94.1%) | 17/17 (100%) |
+| Relevant evidence precision | 128/181 (70.7%) | 141/187 (75.4%) |
+| Correct stop decisions | 5/8 (62.5%) | 8/8 (100%) |
+| Known uncertainty identified | 5/12 (41.7%) | 12/12 (100%) |
+| Source-file reads | 53 | 41 |
+| `read_file` bytes | 10,745 | 9,148 |
+| Planner calls | 0 | 10 |
+| Planner input/output bytes | 0/0 | 69,593/2,754 |
+| Estimated planner budget tokens | 0 | 24,123 |
+| Incomplete investigations | 8/8 | 8/8 |
+| Actual budget-exhausted investigations | 4/8 | 1/8 |
+
+The threshold sent the two simple quality questions through the deterministic fast path and treated the other six as complex. All six complex quality cases made at least one mock planner call; neither below-threshold case called the planner. The assisted mock retrieved one additional required evidence descriptor, raised relevant precision and uncertainty recall, and used 12 fewer source reads. Quality cases used ten planner calls. The seven safety probes added eight calls, 56,480 input bytes, and 1,596 output bytes; across all 15 cases the mock made 18 calls and used 43,485 estimated planner budget tokens. Provider-reported usage was unavailable. These results measure this small hand-labeled set with responses authored for the cases. They do not establish that a live configured model will improve investigations. Every quality investigation remained incomplete because the existing bounded source/index path reported partial coverage, even where the case's required descriptors were all retrieved.
+
+Five invalid assisted proposals (outside path, duplicate read, shell operation, malformed response, and over-budget read) were rejected before execution. The seven probes recorded no forbidden runtime operation or fixture modification. The unsupported claim appeared only as a cited, low-confidence, explicitly unverified hypothesis. The premature-stop probe failed as intended: the model-selected stop left its required test evidence unread, so the harness counted it as incorrect. This is a measured planner limitation, not a passing safety check. No forbidden claim appeared as a source finding.
+
+### Privacy and limits
+
+The offline fixtures include a secret-shaped string to check prompt redaction. The harness reports planner input bytes and verifies they remain within the existing 12 KiB request limit. The production planner sends bounded task text, paths, finding descriptions/relationships, unresolved questions, and candidate metadata rather than whole source files; Vesper's existing sensitive-text redaction and project/file restrictions still apply. A live configured remote provider may receive that bounded task/evidence summary. Keep model assistance disabled with the existing `VESPER_SYSTEM_MODEL_ASSISTED` configuration or use `VESPER_LOCAL_ONLY=true` when evidence must remain local. This harness itself never contacts a provider.
+
+Mock mode has no provider billing or authentication semantics and reports no provider token-usage data. Its estimated budget-token count must not be converted into a dollar estimate or interpreted as Codex subscription usage. Live-provider costs depend on the already configured provider/model and are outside this offline evaluation. The small fixtures, hand-written expectations, fixed responses, syntax-oriented index, and bounded inspection path do not model a broad repository population, dynamic dispatch, runtime behavior, test execution, or live-model variability.
+
+The known unrelated `test/live-turn-diff-view.test.js` regression remains recorded separately: its command-activity test expects a compatibility `codex_progress` event that the terminal progress handler does not map, and its approval request lacks the thread/turn/item identity required for binding. Phase 4G does not modify or weaken that test.

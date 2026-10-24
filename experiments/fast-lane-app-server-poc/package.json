@@ -20,7 +20,8 @@
   "scripts": {
     "test": "node ./test/run-tests.js",
     "test:pty": "python3 ./test/pty-cli-smoke.py",
-    "cli": "node ./bin/vesper.js"
+    "cli": "node ./bin/vesper.js",
+    "evaluate:system-model": "node ./benchmark/run-system-model.js"
   },
   "contributes": {
     "commands": [

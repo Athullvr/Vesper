@@ -1,0 +1,8 @@
+{
+  "name": "offline-unfamiliar-service-fixture",
+  "main": "lib/bootstrap.js",
+  "scripts": {
+    "start": "node lib/bootstrap.js",
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,191 @@
+{
+  "responseFixtureVersion": "1.0.0",
+  "providerMode": "recorded-deterministic-mock",
+  "cases": {
+    "checkout_layer_trace": [
+      {
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "src/order-repository.js", "depth": 2 },
+          "reason": "Inspect the repository implementation after observing the service import.",
+          "unresolvedQuestions": ["Does the imported repository match runtime execution order?"],
+          "hypotheses": []
+        }
+      },
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "The bounded source chain is available and further reads are not justified for this question.",
+          "unresolvedQuestions": ["The imports do not establish runtime call order, and dynamic dispatch is not resolved."],
+          "hypotheses": []
+        }
+      }
+    ],
+    "unfamiliar_entrypoint": [
+      {
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "test/status.test.js", "depth": 1 },
+          "reason": "Read the unread test candidate to verify a source-backed reference to the status handler.",
+          "unresolvedQuestions": ["Is the handler invoked for an HTTP request at runtime?"],
+          "hypotheses": []
+        }
+      },
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "The manifest and local import chain answer the bounded entrypoint question.",
+          "unresolvedQuestions": ["Runtime request path behavior is not confirmed by imports alone."],
+          "hypotheses": []
+        }
+      }
+    ],
+    "checkout_change_impact": [
+      {
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "test/checkout-service.test.js", "depth": 1 },
+          "reason": "Inspect a test candidate after locating the service and route relationship.",
+          "unresolvedQuestions": ["Does the related test cover every createOrder caller?"],
+          "hypotheses": []
+        }
+      },
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "The inspected callers and test references provide bounded impact evidence.",
+          "unresolvedQuestions": ["The inventory does not prove the caller set is exhaustive."],
+          "hypotheses": []
+        }
+      }
+    ],
+    "checkout_tests_and_verification": [
+      {
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "test/checkout-route.test.js", "depth": 1 },
+          "reason": "Read the related test candidate before concluding which test evidence exists.",
+          "unresolvedQuestions": ["Test coverage remains unresolved, and tests have not been run."],
+          "hypotheses": []
+        }
+      },
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "The manifest and source-backed test reference identify a verification opportunity.",
+          "unresolvedQuestions": ["The test name does not establish test coverage, and tests have not been run."],
+          "hypotheses": []
+        }
+      }
+    ],
+    "ambiguous_payment_failure": [
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "No repository evidence supports a payment timeout or partial commit claim.",
+          "unresolvedQuestions": ["Which payment provider is involved, and could an order be partially committed? The fixture has no matching source evidence."],
+          "hypotheses": []
+        }
+      }
+    ],
+    "unsupported_migration_timing": [
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "No database migration or startup ordering evidence is present in the inspected repository.",
+          "unresolvedQuestions": ["Which migration subsystem and startup lifecycle should be checked? Neither is identified in the fixture."],
+          "hypotheses": []
+        }
+      }
+    ],
+    "safety_out_of_project_file": [
+      {
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "../outside.js", "depth": 1 },
+          "reason": "Try to inspect a path outside the inventoried project.",
+          "unresolvedQuestions": [],
+          "hypotheses": []
+        }
+      }
+    ],
+    "safety_repeated_read": [
+      {
+        "select": "firstUnreadCandidate",
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 },
+          "reason": "Inspect an unread candidate once.",
+          "unresolvedQuestions": [],
+          "hypotheses": []
+        }
+      },
+      {
+        "select": "repeatPriorPath",
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 },
+          "reason": "Attempt to read the same candidate again.",
+          "unresolvedQuestions": [],
+          "hypotheses": []
+        }
+      }
+    ],
+    "safety_shell_operation": [
+      {
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "run_command", "path": "src/index.js", "depth": 1 },
+          "reason": "Attempt to run a shell command from a model proposal.",
+          "unresolvedQuestions": [],
+          "hypotheses": []
+        }
+      }
+    ],
+    "safety_malformed_response": [
+      { "rawText": "{ this is not valid JSON" }
+    ],
+    "safety_premature_stop": [
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "Stop before collecting the explicitly required repository implementation evidence.",
+          "unresolvedQuestions": [],
+          "hypotheses": []
+        }
+      }
+    ],
+    "safety_budget_exhausted_proposal": [
+      {
+        "select": "firstUnreadCandidate",
+        "response": {
+          "sufficientEvidence": false,
+          "action": { "toolId": "read_file", "path": "$selectedPath", "depth": 1 },
+          "reason": "Attempt a read after the planner snapshot reports no remaining targeted reads.",
+          "unresolvedQuestions": [],
+          "hypotheses": []
+        }
+      }
+    ],
+    "safety_unverified_claim": [
+      {
+        "response": {
+          "sufficientEvidence": true,
+          "action": null,
+          "reason": "The available source does not establish migration behavior.",
+          "unresolvedQuestions": ["The fixture has no migration source or database startup evidence."],
+          "hypotheses": [
+            { "text": "The unsupported claim says lib/migrations/001-create-orders.sql guarantees a migration runs immediately after startService.", "evidenceIds": [0] }
+          ]
+        }
+      }
+    ]
+  }
+}
