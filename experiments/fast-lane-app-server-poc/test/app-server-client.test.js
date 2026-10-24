@@ -330,6 +330,7 @@ test("turn timeout requests interruption and resolves as timed out after confirm
 
 test("approval requests use one-time supported decisions and permissions are limited to the current turn", async (t) => {
   const approvalCalls = [];
+  const approvalEvents = [];
   const server = new FakeAppServerProcess({ onTurnStart: (message, current) => {
     current.respond(message.id, { turn: { id: "turn-1", items: [], status: "inProgress" } });
     current.requestFromServer("approval-1", "item/commandExecution/requestApproval", {
@@ -338,10 +339,13 @@ test("approval requests use one-time supported decisions and permissions are lim
     setImmediate(() => current.completeTurn(message, "completed"));
   } });
   const { client } = createClient(server, {
-    onApproval: async (method, params) => {
-      approvalCalls.push({ method, params });
+    onApproval: async (method, params, context) => {
+      approvalCalls.push({ method, params, context });
       return { decision: "accept" };
     },
+  });
+  client.on("progress", (event) => {
+    if (["approval_requested", "approval_decided"].includes(event.type)) approvalEvents.push(event);
   });
   t.after(() => client.dispose());
 
@@ -349,11 +353,21 @@ test("approval requests use one-time supported decisions and permissions are lim
   const approvalResponse = server.requests.find((request) => request.id === "approval-1");
   assert.deepEqual(approvalResponse.result, { decision: "accept" });
   assert.equal(approvalCalls[0].method, "item/commandExecution/requestApproval");
+  assert.equal(approvalCalls[0].context.requestId, "approval-1", "the native JSON-RPC request ID reaches the approval adapter");
+  assert.equal(approvalEvents.find((event) => event.type === "approval_requested").requestId, "approval-1");
+  assert.equal(approvalEvents.find((event) => event.type === "approval_decided").requestId, "approval-1");
 
   server.requestFromServer("approval-stale", "item/commandExecution/requestApproval", {
     itemId: "item-stale", startedAtMs: 2, threadId: "thread-1", turnId: "turn-1", command: "npm test",
   });
   assert.deepEqual(server.requests.find((request) => request.id === "approval-stale").result, { decision: "decline" });
+  assert.equal(approvalCalls.length, 1);
+
+  server.requestFromServer(null, "item/commandExecution/requestApproval", {
+    itemId: "item-1", threadId: "thread-1", turnId: "turn-1", command: "npm test",
+  });
+  assert.equal(server.requests.find((request) => request.id === null).error.code, -32600,
+    "an invalid JSON-RPC request identity is rejected before approval can be requested");
   assert.equal(approvalCalls.length, 1);
 
   assert.deepEqual(validateApprovalResult("item/permissions/requestApproval", { permissions: {}, scope: "turn" }), { permissions: {}, scope: "turn" });

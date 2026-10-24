@@ -314,13 +314,16 @@ class CodexExecutionProvider extends EventEmitter {
         // approval callback. The protocol payload is deliberately discarded.
         break;
       case "approval_decided":
-        this.emitCommandUpdates(this.commandActivity.applyApproval(event.params, event.status), event.method || "approval.response");
-        this.emitEvent("approval-decided", {
-          ...normalizeApprovalActivity(event.params, event.status, event.method),
-          operation: approvalType(event.method),
-          sourceEventType: event.method || "approval.response",
-        });
-        break;
+        {
+          const params = { ...(event.params || {}), requestId: safeRequestId(event.requestId) };
+          this.emitCommandUpdates(this.commandActivity.applyApproval(params, event.status), event.method || "approval.response");
+          this.emitEvent("approval-decided", {
+            ...normalizeApprovalActivity(params, event.status, event.method),
+            operation: approvalType(event.method),
+            sourceEventType: event.method || "approval.response",
+          });
+          break;
+        }
       case "codex_progress":
         this.handleCodexProgress(event.method, event.params);
         break;
@@ -434,6 +437,7 @@ function normalizeApprovalRequest(method, params, context) {
     taskId: safeIdentity(params.turnId),
     itemId: safeIdentity(params.itemId),
     approvalId: safeIdentity(params.approvalId),
+    requestId: safeRequestId(context?.requestId),
     command: safeField(params.command, MAX_COMMAND_LENGTH, true),
     cwd: safeField(params.cwd, MAX_CWD_LENGTH, false),
     review,
@@ -450,6 +454,7 @@ function publicApprovalRequest(request) {
     taskId: request.taskId,
     itemId: request.itemId,
     approvalId: request.approvalId,
+    requestId: request.requestId,
     reviewTitle: request.review.title,
     reviewTruncated: request.review.truncated,
     canApprove: request.canApprove,
@@ -462,6 +467,7 @@ function approvalActivityParams(request) {
     turnId: request.taskId,
     itemId: request.itemId,
     approvalId: request.approvalId,
+    requestId: request.requestId,
     command: request.command,
     cwd: request.cwd,
   };
@@ -473,6 +479,7 @@ function normalizeApprovalActivity(params = {}, status, method) {
     taskId: safeIdentity(params.turnId),
     itemId: safeIdentity(params.itemId),
     approvalId: safeIdentity(params.approvalId),
+    requestId: safeRequestId(params.requestId),
     operation: approvalType(method),
     command: safeField(params.command, MAX_COMMAND_LENGTH, true),
     cwd: safeField(params.cwd, MAX_CWD_LENGTH, false),
@@ -539,6 +546,11 @@ function mapTurnState(status) {
 function safeIdentity(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 512 &&
     !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value) ? value : null;
+}
+
+function safeRequestId(value) {
+  if (typeof value === "string") return safeIdentity(value);
+  return Number.isSafeInteger(value) ? value : null;
 }
 
 function safeField(value, limit, redact) {

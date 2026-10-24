@@ -95,16 +95,20 @@ class CommandActivityStore {
 
   applyApproval(params, status) {
     if (!isObject(params) || !["requested", "approved", "declined", "cancelled"].includes(status)) return [];
+    const approvalKey = approvalRequestKey(params.requestId) ||
+      (isIdentity(params.approvalId) ? `approval:${params.approvalId}` : null);
+    if (!approvalKey) return [];
     const record = this.getRecord(params.threadId, params.turnId, params.itemId);
     if (!record) return this.flushOverflow();
-    this.updateCommandFields(record, { command: params.command, cwd: params.cwd });
-    const approvalKey = isIdentity(params.approvalId) ? params.approvalId : "default";
     const current = record.approvals.get(approvalKey);
     if (status === "requested") {
-      if (!current && record.approvals.size < MAX_APPROVALS_PER_ITEM) record.approvals.set(approvalKey, "requested");
-    } else if (current === "requested" || !current) {
+      if (current || record.approvals.size >= MAX_APPROVALS_PER_ITEM) return [];
+      record.approvals.set(approvalKey, "requested");
+    } else {
+      if (current !== "requested") return [];
       record.approvals.set(approvalKey, status);
     }
+    this.updateCommandFields(record, { command: params.command, cwd: params.cwd });
     const latest = [...record.approvals.values()].at(-1);
     record.approvalStatus = latest || record.approvalStatus;
     return this.flush(record);
@@ -268,6 +272,12 @@ function isObject(value) {
 function isIdentity(value) {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_ID_LENGTH &&
     !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value);
+}
+
+function approvalRequestKey(value) {
+  if (isIdentity(value)) return `request:string:${value}`;
+  if (Number.isSafeInteger(value)) return `request:number:${value}`;
+  return null;
 }
 
 function isValidWorkingDirectory(value) {

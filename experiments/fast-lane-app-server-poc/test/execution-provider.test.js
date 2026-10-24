@@ -197,6 +197,7 @@ test("approval callbacks receive normalized review evidence and return Codex one
   provider.on("event", (event) => events.push(event));
   provider.setApprovalHandler(async (request) => {
     assert.equal(request.type, "command");
+    assert.equal(request.requestId, "rpc-approval-1");
     assert.equal(request.review.title, "command execution");
     assert.equal(request.command, "npm test");
     assert.equal(Object.hasOwn(request, "method"), false);
@@ -208,10 +209,11 @@ test("approval callbacks receive normalized review evidence and return Codex one
     threadId: "thread-1", turnId: "turn-1", itemId: "item-1", command: "npm test", cwd: "/workspace/project",
     availableDecisions: ["accept", "decline"],
     privatePayload: "credential-value",
-  });
+  }, { requestId: "rpc-approval-1" });
   assert.deepEqual(result, { decision: "accept" });
   const event = events.find((item) => item.type === "approval-required");
   assert.equal(event.request.type, "command");
+  assert.equal(event.request.requestId, "rpc-approval-1");
   assert.equal(JSON.stringify(event).includes("privatePayload"), false);
   assert.equal(JSON.stringify(event).includes("credential-value"), false);
   provider.dispose();

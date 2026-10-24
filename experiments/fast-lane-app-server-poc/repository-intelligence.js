@@ -10,7 +10,10 @@ const MAX_INSPECTION_MS = 10_000;
 // The shared task-evidence ledger stores at most 32 tool outcomes. Keep local
 // exploration within that same bound so every invoked operation can be reported.
 const MAX_TOOL_CALLS = 32;
-const MAX_DIRECTORIES = 6;
+// Held-out evaluation showed that six directories can hide ordinary route,
+// service, and storage layers in a small project before candidate selection.
+// Keep traversal bounded, but admit a modest multi-layer tree.
+const MAX_DIRECTORIES = 16;
 const MAX_FILES = 600;
 const MAX_MANIFESTS = 4;
 const MAX_MANIFEST_BYTES = 128 * 1024;
@@ -30,8 +33,15 @@ const MAX_FINDINGS = 48;
 const MAX_STEPS = 32;
 const MAX_INDEX_FINDINGS_PER_SYMBOL = 12;
 const MAX_INDEX_QUERY_SYMBOLS = 6;
+const MAX_EXCLUDED_PATHS = 16;
 const FOLLOWUP_TOOL_IDS = new Set(["read_file"]);
 const REFERENCE_INDEX_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"]);
+const FINDING_PRIORITY = new Map([
+  ["symbol-definition", 0], ["symbol-import", 1], ["symbol-export", 2], ["likely-call-site", 3],
+  ["route-handler", 4], ["test-reference", 5], ["identifier-reference", 6], ["textual-reference", 7],
+  ["symbol", 8], ["import-edge", 9], ["git-diff-hunk", 10], ["git-diff", 11], ["search-match", 12],
+  ["reference", 13], ["source-section", 14], ["path-match", 15],
+]);
 
 const MANIFEST_NAMES = new Set([
   "package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "pipfile",
@@ -135,6 +145,9 @@ class RepositoryIntelligenceService {
       gitIgnoreAvailable: false,
       files: [],
       directories: [],
+      excludedPaths: [],
+      dynamicModuleLoads: new Set(),
+      taskTerms: extractSearchTerms(task),
       ignored: 0,
       sensitive: 0,
       symlinks: 0,
@@ -203,6 +216,7 @@ class RepositoryIntelligenceService {
           languages: Object.freeze(state.languages.slice(0, 8)), frameworks: Object.freeze(state.frameworks.slice(0, 8)),
           dependencies: Object.freeze(state.dependencies.slice(0, 20)), manifests: Object.freeze(state.manifests.map((item) => Object.freeze({ ...item }))),
           entryPoints: Object.freeze(state.entryPoints.slice(0, 10)), commands: Object.freeze(state.commands.slice(0, 12)),
+          excludedPaths: Object.freeze(state.excludedPaths.slice(0, MAX_EXCLUDED_PATHS)),
           structure: Object.freeze([...state.directories.map((item) => `${item.path}/`), ...state.files.map((item) => item.path)].slice(0, MAX_STRUCTURE_ENTRIES)),
           candidateFiles: Object.freeze(state.candidates.slice(0, 80).map((item) => Object.freeze({ ...item }))),
           readPaths: Object.freeze([...state.readPaths].slice(0, MAX_SOURCE_READS + MAX_TARGETED_READS)),
@@ -229,7 +243,8 @@ class RepositoryIntelligenceService {
       return Object.freeze({ status: evidence.investigation.status, observedAt: evidence.investigation.observedAt, project: Object.freeze({ fileCount: state.files.length, directoryCount: state.directories.length,
         languages: Object.freeze(state.languages.slice(0, 8)), frameworks: Object.freeze(state.frameworks.slice(0, 8)), dependencies: Object.freeze(state.dependencies.slice(0, 20)),
         manifests: Object.freeze(state.manifests.map((item) => Object.freeze({ ...item }))), entryPoints: Object.freeze(state.entryPoints.slice(0, 10)),
-        commands: Object.freeze(state.commands.slice(0, 12)), structure: Object.freeze(state.files.slice(0, MAX_STRUCTURE_ENTRIES).map((item) => item.path)),
+        commands: Object.freeze(state.commands.slice(0, 12)), excludedPaths: Object.freeze(state.excludedPaths.slice(0, MAX_EXCLUDED_PATHS)),
+        structure: Object.freeze(state.files.slice(0, MAX_STRUCTURE_ENTRIES).map((item) => item.path)),
         candidateFiles: Object.freeze(state.candidates.slice(0, 80).map((item) => Object.freeze({ ...item }))), readPaths: Object.freeze([...state.readPaths]), truncated: true }),
         git: Object.freeze({ available: state.gitAvailable, status: safeText(state.statusText, 4_000), history: safeText(state.historyText, 3_000), diff: safeText(state.diffText, 6_000),
           coverage: state.gitAvailable ? "Tracked working-tree status and unstaged tracked diff only; untracked files and staged diff are omitted. Git ignore checks use in-project rules; global excludes are not read." : "Git metadata is unavailable; filesystem findings are independent of Git." }),
@@ -324,7 +339,15 @@ class RepositoryIntelligenceService {
         const relative = joinProjectPath(current.path, entry.name);
         if (!relative || isSensitivePath(relative) || entry.type === "symbolic-link" || (entry.type === "directory" && shouldSkipDirectory(entry.name))) continue;
         const ignored = state.gitAvailable ? ignoredByGit.has(relative) : isIgnoredByRules(relative, entry.type === "directory", rules);
-        if (ignored) { state.ignored += 1; continue; }
+        if (ignored) {
+          state.ignored += 1;
+          if (state.excludedPaths.length < MAX_EXCLUDED_PATHS) state.excludedPaths.push(relative);
+          const taskTerms = state.taskTerms || [];
+          if (taskTerms.some((term) => relative.toLocaleLowerCase("en-US").includes(term.toLocaleLowerCase("en-US")))) {
+            state.unresolved.push(`Project ignore rules exclude ${relative}${entry.type === "directory" ? "/" : ""}; files at this path were not inspected.`);
+          }
+          continue;
+        }
         if (entry.type === "directory") {
           if (current.depth < 6 && queue.length + state.directories.length < MAX_DIRECTORIES) queue.push({ path: relative, depth: current.depth + 1, rules });
           else state.incomplete.push(`Traversal depth or directory budget stopped before ${relative}.`);
@@ -639,7 +662,15 @@ class RepositoryIntelligenceService {
       const lines = content.split("\n");
       const sourceFile = state.files.find((item) => item.path === sourcePath);
       for (let index = 0; index < Math.min(lines.length, MAX_SOURCE_LINES); index += 1) {
-        const specifier = localImportSpecifier(lines[index], sourceFile?.extension || path.posix.extname(sourcePath).toLowerCase());
+        const line = lines[index];
+        if (/\b(?:require|import)\s*\(\s*(?!["'])/u.test(line)) {
+          const loadKey = `${sourcePath}:${index + 1}`;
+          if (!state.dynamicModuleLoads.has(loadKey)) {
+            state.dynamicModuleLoads.add(loadKey);
+            state.unresolved.push(`Dynamic module loading in ${loadKey} uses a computed path that could not be resolved to one inventoried file.`);
+          }
+        }
+        const specifier = localImportSpecifier(line, sourceFile?.extension || path.posix.extname(sourcePath).toLowerCase());
         if (!specifier || traced >= 20) continue;
         const target = resolveInventoryImport(sourcePath, specifier, known);
         if (!target) {
@@ -1029,6 +1060,28 @@ class RepositoryIntelligenceService {
   }
 
   find(evidence, finding) {
+    // The source scan can fill the shared finding ledger with literal matches
+    // before the parsed reference index runs. Preserve the same hard evidence
+    // bound, but let a structured relationship displace a lower-value search
+    // hint so useful provenance survives the bounded report.
+    if (evidence.findings.length >= MAX_FINDINGS) {
+      if (evidence.findings.some((existing) => existing.type === finding.type &&
+          existing.path === finding.path && existing.relatedPath === finding.relatedPath &&
+          existing.lineStart === finding.lineStart && existing.symbol === finding.symbol &&
+          existing.description === finding.description)) return false;
+      const incomingPriority = FINDING_PRIORITY.get(finding.type) ?? 16;
+      let replaceIndex = -1;
+      let lowestPriority = incomingPriority;
+      for (let index = 0; index < evidence.findings.length; index += 1) {
+        const existingPriority = FINDING_PRIORITY.get(evidence.findings[index].type) ?? 16;
+        if (existingPriority > lowestPriority) {
+          lowestPriority = existingPriority;
+          replaceIndex = index;
+        }
+      }
+      if (replaceIndex < 0) return false;
+      evidence.findings.splice(replaceIndex, 1);
+    }
     recordRepositoryFinding(evidence, { ...finding, observedAt: this.now().toISOString() });
   }
 

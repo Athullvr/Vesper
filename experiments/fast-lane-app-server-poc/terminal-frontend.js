@@ -362,6 +362,7 @@ class TerminalFrontend {
         turnId: approvalRequest.taskId,
         itemId: approvalRequest.itemId,
         approvalId: approvalRequest.approvalId,
+        requestId: approvalRequest.requestId,
         command: approvalRequest.command,
         cwd: approvalRequest.cwd,
       }, "requested"));
@@ -644,7 +645,12 @@ class TerminalFrontend {
         this.turnDiffIdentity = isTurnDiffIdentity(event.conversationId, event.taskId)
           ? { threadId: event.conversationId, turnId: event.taskId }
           : null;
-        if (this.turnDiffIdentity) this.turnDiffView.begin();
+        if (this.turnDiffIdentity) {
+          this.renderCommandActivity(this.commandActivity?.bindTurn(event.conversationId, event.taskId));
+          this.turnDiffView.begin();
+        } else {
+          this.turnDiffView.end();
+        }
         this.renderFileChangeActivities(event.fileChanges);
         break;
       case "task-state":
@@ -691,7 +697,13 @@ class TerminalFrontend {
   // client directly. Production execution subscribes only to normalized events.
   handleProgress(event) {
     if (!event || typeof event !== "object") return;
-    if (event.type === "turn_identity") {
+    if (event.type === "codex_progress") {
+      const active = this.turnDiffIdentity;
+      const params = event.params;
+      if (!active || !params || params.threadId !== active.threadId || params.turnId !== active.turnId ||
+          !["item/started", "item/completed", "item/commandExecution/outputDelta"].includes(event.method)) return;
+      this.renderCommandActivity(this.commandActivity?.applyProtocolNotification(event.method, params));
+    } else if (event.type === "turn_identity") {
       this.handleExecutionEvent({ type: "task-identity", conversationId: event.threadId, taskId: event.turnId, fileChanges: event.fileChanges });
     } else if (event.type === "file_change_activity") {
       this.handleExecutionEvent({ type: "file-change", activity: event.activity });

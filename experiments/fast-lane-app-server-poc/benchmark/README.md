@@ -236,4 +236,91 @@ The offline fixtures include a secret-shaped string to check prompt redaction. T
 
 Mock mode has no provider billing or authentication semantics and reports no provider token-usage data. Its estimated budget-token count must not be converted into a dollar estimate or interpreted as Codex subscription usage. Live-provider costs depend on the already configured provider/model and are outside this offline evaluation. The small fixtures, hand-written expectations, fixed responses, syntax-oriented index, and bounded inspection path do not model a broad repository population, dynamic dispatch, runtime behavior, test execution, or live-model variability.
 
-The known unrelated `test/live-turn-diff-view.test.js` regression remains recorded separately: its command-activity test expects a compatibility `codex_progress` event that the terminal progress handler does not map, and its approval request lacks the thread/turn/item identity required for binding. Phase 4G does not modify or weaken that test.
+At the time of this Phase 4G snapshot, `test/live-turn-diff-view.test.js` had a known approval/activity regression. Phase 4H documents the event-flow diagnosis and fix below; the Phase 4G measurement and baseline remain unchanged.
+
+## Phase 4H held-out System Model evaluation
+
+Run the independently authored held-out cases separately from the Phase 4G development cases:
+
+```sh
+npm run evaluate:system-model -- --set heldout --json /tmp/vesper-system-model-heldout-results.json
+```
+
+The command is fully offline and deterministic. It uses recorded planner responses, fresh fixture copies, a mock read-only Git interface, and the same permissioned runtime/evidence format as Vesper. It does not need credentials or network access and never runs scripts, tests, builds, or commands from a benchmark fixture. Development and held-out cases have separate case/response files. Expected evidence, findings, uncertainties, and stopping criteria are fixture-authored independently of the planner responses. The held-out case metadata records `authorship: independent-of-planner-responses` and `thresholdTunedOnThisSet: false`; do not tune the production complexity threshold against this set.
+
+This held-out version contains nine quality cases and five adversarial safety cases in `system-model-heldout-cases.json`, backed by the small `ledger-api` fixture. Cases cover cross-file invoice behavior, a misleading legacy literal match, a computed worker path whose expected target is absent, a generated worker excluded by ignore rules, an ambiguous idempotency request, an easy manifest fast path, a task where additional reads do not help, a premature stop before a related test, and an unsupported runtime-order conclusion. Safety proposals include outside-project paths, duplicate reads, shell execution, malformed output, and a read after the budget is exhausted. Recorded assisted responses are in `system-model-heldout-planner-responses.json`.
+
+Each mode runs against a fresh copy of the same case fixture. The original Phase 4G baseline, `system-model-baseline-v1.json`, is unchanged. The updated development snapshot is saved as `system-model-baseline-v2.json`; the independent held-out run is saved as `system-model-heldout-baseline-v1.json`. The runner refuses to overwrite an existing versioned baseline. The Phase 4H development snapshot comparison reports 13 case rows with changed evidence/uncertainty or related measured values against Phase 4G; its relevant-evidence totals are 141/189 deterministic and 148/194 assisted, versus the historical 128/181 and 141/187. Use `--compare PATH` to compare compatible case/fixture inputs and per-case evidence, uncertainty, stop, and work/coverage outcomes. The result includes benchmark version, fixture hashes, planner mode and config, per-case evidence status, and separate aggregate denominators. `--json PATH` writes sanitized machine-readable case details; raw prompts and raw provider responses are not stored.
+
+### Held-out results, version 1
+
+Exact command used to produce the saved offline result:
+
+```sh
+node benchmark/run-system-model.js --set heldout --write-baseline benchmark/system-model-heldout-baseline-v1.json --json /tmp/vesper-system-model-heldout-results-final.json
+```
+
+The two quality modes evaluated all 9 cases on equivalent fixture copies. The 5 safety probes are reported separately; the baseline never receives adversarial model proposals. Counts below use the explicit denominators shown.
+
+| Quality metric | Deterministic | Assisted recorded mock |
+| --- | ---: | ---: |
+| Required evidence retrieved | 14/17 (82.4%) | 11/17 (64.7%) |
+| Required evidence retrieved where path is available | 14/15 (93.3%) | 11/15 (73.3%) |
+| Relevant evidence precision | 159/356 (44.7%) | 117/294 (39.8%) |
+| Correct stop decisions | 6/9 (66.7%) | 6/9 (66.7%) |
+| Known uncertainties identified | 4/8 (50.0%) | 6/8 (75.0%) |
+| Source-file reads | 66 | 52 |
+| `read_file` bytes inspected | 19,463 | 15,333 |
+| Planner calls | 0 | 6 |
+| Planner input/output bytes | 0/0 | 43,176/1,484 |
+| Estimated planner budget tokens | 0 | 14,891 |
+| Provider-reported token usage | unavailable (offline mock) | unavailable (offline mock) |
+| Planner latency | not measured in reproducible offline mode | not measured in reproducible offline mode |
+| Incomplete investigations | 9/9 | 9/9 |
+| Budget-exhausted investigations | 0/9 | 0/9 |
+
+Assistance reduced reads by 14 and raised uncertainty recall by 25 percentage points. It lowered total required-evidence recall by 17.7 points, available-path recall by 20 points, and relevant-evidence precision by 4.9 points; stop accuracy was unchanged. The result does not support claiming the assisted planner improves overall evidence quality on this held-out sample. The threshold kept five quality questions on the deterministic fast path and marked four complex; all four complex cases made at least one recorded planner call.
+
+Unsupported findings and hypotheses are distinct. Both modes had 0/2 forbidden claims in source evidence and 0 findings outside the fixture inventory (0/356 deterministic, 0/294 assisted). Assisted planning surfaced the fixture-authored unsupported runtime-order claim in 1/2 checks, but the one hypothesis was marked unverified and cited one evidence record. Uncertainty recall is 4/8 deterministic versus 6/8 assisted. Five of five assisted adversarial stop checks were safely handled; no proposal executed a command, wrote a fixture, or bypassed permission checks. The deliberate premature-stop quality case is counted as an incorrect stop in both the quality report's six correct decisions out of nine; its unread required test remains visibly unverified.
+
+Required-path status explains the recall denominator: one target file is absent from the fixture and one is excluded by fixture ignore rules, leaving 15 available expected evidence descriptors. Among the available-but-not-retrieved descriptors, the deterministic run read one file without emitting the expected finding; assisted planning inventoried but did not read three files and also read one file without emitting the expected finding. Missing and ignored paths are not counted as verified evidence. No claim of full coverage is made.
+
+### Incomplete coverage analysis and bounded change
+
+All 9 quality cases in both modes remain incomplete. The most common cause is candidate selection: the existing bounded source investigation sampled 4 of 8 candidate code files in all nine cases. Seven deterministic cases and three assisted cases also hit the existing 48-finding evidence cap. Four assisted cases hit the existing finding-bound on cross-file candidate discovery. Required-path diagnostics additionally identify unread inventoried files, one missing fixture path, one ignore-excluded path, and a read file with a missing expected finding. This separates candidate sampling, finding/index limits, unread relevant files, and unavailable evidence rather than marking a partial investigation complete.
+
+The measured candidate traversal previously stopped at six directories before reaching relevant route/service/storage paths in this fixture, so the existing traversal cap was raised to sixteen while remaining bounded. The 48-finding ledger now replaces lower-priority path/literal/source-section hints with higher-priority parsed definitions/imports/call/test relationships when full; it still retains the same hard cap and reports truncation. The report now exposes a bounded list of paths excluded by ignore rules and labels computed `require`/`import` paths unresolved instead of guessing their targets. These changes improved inspectable provenance but did not make the held-out investigations complete. Candidate inventory, source-read, and index budgets remain, and the evidence shows no basis for a broader source-reading bypass.
+
+### Optional live-provider evaluation
+
+Live mode is opt-in and was **not run** for this report. The runner requires explicit selection of the already configured `openai-chat-completions` or `nvidia-nim` provider, `--confirm-live-charges`, model assistance enabled, a held-out quality case limit, planner-call limit, elapsed-time limit, and a JSON result path. It never switches provider or model, and it refuses to compare against or overwrite an offline baseline. For example, this optional command evaluates one quality case with at most two planner calls and 30 seconds elapsed:
+
+```sh
+VESPER_SYSTEM_MODEL_ASSISTED=1 npm run evaluate:system-model -- --set heldout --live-provider openai-chat-completions --confirm-live-charges --max-cases 1 --max-planner-calls 2 --max-elapsed-ms 30000 --json /tmp/vesper-system-model-live.json
+```
+
+Use `--live-provider nvidia-nim` to explicitly select NVIDIA instead. The command uses Vesper's existing configured adapter, credentials, endpoint, and model. It may incur separate API charges according to that provider's billing; a Codex subscription or credit is not assumed to cover them. It rejects live mode under `VESPER_LOCAL_ONLY=true` and requires `VESPER_SYSTEM_MODEL_ASSISTED=1`. The request is bounded to the existing redacted task/evidence metadata and provider output limits; source excerpts, whole repositories, command execution, fixture writes, tests, and builds are not sent or run. Provider-reported input/output/total token usage is recorded only when the adapter returns it; missing values remain unknown, and currency cost is always unknown. The JSON report is the documented inspection path for sanitized per-case outcomes. It excludes raw prompt/response text by default. A live request can still disclose the bounded task text, repository-relative paths, and evidence metadata to the selected remote provider; follow its privacy/retention settings.
+
+### Metric definitions and limitations
+
+- Required-evidence recall is retrieved independent descriptors divided by expected descriptors. Available-path recall excludes only descriptors whose paths are missing from the fixture or explicitly ignored; both totals remain visible.
+- Relevant-evidence precision is source-related finding records on case-labeled relevant paths divided by all source-related records. It is not answer accuracy and includes literal search hits as well as parsed relationships.
+- Unsupported claims count fixture-authored forbidden-claim checks in evidence and hypotheses separately. Out-of-fixture finding rate uses all source-finding records as its denominator. Model hypotheses are also checked for explicit unverified labels and evidence-reference counts.
+- Stop correctness is scored per case with a defined stop expectation. Uncertainty recall is identified labeled uncertainties divided by the independent known-uncertainty checks.
+- Source reads and bytes are measured from `read_file` tool operations. Offline planner calls are recorded mock calls; estimated planner-budget tokens are not provider usage or a cost estimate. Live provider latency and token usage are reported only when actually measured or returned. Missing provider usage and all currency costs are unknown.
+- An incomplete investigation is not necessarily budget exhaustion. Inventory sampling, candidate bounds, index/finding caps, missing paths, ignored paths, and unread files remain visible even when required evidence happens to be found.
+
+The fixtures are small, hand-authored JavaScript, TypeScript, and configuration examples. This sample does not establish broad repository performance or the likely quality of live models. The lexical index does not prove runtime control flow, dynamic module paths remain unresolved, and the harness never runs fixture tests to validate suggested verification opportunities. The saved results are deterministic and offline; no API keys or network are needed for the normal benchmark or tests.
+
+The focused regression commands are:
+
+```sh
+node test/system-model-evaluation.test.js
+node test/live-turn-diff-view.test.js
+```
+
+## Phase 4H live-turn approval/activity regression
+
+The original failure was reproduced in the approval/activity assertion in `test/live-turn-diff-view.test.js`. App-server notifications arrived through the compatibility `codex_progress` event, while the terminal progress handler only handled native event names; consequently the live diff did not suspend for the command activity. Approval requests also traveled from the app-server JSON-RPC response through the Codex execution provider without the JSON-RPC request ID, so the activity could not be tied to the request that Vesper had actually approved.
+
+The fix preserves Codex's app-server flow and one-time approval response: `app-server-client.js` carries the actual protocol request ID with approval callbacks and approval events, `codex-execution-provider.js` preserves it in the normalized approval activity, and `command-activity.js` keys approvals by their real request identity. `terminal-frontend.js` now maps only allowlisted compatibility `codex_progress` command activity and binds it to the active thread/turn. Missing, stale, or mismatched progress identities are ignored; missing approval request IDs are not fabricated or approved. Tests cover the request ID arriving at the live activity, turn scoping, and stale/mismatched progress. The complete live-turn-diff test file passed after this fix.

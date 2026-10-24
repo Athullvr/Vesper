@@ -198,8 +198,13 @@ test("terminal controls and common secret patterns are escaped or redacted befor
 test("approval state stays separate from execution state", () => {
   const store = new CommandActivityStore();
   store.bindTurn(identity.threadId, identity.turnId);
-  const requested = store.applyApproval({ ...identity, command: "npm test", cwd: "/workspace/project" }, "requested");
-  const accepted = store.applyApproval({ ...identity, command: "npm test", cwd: "/workspace/project" }, "approved");
+  const approvalIdentity = { ...identity, requestId: "rpc-approval-1" };
+  assert.deepEqual(store.applyApproval({ ...identity, command: "npm test", cwd: "/workspace/project" }, "requested"), [],
+    "an approval with no request or approval identity is ignored");
+  assert.deepEqual(store.applyApproval({ ...approvalIdentity, requestId: "stale-request" }, "approved"), [],
+    "a decision without its matching request is ignored");
+  const requested = store.applyApproval({ ...approvalIdentity, command: "npm test", cwd: "/workspace/project" }, "requested");
+  const accepted = store.applyApproval({ ...approvalIdentity, command: "npm test", cwd: "/workspace/project" }, "approved");
   assert.equal(requested[0].activity.approvalStatus, "requested");
   assert.equal(requested[0].activity.executionStatus, null);
   assert.equal(accepted[0].activity.approvalStatus, "approved");
@@ -214,6 +219,19 @@ test("approval state stays separate from execution state", () => {
   assert.match(text, /approval approved/u);
   assert.match(text, /execution started/u);
   assert.doesNotMatch(render(accepted), /execution completed/u);
+});
+
+test("separate approval request IDs stay distinct even when the server reuses an approval ID", () => {
+  const store = new CommandActivityStore();
+  store.bindTurn(identity.threadId, identity.turnId);
+  const first = { ...identity, requestId: "rpc-approval-1", approvalId: "shared-approval" };
+  const second = { ...identity, requestId: "rpc-approval-2", approvalId: "shared-approval" };
+  store.applyApproval(first, "requested");
+  store.applyApproval(second, "requested");
+  const firstDecision = store.applyApproval(first, "approved");
+  assert.deepEqual(firstDecision, [], "the other pending request remains the latest visible state");
+  const secondDecision = store.applyApproval(second, "declined");
+  assert.equal(secondDecision[0].activity.approvalStatus, "declined");
 });
 
 test("retained command activity has a fixed item bound and reports omitted items", () => {

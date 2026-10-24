@@ -172,14 +172,29 @@ test("command activity and approval prompts suspend and then restore the live di
   await waitForRedraw();
 
   const approval = frontend.requestApproval("item/commandExecution/requestApproval", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "command-1",
+    approvalId: "approval-command-1",
     command: "npm test",
     cwd: "/workspace",
     availableDecisions: ["accept", "decline", "cancel"],
-  });
+  }, { requestId: "rpc-approval-1" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(frontend.turnDiffView.suspended, 1);
   const writesAtPrompt = output.writes.length;
   update(frontend, "updated while approval is open", { revision: 2 });
+  frontend.handleProgress({ type: "codex_progress", method: "item/started", params: {
+    threadId: "foreign-thread", turnId: "turn-1",
+    item: { type: "commandExecution", id: "foreign-command", command: "foreign identity must be ignored", cwd: "/workspace", status: "inProgress" },
+  } });
+  frontend.handleProgress({ type: "codex_progress", method: "item/started", params: {
+    threadId: "thread-1", turnId: "stale-turn",
+    item: { type: "commandExecution", id: "stale-command", command: "stale turn must be ignored", cwd: "/workspace", status: "inProgress" },
+  } });
+  frontend.handleProgress({ type: "codex_progress", method: "item/started", params: {
+    item: { type: "commandExecution", id: "missing-identity", command: "missing identity must be ignored", cwd: "/workspace", status: "inProgress" },
+  } });
   frontend.handleProgress({ type: "codex_progress", method: "item/started", params: {
     threadId: "thread-1", turnId: "turn-1",
     item: { type: "commandExecution", id: "command-1", command: "npm test", cwd: "/workspace", status: "inProgress" },
@@ -187,6 +202,7 @@ test("command activity and approval prompts suspend and then restore the live di
   await waitForRedraw();
   assert.equal(output.writes.some((chunk) => chunk.includes("updated while approval is open")), false);
   assert.ok(output.writes.length > writesAtPrompt, "approval and command activity still render while the diff view is suspended");
+  assert.doesNotMatch(output.text(), /foreign identity must be ignored|stale turn must be ignored|missing identity must be ignored/u);
 
   answer("no");
   assert.deepEqual(await approval, { decision: "decline" });

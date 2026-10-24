@@ -758,6 +758,9 @@ function renderSystemModelReport(result) {
     for (const item of result.project.entryPoints.slice(0, 8)) lines.push(`- ${item.path} (${item.confidence} confidence; ${item.reason}; ${item.source}).`);
   }
   if (result.project?.structure?.length) lines.push(`Structure sample (${result.project.truncated ? "bounded/incomplete" : "observed"}): ${result.project.structure.slice(0, 24).join(", ")}`);
+  if (result.project?.excludedPaths?.length) {
+    lines.push(`Paths excluded by project ignore rules (contents not inspected): ${result.project.excludedPaths.slice(0, 12).join(", ")}.`);
+  }
   if (result.findings?.length) {
     lines.push("Evidence-backed findings:");
     for (const finding of result.findings.slice(0, MAX_RENDERED_FINDINGS)) {

@@ -520,12 +520,20 @@ test("approval acceptance is shown separately and does not imply command executi
   };
   const appServer = new AppServerClient({ spawnProcess: () => server });
   const { frontend, output } = makeFrontend({ appServer, answers: ["Inspect command", "yes", ":quit"] });
-  appServer.onApproval = (method, params, context) => frontend.requestApproval(method, params, context);
+  const approvalEvents = [];
+  frontend.executionProvider.on("event", (event) => {
+    if (event.type === "approval-required" || event.type === "approval-decided") approvalEvents.push(event);
+  });
   await frontend.run();
   assert.match(output(), /approval requested/u);
   assert.match(output(), /approval approved/u);
   assert.match(output(), /execution status unavailable|turn ended before command status was reported/u);
   assert.doesNotMatch(output(), /execution completed/u);
+  assert.deepEqual(approvalEvents.map((event) => event.type), ["approval-required", "approval-decided"]);
+  assert.equal(approvalEvents[0].request.requestId, "approval-1");
+  assert.equal(approvalEvents[1].requestId, "approval-1");
+  assert.deepEqual([approvalEvents[0].request.conversationId, approvalEvents[0].request.taskId, approvalEvents[0].request.itemId],
+    [approvalEvents[1].conversationId, approvalEvents[1].taskId, approvalEvents[1].itemId]);
   assert.deepEqual(server.requests.find((request) => request.id === "approval-1").result, { decision: "accept" });
   appServer.dispose();
 });

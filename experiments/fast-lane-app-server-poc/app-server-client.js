@@ -466,6 +466,7 @@ class AppServerClient extends EventEmitter {
       if (this.activeTurn === active) this.emit("progress", {
         type: "file_approval_declined",
         reason,
+        requestId: id,
         ...(isSafeProtocolIdentity(params.threadId || params.conversationId) ? { conversationId: params.threadId || params.conversationId } : {}),
         ...(isSafeProtocolIdentity(params.turnId) ? { taskId: params.turnId } : {}),
         ...(isSafeProtocolIdentity(params.itemId) ? { itemId: params.itemId } : {}),
@@ -473,6 +474,10 @@ class AppServerClient extends EventEmitter {
       });
     };
     try {
+      if (!isSafeServerRequestId(id)) {
+        respond({ id: null, error: { code: -32600, message: "Codex sent a server request without a valid request identity." } });
+        return;
+      }
       if (!isApprovalMethod(method)) {
         respond({ id, error: { code: -32601, message: `Vesper does not support app-server request ${method}.` } });
         if (active) this.handleExit(new Error(`Codex requested unsupported server method ${method}.`), generation);
@@ -487,9 +492,10 @@ class AppServerClient extends EventEmitter {
       const fileApproval = method === "item/fileChange/requestApproval";
       // Bind the evidence at receipt, before any wait/queued UI. A patch that
       // arrives later must not silently become the subject of this request.
-      const context = fileApproval && active && params?.grantRoot == null
+      const fileChangeContext = fileApproval && active && params?.grantRoot == null
         ? active.fileChanges.capture(params)
         : undefined;
+      const context = Object.freeze({ requestId: id, ...(fileChangeContext || {}) });
       if (fileApproval && active) await active.startReady;
       if (method === "item/commandExecution/requestApproval" && active) await active.startReady;
       if (!isCurrentApproval(active, method, params, this.activeTurn)) {
@@ -506,14 +512,14 @@ class AppServerClient extends EventEmitter {
           declineFileChange("A session write-root grant cannot be approved through the one-time file-change flow.");
           return;
         }
-        if (!context?.isCurrent()) {
+        if (!context?.isCurrent?.()) {
           declineFileChange("No complete, current, reviewable diff matches this file-change item.");
           return;
         }
       }
-      this.emit("progress", { type: "approval_requested", method, params });
+      this.emit("progress", { type: "approval_requested", method, params, requestId: id });
       const result = await this.onApproval(method, params, context);
-      if (!isCurrentApproval(active, method, params, this.activeTurn) || (context && !context.isCurrent())) {
+      if (!isCurrentApproval(active, method, params, this.activeTurn) || (fileApproval && !context.isCurrent?.())) {
         if (fileApproval) {
           declineFileChange("The file-change snapshot or active request changed during review.");
           return;
@@ -525,7 +531,7 @@ class AppServerClient extends EventEmitter {
       const sent = respond({ id, result: safeResult });
       if (sent && (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval")) {
         const status = safeResult.decision === "accept" ? "approved" : safeResult.decision === "cancel" ? "cancelled" : "declined";
-        this.emit("progress", { type: "approval_decided", method, params, status });
+        this.emit("progress", { type: "approval_decided", method, params, requestId: id, status });
       }
     } catch (error) {
       try {
@@ -839,6 +845,10 @@ function isTerminalStatus(status) {
 function isSafeProtocolIdentity(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 512 &&
     !/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/u.test(value);
+}
+
+function isSafeServerRequestId(value) {
+  return isSafeProtocolIdentity(value) || Number.isSafeInteger(value);
 }
 
 function safeErrorMessage(error) {
