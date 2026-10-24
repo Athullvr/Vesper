@@ -294,13 +294,12 @@ async function runCase(item, mode, responseFixture, fixtureIdentity, { repositor
       const read = readPathSet.has(descriptor.path);
       const sourcePath = SOURCE_EXTENSIONS.has(path.posix.extname(descriptor.path).toLowerCase());
       const candidateApplicable = !descriptor.kind && sourcePath;
-      let failureClass = candidateApplicable ? "retrieved" : "not_a_source_candidate";
-      if (candidateApplicable && !entry.retrieved) {
+      let failureClass = entry.retrieved ? "retrieved" : "unknown";
+      if (!entry.retrieved) {
         if (!findingInventory.has(descriptor.path) || location.status === "excluded_by_ignore_rules" || location.status === "excluded_by_runtime_rules") failureClass = "6_correctly_excluded_or_genuinely_unverifiable";
         else if (!inventoryObserver.wasListed(descriptor.path)) failureClass = "1_not_present_in_permitted_inventory";
-        else if (sourcePath && !candidate) failureClass = "2_present_but_not_discovered";
-        else if (operationBudgetStopped && !read) failureClass = "4_ranked_but_not_read_before_stop_or_budget";
-        else if (candidate && candidate.rank > rankedReadCutoff) failureClass = "3_discovered_but_ranked_below_read_window";
+        else if (candidateApplicable && !candidate) failureClass = "2_present_but_not_discovered";
+        else if (candidateApplicable && candidate && candidate.rank > rankedReadCutoff) failureClass = "3_discovered_but_ranked_below_read_window";
         else if (!read) failureClass = "4_ranked_but_not_read_before_stop_or_budget";
         else failureClass = "5_read_but_not_extracted_or_included_in_report";
       }
@@ -331,12 +330,22 @@ async function runCase(item, mode, responseFixture, fixtureIdentity, { repositor
       discoverySearchLimit: result.candidateDiscovery?.searchedFiles ?? 0,
       candidateFilesRanked: candidateFiles.length,
       rankedCandidatesRead: candidateFiles.filter((candidate) => readPathSet.has(candidate.path)).length,
+      rankedCandidates: candidateFiles.map((candidate, index) => ({
+        path: candidate.path,
+        rank: index + 1,
+        score: candidate.score,
+        sizeBytes: candidate.sizeBytes,
+        searchMatch: candidate.searchMatch === true,
+        entryPoint: candidate.entryPoint === true,
+        changed: candidate.changed === true,
+        selectedForRead: readPathSet.has(candidate.path),
+      })),
       relevantCandidates: [...relevantPathSet].filter((candidatePath) => candidateRank.has(candidatePath)).length,
       relevantCandidatesNeverRead: [...relevantPathSet].filter((candidatePath) => candidateRank.has(candidatePath) && !readPathSet.has(candidatePath)).length,
       requiredEvidence: { retrieved: requiredCandidateDiagnostics.filter((entry) => entry.candidateApplicable && entry.retrieved).length,
         total: requiredCandidateDiagnostics.filter((entry) => entry.candidateApplicable).length,
         allRequired: requiredCandidateDiagnostics.length,
-        failureClasses: candidateFailureCounts, checks: requiredCandidateDiagnostics },
+      failureClasses: candidateFailureCounts, checks: requiredCandidateDiagnostics },
       candidateDiscovery: result.candidateDiscovery || null,
       referenceIndex: { status: indexed.status || "unknown", indexedFiles: indexed.indexedFiles ?? null,
         eligibleFiles: indexed.eligibleFiles ?? null, indexedBytes: indexed.indexedBytes ?? null,
@@ -856,6 +865,10 @@ function summarizeGroup(rows) {
   const candidateApplicableChecks = candidateChecks.filter((entry) => entry.candidateApplicable);
   const candidateFailureClasses = {};
   for (const entry of candidateChecks) candidateFailureClasses[entry.failureClass] = (candidateFailureClasses[entry.failureClass] || 0) + 1;
+  const requiredEvidenceIndexStatuses = {};
+  for (const entry of candidateApplicableChecks) {
+    requiredEvidenceIndexStatuses[entry.referenceIndex] = (requiredEvidenceIndexStatuses[entry.referenceIndex] || 0) + 1;
+  }
   const relevantCandidateCount = candidateRows.reduce((sum, entry) => sum + entry.relevantCandidates, 0);
   const relevantCandidateNeverRead = candidateRows.reduce((sum, entry) => sum + entry.relevantCandidatesNeverRead, 0);
   const cases = rows.length;
@@ -898,6 +911,7 @@ function summarizeGroup(rows) {
       relevantCandidatesNeverRead: { count: relevantCandidateNeverRead, totalRelevantRanked: relevantCandidateCount },
       relevantCandidatesRead: relevantCandidateCount - relevantCandidateNeverRead,
       failureClasses: candidateFailureClasses,
+      requiredEvidenceIndexStatuses,
       discoveryPartialCases: candidateRows.filter((entry) => entry.candidateDiscovery?.status === "partial").length,
       indexPartialCases: candidateRows.filter((entry) => entry.referenceIndex?.status === "partial" || entry.referenceIndex?.truncated === true).length,
     },
@@ -1247,8 +1261,9 @@ function printSummary(report) {
         const candidate = metrics.candidateAnalysis;
         const failures = Object.entries(candidate.failureClasses).filter(([stage]) => stage !== "retrieved")
           .map(([stage, count]) => `${stage}=${count}`).join(", ") || "none";
+        const indexStatuses = Object.entries(candidate.requiredEvidenceIndexStatuses).map(([status, count]) => `${status}=${count}`).join(", ") || "none";
         process.stdout.write(`  ${repositoryId} (${repository.revision || "revision unknown"}): required ${metrics.requiredEvidence.retrieved}/${metrics.requiredEvidence.total}; relevant precision ${formatCountRate(metrics.relevantEvidence.retrievedFindings, metrics.relevantEvidence.allSourceFindings, metrics.relevantEvidence.precision)}; candidate paths discovered/read ${candidate.requiredEvidenceDiscovered}/${candidate.requiredEvidenceLocations} / ${candidate.requiredEvidenceRead}/${candidate.requiredEvidenceLocations}; source reads ${metrics.investigation.sourceReads}, bytes ${metrics.investigation.fileBytesInspected}, incomplete ${metrics.investigation.incompleteCases}/${metrics.caseCount}.\n`);
-        process.stdout.write(`    candidate miss stages: ${failures}; relevant ranked candidates unread ${candidate.relevantCandidatesNeverRead.count}/${candidate.relevantCandidatesNeverRead.totalRelevantRanked}; partial discovery/index ${candidate.discoveryPartialCases}/${candidate.indexPartialCases} cases.\n`);
+        process.stdout.write(`    candidate miss stages: ${failures}; relevant ranked candidates unread ${candidate.relevantCandidatesNeverRead.count}/${candidate.relevantCandidatesNeverRead.totalRelevantRanked}; required-path index status ${indexStatuses}; partial discovery/index ${candidate.discoveryPartialCases}/${candidate.indexPartialCases} cases.\n`);
       }
     }
   }

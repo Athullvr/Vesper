@@ -253,7 +253,9 @@ test("multi-package snapshots are pinned, separated, paired, and expose candidat
     assert.match(repository.license, /MIT/u);
   }
 
-  const report = await runEvaluation({ dataset: "multipackage-heldout", maxCases: 4 });
+  const report = await runEvaluation({ dataset: "multipackage-heldout", maxCases: 5 });
+  const repeated = await runEvaluation({ dataset: "multipackage-heldout", maxCases: 5 });
+  assert.equal(JSON.stringify(report), JSON.stringify(repeated));
   assert.equal(report.execution.offline, true);
   assert.equal(report.execution.providerApiCalls, 0);
   assert.equal(report.execution.targetRepositoryCommandsExecuted, false);
@@ -263,11 +265,15 @@ test("multi-package snapshots are pinned, separated, paired, and expose candidat
     assert.deepEqual(rows.map((row) => [row.id, row.fixtureSha256]),
       report.modes[mode === "deterministic" ? "assisted" : "deterministic"].cases.map((row) => [row.id, row.fixtureSha256]));
     assert.ok(rows.every((row) => row.repositoryRevision === heldout.repositories[0].revision));
+    assert.ok(rows.every((row) => row.safety.forbiddenRuntimeOperations.length === 0 &&
+      row.safety.projectFilesChanged.length === 0 && !row.safety.commandExecutionEnabled), mode);
     for (const row of rows) {
       const coverage = row.evidence.candidateCoverage;
       assert.ok(coverage.requiredEvidence.checks.length > 0, row.id);
+      assert.ok(coverage.rankedCandidates.every((candidate, index) =>
+        candidate.rank === index + 1 && typeof candidate.selectedForRead === "boolean"), row.id);
       for (const check of coverage.requiredEvidence.checks) {
-        assert.ok(["retrieved", "not_a_source_candidate", "1_not_present_in_permitted_inventory",
+        assert.ok(["retrieved", "1_not_present_in_permitted_inventory",
           "2_present_but_not_discovered", "3_discovered_but_ranked_below_read_window",
           "4_ranked_but_not_read_before_stop_or_budget", "5_read_but_not_extracted_or_included_in_report",
           "6_correctly_excluded_or_genuinely_unverifiable"].includes(check.failureClass), `${row.id}: ${check.path}`);
@@ -279,6 +285,14 @@ test("multi-package snapshots are pinned, separated, paired, and expose candidat
   const compilerCase = report.modes.assisted.cases.find((row) => row.id === "vue_compiler_boundary_and_generated_output_uncertainty");
   assert.equal(compilerCase.evidence.candidateCoverage.evidenceLocations.find((location) =>
     location.path === "packages/compiler-dom/src/index.ts").expectedUnavailabilityReason, "The package is outside this curated fixture.");
+  const generated = compilerCase.evidence.candidateCoverage.evidenceLocations.find((location) =>
+    location.path === "packages/vue/dist/vue.runtime.esm-bundler.js");
+  assert.equal(generated.runtimeExcludedByIgnoreRules, false);
+  assert.match(generated.expectedUnavailabilityReason, /upstream ignore rule/u);
+  const fastPath = report.modes.deterministic.cases.find((row) => row.id === "vue_root_test_unit_script_fast_path");
+  assert.equal(fastPath.evidence.candidateCoverage.requiredEvidence.checks[0].candidateApplicable, false);
+  assert.equal(fastPath.evidence.candidateCoverage.requiredEvidence.checks[0].failureClass,
+    "5_read_but_not_extracted_or_included_in_report");
 });
 
 test("live evaluation requires explicit provider and charge confirmation and protects saved baselines", () => {

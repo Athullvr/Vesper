@@ -151,7 +151,7 @@
         { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "role": "test reference", "why": "Contains tests of utilities exported by the core package." }
       ],
       "requiredFindings": [
-        { "path": "packages/vite/src/node/utils.ts", "types": ["symbol-definition"], "symbol": "normalizePath" },
+        { "path": "packages/vite/src/node/utils.ts", "types": ["symbol-definition", "symbol"], "symbol": "normalizePath" },
         { "path": "packages/vite/src/node/index.ts", "types": ["symbol-export", "symbol-import"], "symbol": "normalizePath" },
         { "path": "packages/plugin-legacy/src/index.ts", "types": ["symbol-import", "identifier-reference", "likely-call-site"], "symbol": "normalizePath" },
         { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "types": ["symbol-import", "test-reference", "likely-call-site"], "symbol": "normalizePath" }
@@ -176,7 +176,7 @@
         { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "role": "test opportunity", "why": "Shows relevant test source; it is not executed." }
       ],
       "requiredFindings": [
-        { "path": "packages/vite/src/node/utils.ts", "types": ["symbol-definition"], "symbol": "normalizePath" },
+        { "path": "packages/vite/src/node/utils.ts", "types": ["symbol-definition", "symbol"], "symbol": "normalizePath" },
         { "path": "packages/plugin-legacy/src/index.ts", "types": ["symbol-import", "likely-call-site", "identifier-reference"], "symbol": "normalizePath" },
         { "path": "packages/vite/src/node/index.ts", "types": ["symbol-export", "symbol-import"], "symbol": "normalizePath" },
         { "path": "packages/vite/src/node/__tests__/utils.spec.ts", "types": ["test-reference", "symbol-import", "likely-call-site"], "symbol": "normalizePath" }

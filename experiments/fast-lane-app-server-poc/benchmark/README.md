@@ -324,3 +324,81 @@ node test/live-turn-diff-view.test.js
 The original failure was reproduced in the approval/activity assertion in `test/live-turn-diff-view.test.js`. App-server notifications arrived through the compatibility `codex_progress` event, while the terminal progress handler only handled native event names; consequently the live diff did not suspend for the command activity. Approval requests also traveled from the app-server JSON-RPC response through the Codex execution provider without the JSON-RPC request ID, so the activity could not be tied to the request that Vesper had actually approved.
 
 The fix preserves Codex's app-server flow and one-time approval response: `app-server-client.js` carries the actual protocol request ID with approval callbacks and approval events, `codex-execution-provider.js` preserves it in the normalized approval activity, and `command-activity.js` keys approvals by their real request identity. `terminal-frontend.js` now maps only allowlisted compatibility `codex_progress` command activity and binds it to the active thread/turn. Missing, stale, or mismatched progress identities are ignored; missing approval request IDs are not fabricated or approved. Tests cover the request ID arriving at the live activity, turn scoping, and stale/mismatched progress. The complete live-turn-diff test file passed after this fix.
+
+## Phase 4I multi-package repository evaluation
+
+This extension evaluates the same System Model and permissioned runtime on curated source snapshots from three upstream workspaces. The evaluator copies each fixture to a new temporary project for each case and mode. It does not run commands, tests, or builds from a fixture. The checked-in fixture directories contain no `.git` metadata, dependencies, generated output, or secrets; Git status/history are therefore unavailable during these inspections. Git facts are reported as unavailable rather than fabricated. Each snapshot includes its upstream MIT license and root workspace metadata.
+
+| Set | Repository and pinned revision | Included packages | Snapshot files |
+| --- | --- | --- | ---: |
+| Development | [changesets/changesets](https://github.com/changesets/changesets), `e2ee472cc6c901a0bb29781dac12603f6e4d5215` | `@changesets/cli`, `@changesets/read`, `@changesets/assemble-release-plan` | 16 |
+| Development | [vitejs/vite](https://github.com/vitejs/vite), `82e7aa0374a15e1c67594557ab5893c91578f897` | `vite`, `@vitejs/plugin-legacy` | 17 |
+| Held-out | [vuejs/core](https://github.com/vuejs/core), `0ff253bfba3ee8d3d65448bd44ad890fd01b0ecd` | `vue`, `@vue/runtime-dom`, `@vue/runtime-core`, `@vue/shared` | 20 |
+
+The fixture manifest at `system-model-multipackage-repositories.json` records full revisions, source URLs, license, included packages, and omissions. Development questions and their independently written evidence locations, required findings, relevant paths, uncertainty checks, and stopping criteria are in `system-model-multipackage-development-cases.json` (five Changesets and five Vite tasks). `system-model-multipackage-heldout-cases.json` contains five Vue Core tasks written separately from the development set; compiler source and generated `dist` files are intentionally unavailable. The held-out threshold was not tuned. Recorded planner replies are stored separately from the cases.
+
+The tasks cover cross-package entry/consumer traces, shared-interface impact, tests, misleading literals, lazy loading, incomplete package/compiler evidence, and simple manifest fast paths. Each `expectedEvidenceLocations` record names the path and explains why it matters. The Vite `normalizePath` descriptors accept the evaluator's `symbol` record because it carries an exact source path, line, and source-declaration description; the separately reported source index still marks the 2,005-line file as over its 2,000-line indexing limit. This corrects an evidence-type mismatch in the rubric, not the planner output.
+
+Run both modes offline and save a new, immutable result version with:
+
+```sh
+node benchmark/run-system-model.js --set multipackage-development --write-baseline benchmark/system-model-multipackage-development-baseline-v3.json --json /tmp/vesper-system-model-multipackage-development-v3.json
+node benchmark/run-system-model.js --set multipackage-heldout --write-baseline benchmark/system-model-multipackage-heldout-baseline-v3.json --json /tmp/vesper-system-model-multipackage-heldout-v3.json
+```
+
+The command prints per-repository and aggregate terminal summaries and writes the full per-case JSON, including the pinned revision and fixture fingerprint. To compare a later run without replacing a saved result, pass `--compare benchmark/system-model-multipackage-heldout-baseline-v3.json` (and use the development baseline for development cases). Normal operation is offline, requires no keys, and makes zero provider calls. The v1 and v2 multi-package files are preserved as earlier measurements; v3 is the final result after failure-stage instrumentation and the evidence-type correction. The original Phase 4G baselines are unchanged.
+
+### Results
+
+All counts below are measured from baseline v3. “Assisted” means the recorded deterministic planner-response fixture, not a live provider. Both modes receive the same case, fixture bytes, and independent expected answers. No amount is estimated from token counts.
+
+| Repository / set | Mode | Required evidence | Relevant precision | Correct stops | Uncertainty identified | Candidate discovered / read | Source reads / bytes | Planner calls / estimated tokens | Incomplete / budget exhausted |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Changesets / development (5 cases) | Deterministic | 10/12 | 102/197 (51.8%) | 4/5 | 3/8 | 11/11 / 11/11 | 30 / 411,724 | 0 / 0 | 5/5 / 0/5 |
+| Changesets / development (5 cases) | Assisted | 9/12 | 109/190 (57.4%) | 3/5 | 6/8 | 11/11 / 9/11 | 23 / 286,909 | 7 / 21,025 | 5/5 / 0/5 |
+| Vite / development (5 cases) | Deterministic | 11/13 | 95/221 (43.0%) | 3/5 | 1/7 | 12/12 / 10/12 | 31 / 1,070,738 | 0 / 0 | 5/5 / 1/5 |
+| Vite / development (5 cases) | Assisted | 11/13 | 114/176 (64.8%) | 2/5 | 3/7 | 12/12 / 10/12 | 23 / 854,362 | 7 / 21,244 | 5/5 / 0/5 |
+| Vue Core / held-out (5 cases) | Deterministic | 5/13 | 105/189 (55.6%) | 0/5 | 0/8 | 10/12 / 7/12 | 24 / 387,076 | 0 / 0 | 5/5 / 0/5 |
+| Vue Core / held-out (5 cases) | Assisted | 7/13 | 129/195 (66.2%) | 1/5 | 5/8 | 10/12 / 9/12 | 23 / 407,499 | 7 / 21,246 | 5/5 / 0/5 |
+| Both development repositories (10 cases) | Deterministic | 21/25 | 197/418 (47.1%) | 7/10 | 4/15 | 23/23 / 21/23 | 61 / 1,482,462 | 0 / 0 | 10/10 / 1/10 |
+| Both development repositories (10 cases) | Assisted | 20/25 | 223/366 (60.9%) | 5/10 | 9/15 | 23/23 / 19/23 | 46 / 1,141,271 | 14 / 42,269 | 10/10 / 0/10 |
+
+The held-out Vue sample shows higher assisted retrieval (7/13 vs 5/13), relevant-evidence precision (66.2% vs 55.6%), uncertainty recall (5/8 vs 0/8), and candidate-path read recall (9/12 vs 7/12). Candidate discovery itself was unchanged at 10/12. Stop accuracy remained poor (1/5 assisted), all five investigations remained incomplete, and the assisted run read one fewer file while inspecting 20,423 more bytes. This supports a measured gain for this fixed recorded-response sample, not a conclusion about live model quality or a broad repository population.
+
+On development, deterministic planning retrieved more required findings overall (21/25 vs 20/25), read more required candidate paths (21/23 vs 19/23), and made more correct stop decisions (7/10 vs 5/10). Recorded assistance raised relevant precision by 13.8 percentage points and uncertainty recall by 33.3 points, while reducing source reads by 15 and read-file bytes by 341,191. It used 14 planner calls and 42,269 estimated budget tokens. The result does not support replacing deterministic behavior with assistance for these cases.
+
+The development assisted prompts/responses measured 122,326/4,449 input/output bytes. The held-out assisted mode measured 61,574/2,151 bytes across seven planner calls and 21,246 estimated budget tokens. These are local harness measurements; actual provider token usage is unknown because no provider was called. Offline planner latency was not measured.
+
+In offline recorded mode the provider-reported token usage and latency are unavailable; estimated budget tokens are only the planner's internal accounting, not provider usage, API charges, or a Codex subscription estimate. The harness made zero provider API calls, so currency cost is unknown. Question-specific forbidden-claim checks were not authored for these quality cases, so that rate has no denominator. The measurable inventory check found 0 findings outside the fixture in 418 deterministic and 366 assisted development findings, and in 189 deterministic and 195 assisted held-out findings.
+
+### Candidate, index, and stopping diagnosis
+
+Each required descriptor retains its snapshot presence, permissioned inventory presence, ignore-rule observation, candidate rank, read status, source-index status, and earliest failure class. The JSON also retains the ranked candidate list (path, rank, score, search-match, entry-point/change flags, and whether it was read), exact source-read paths, candidate-discovery bounds, index skipped paths/reasons, and unresolved expected paths. A fixture omission is kept separate from an ignore rule that the runtime actually observed; the author-specified reason for unavailable paths is stored independently.
+
+| Earliest failure class | Development deterministic | Development assisted | Held-out deterministic | Held-out assisted |
+| --- | ---: | ---: | ---: | ---: |
+| 1. Not present in permitted inventory | 0 | 0 | 0 | 0 |
+| 2. Present but not discovered | 0 | 0 | 2 | 2 |
+| 3. Discovered but ranked below read window | 2 | 3 | 3 | 1 |
+| 4. Appropriate rank but not read before stop/budget | 0 | 1 | 0 | 0 |
+| 5. Read but expected finding not emitted | 2 | 1 | 3 | 3 |
+| 6. Properly excluded or unverifiable required evidence | 0 | 0 | 0 | 0 |
+
+Counts classify missed required findings across each mode's cases; retrieved findings are not shown. The development rubric correction above means the two Vite utility definitions are now retrieved as source-backed `symbol` findings. The index still reports `file-limit` for `packages/vite/src/node/utils.ts` in two expected-path checks per mode; direct source scanning found `normalizePath` at line 234, but the bounded JS/TS relationship index did not process that 2,005-line file. This is an index-limit observation, not a missed definition after the corrected rubric.
+
+The held-out discovery misses are `packages/runtime-core/src/renderer.ts` in the createApp and createVNode traces (two per mode). They were present and listed by the permitted inventory, but did not enter the ranked candidate list. Ranked-but-unread misses were mostly related test or shared-helper files below the initial read window. Other read-but-unemitted misses include the held-out `compileToFunction` question and root `test-unit` command: the source was read, but task-term symbol extraction did not emit the expected definition, and the root package script appears after the parser's 12-script manifest cap, respectively. Vue Core also reported only four of five manifests analyzed in every case. Each condition remains visible; no global file, byte, index, manifest, or model-call limit was raised.
+
+All sets report partial discovery in 8/10 development cases and 3/5 held-out cases. The reference index was partial in all ten development cases and all five held-out cases. This broad partial flag includes the intentional fact that the index only contains source files actually read; per-path `file-limit` and `index-budget` reasons are available in the case JSON. Development required-path index statuses were `indexed=19`, `file-limit=2`, and `not-indexed-or-not-applicable=2` deterministic; assisted was `indexed=17`, `file-limit=2`, and `not-indexed-or-not-applicable=4`. Held-out status counts were `indexed=7`, `not-indexed-or-not-applicable=5` deterministic and `indexed=9`, `not-indexed-or-not-applicable=3` assisted.
+
+No System Model budget or execution behavior was changed based on these results. The repeated bottlenecks point to separate follow-ups: improve task-term extraction for named declarations and high-value manifest scripts; make cross-package import targets easier to discover; and tune ranking/read selection using development data, then validate once on a fresh held-out repository set. Raising global budgets would not resolve the read-but-not-extracted cases, so no budget increase is justified here.
+
+### Metric denominators and limitations
+
+- Required evidence is independently retrieved descriptors divided by required descriptors (25 development and 13 held-out per mode); every required path in these sets is present in the curated snapshot, so available-path recall has the same denominator. Source-candidate selection/read recall excludes two root-manifest `projectCommand` descriptors: development is 23 path descriptors and held-out is 12. Aggregate candidate-selection recall is development 23/23 in both modes and held-out 10/12 in both modes. Required candidate paths read are development 21/23 deterministic and 19/23 assisted; held-out 7/12 and 9/12.
+- Relevant-evidence precision is relevant-path source findings divided by every source finding: literal matches and parsed/source relationships are included. It is not answer correctness.
+- Stop accuracy and uncertainty recall use the exact denominators in the result table. The expected stop rules and uncertainty labels live in the case files. A source test reference is not evidence that tests ran or that coverage is complete.
+- Budget exhaustion is a subset of incomplete investigations. The development deterministic Vite cases hit the existing operation bound once; no held-out investigation exhausted a budget. Every case in both modes is still incomplete, including cases that retrieved all required descriptors.
+- The sample uses only three hand-curated repositories and 15 authored tasks. The held-out set has one repository and is not enough to estimate general performance. Snapshot boundaries omit unrelated packages/files, and no evaluator result proves complete call graphs, test coverage, Git history/status, or runtime behavior. No live provider evaluation was run.
+- To add a repository, pin a commit, include the upstream license and a small curated snapshot, record provenance and omissions in the repository manifest, then author expected paths/reasons and required evidence in the case file before writing a separate deterministic response fixture. Keep held-out cases and thresholds independent of tuning.
+
+The multi-package focused evaluation checks run with `node test/system-model-evaluation.test.js`. Existing System Model, repository intelligence, source index, and live-diff tests should still be run as regressions; the overall suite should be run with child-process spawning enabled because this repository's suite launches child processes.
