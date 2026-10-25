@@ -148,6 +148,8 @@ test("Ctrl+C during local investigation cancels before provider submission", asy
   await task;
   assert.equal(interrupted, true);
   assert.equal(appServer.turns.length, 0);
+  assert.equal(terminal.lastTaskLifecycle.snapshot().status, "cancelled");
+  assert.equal(terminal.lastTaskLifecycle.snapshot().submitted, false);
   assert.match(text(), /provider task was not submitted/u);
   await terminal.toolRuntime.dispose();
   terminal.executionProvider.dispose();

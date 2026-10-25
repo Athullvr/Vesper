@@ -1184,6 +1184,9 @@ async function runInteractiveVesper(options, dependencies, output, errorOutput) 
       onTask: () => {
         session = store.touch(session.sessionId);
       },
+      commandExecutionEnabled: dependencies.commandExecutionEnabled === true || environment.VESPER_ENABLE_ISOLATED_COMMANDS === "1",
+      commandWorkspaceWriteEnabled: false,
+      ...(dependencies.commandBackend ? { commandBackend: dependencies.commandBackend } : {}),
       onExecutionState: ({ status, recovery }) => {
         session = store.update(session.sessionId, { status, recovery });
       },

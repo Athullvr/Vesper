@@ -102,6 +102,9 @@ function mergeRepositoryEvidence(target, source) {
       ...(source.investigation.impactReport && typeof source.investigation.impactReport === "object" ? {
         impactReport: normalizeImpactReport(source.investigation.impactReport),
       } : {}),
+      ...(Array.isArray(source.investigation.verificationRequirements) ? {
+        verificationRequirements: source.investigation.verificationRequirements.slice(0, 8).map((item) => safeDescription(item, 240)).filter(Boolean),
+      } : {}),
       ...(source.investigation.modelPlanning && typeof source.investigation.modelPlanning === "object" ? {
         modelPlanning: normalizeModelPlanning(source.investigation.modelPlanning),
       } : {}),
@@ -705,6 +708,9 @@ function renderTaskEvidenceReport(evidence) {
     ...(investigation?.modelPlanning?.unresolvedQuestions || []),
   ])];
   for (const note of unresolved.slice(0, 5)) lines.push("- Unresolved: " + safeDescription(note, 240));
+  for (const item of (investigation?.verificationRequirements || []).slice(0, 8)) {
+    lines.push(`Suggested verification, not run: ${safeDescription(item, 240) || "choose an explicit project check"}.`);
+  }
   const findings = Array.isArray(evidence?.findings) ? evidence.findings.slice(0, 20) : [];
   if (findings.length) {
     lines.push("Repository findings:");
@@ -777,7 +783,7 @@ function renderProviderEvidence(entry) {
 
 function renderEvidenceInstructions(evidence) {
   const report = renderTaskEvidenceReport(evidence);
-  return `Vesper's observed workflow evidence so far (do not add unsupported claims):\n${report}\n\nFor coding changes, inspect relevant files and Git state first. After inspection, show a concise line beginning "Plan:" that references at least one inspected path or inspection type before proposing a change. Vesper will reject proposals without that evidence-backed plan. A proposal is not a write. Apply only after Vesper's fresh one-time approval; then verify using tool evidence. Never claim tests or builds passed: this workflow exposes no command or test execution tool. In the final response separate inspected facts, assumptions, applied changes, failures, and unverified steps.`;
+  return `Vesper's observed workflow evidence so far (do not add unsupported claims):\n${report}\n\nFor coding changes, inspect relevant files and Git state first. After inspection, show a concise line beginning "Plan:" that references at least one inspected path or inspection type before proposing a change. Vesper will reject proposals without that evidence-backed plan. A proposal is not a write. Apply only after Vesper's fresh one-time approval; then verify using tool evidence. The structured model tool runtime cannot run commands, tests, or builds. Never claim tests or builds passed unless a separate Vesper verification result is present. In the final response separate inspected facts, assumptions, applied changes, failures, and unverified steps.`;
 }
 
 function safeRelativePath(value) {

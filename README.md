@@ -89,6 +89,7 @@ Capability discovery and supported plugin/MCP management are implemented for the
 ## Project documentation
 
 - [Prototype usage and extension setup](experiments/fast-lane-app-server-poc/README.md)
+- [Shared developer task workflow and limitations](experiments/fast-lane-app-server-poc/DEVELOPER-WORKFLOW.md)
 - [Interface inventory and roadmap](experiments/fast-lane-app-server-poc/INTERFACE-ROADMAP.md)
 - [Reliability audit and validation history](experiments/fast-lane-app-server-poc/RELIABILITY-AUDIT.md)
 - [TTY smoke and integration-readiness procedure](experiments/fast-lane-app-server-poc/TTY-INTEGRATION-READINESS.md)

@@ -88,6 +88,9 @@ class SystemModelCoordinator {
         .filter((item) => /^(?:test|test:|build)$/u.test(item.name))
         .map((item) => `${item.name}: ${item.command} (identified from ${item.path}; not run)`))].slice(0, 8);
       if (!verificationRequirements.length) verificationRequirements.push("Choose and run the appropriate project verification explicitly; Vesper did not execute commands during inspection.");
+      if (evidence.evidence?.investigation) {
+        evidence.evidence.investigation.verificationRequirements = verificationRequirements;
+      }
       const hasTaskMatch = findings.some((item) => ["symbol", "reference", "search-match", "symbol-definition", "identifier-reference", "likely-call-site", "route-handler", "test-reference", "path-match", "import-edge"].includes(item.type));
       if (["trace", "bug", "impact", "change-plan"].includes(intent) && !hasTaskMatch) unresolved.push("No task-matched symbol, textual reference, or local import edge was confirmed.");
       if (evidence.evidence?.investigation) {

@@ -15,6 +15,7 @@ const { unavailableHistory } = require("./conversation-history");
 const { createPermissionedToolRuntime } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
 const { createSystemModel, shouldInvestigateTask } = require("./system-model");
+const { TaskLifecycle, understandTask, captureWorkspaceDiff } = require("./task-workflow");
 const { redactSensitiveText } = require("./command-activity");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
@@ -210,6 +211,12 @@ async function handlePrompt(prompt, targetPanel = panel) {
   const client = executionProviderForSession(session, cwd, generation);
   activeCodexRequestId = requestId;
   activeRequestType = "turn";
+  const lifecycle = new TaskLifecycle({ requestId: String(requestId), sessionId: session.sessionId, providerId: session.providerId, projectRoot: cwd, task: prompt });
+  const postWorkflowState = () => {
+    if (!isCurrentRequest(requestId, client, session.sessionId, generation)) return;
+    const { projectRoot: _projectRoot, ...state } = lifecycle.snapshot();
+    postToPanel(targetPanel, { type: "workflow-state", requestId, workflow: state });
+  };
   postToPanel(targetPanel, { type: "assistant-start", requestId, providerId: session.providerId });
   const providerName = providerSessionName(session.providerId);
   if (session.providerConversationId && !client.getState().conversationReady) {
@@ -233,6 +240,8 @@ async function handlePrompt(prompt, targetPanel = panel) {
   }
 
   const onExecutionEvent = (event) => {
+    const accepted = lifecycle.observe(event);
+    if (accepted && isCurrentRequest(requestId, client, session.sessionId, generation)) postWorkflowState();
     if (event?.type === "text-delta" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
       postToPanel(targetPanel, { type: "assistant-delta", requestId, text: event.text });
     } else if (["tool-call", "tool-result"].includes(event?.type) && isCurrentRequest(requestId, client, session.sessionId, generation)) {
@@ -249,6 +258,17 @@ async function handlePrompt(prompt, targetPanel = panel) {
       postToPanel(targetPanel, { type: "workflow-stage", requestId, stage: event.stage });
     } else if (event?.type === "task-progress" && event.kind === "workflow-report" && typeof event.report === "string" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
       postToPanel(targetPanel, { type: "assistant-delta", requestId, text: `\n\n${event.report}\n` });
+    } else if (event?.type === "file-change" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      const activity = event.activity || {};
+      const workflow = lifecycle.snapshot();
+      postToPanel(targetPanel, {
+        type: "file-change-activity", requestId,
+        state: activity.state || "unavailable",
+        files: workflow.proposedFiles,
+        note: "Codex-reported proposal metadata; disk state is not verified by this summary.",
+      });
+    } else if (event?.type === "task-progress" && event.kind === "aggregate-diff" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      postToPanel(targetPanel, { type: "turn-diff", requestId, activity: normalizeTurnDiffForPanel(event.activity) });
     }
   };
   client.on("event", onExecutionEvent);
@@ -267,6 +287,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       let systemModel;
       const preflight = { requestId, controller, systemModel, sessionId: session.sessionId, projectPath: cwd, generation };
       activeRepositoryPreflight = preflight;
+      let preparation;
       try {
         runtime = repositoryToolRuntimeFactory({
           projectRoot: cwd,
@@ -285,59 +306,55 @@ async function handlePrompt(prompt, targetPanel = panel) {
         });
         systemModel = createSystemModel({ repositoryIntelligence, planner: client });
         preflight.systemModel = systemModel;
-        const investigation = await systemModel.investigate({ task: prompt, routeDecision: decision, signal: controller.signal });
-        if (controller.signal.aborted || investigation.status === "cancelled") {
-          recordRouteMetrics(requestId, decision, Math.round(performance.now() - startedAt), false);
-          postToPanel(targetPanel, {
-            type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
-            text: "Repository inspection was cancelled. The provider task was not submitted.",
-            elapsedMs: Math.round(performance.now() - startedAt),
-          });
-          writeLog(`request=${requestId} preflight=cancelled task_submitted=false`);
-          return;
-        }
-        const scopedEvidence = isPreflightEvidenceScoped(investigation.evidence, session, cwd, client);
-        const context = typeof investigation.providerContext === "string" ? investigation.providerContext : "";
-        const contextFits = context.length > 0 && context.length <= MAX_PREFLIGHT_CONTEXT_LENGTH &&
-          prompt.length + context.length + 2 <= MAX_PROMPT_LENGTH;
-        const usableStatus = ["complete", "partial"].includes(investigation.status);
-        if (usableStatus && scopedEvidence && contextFits) {
-          repositoryEvidence = investigation.evidence;
-          providerTask = `${prompt}\n\n${context}`;
-        }
-        const included = Boolean(repositoryEvidence);
-        const fallbackReason = !usableStatus ? "Inspection was unavailable or incomplete; submitting the original task without repository evidence."
-          : !scopedEvidence ? "Inspection evidence did not match this project, provider, or Vesper session; submitting the original task without it."
-            : !contextFits ? "The bounded evidence summary did not fit the provider task limit; submitting the original task without repository evidence."
-              : null;
-        postToPanel(targetPanel, {
-          type: "repository-preflight", requestId,
-          state: fallbackReason ? "fallback" : investigation.status === "partial" ? "partial" : "complete",
-          evidenceIncluded: included,
-          text: fallbackReason || summarizeRepositoryPreflight(investigation, included),
+        preparation = await understandTask({
+          task: prompt, routeDecision: decision, systemModel, projectRoot: cwd, sessionId: session.sessionId,
+          providerId: session.providerId,
+          conversationId: client.getState?.().conversationId || session.providerConversationId || null,
+          signal: controller.signal,
+          maximumTaskLength: MAX_PROMPT_LENGTH,
+          maximumContextLength: MAX_PREFLIGHT_CONTEXT_LENGTH,
         });
-        writeLog(`request=${requestId} preflight=${fallbackReason ? "fallback" : investigation.status} evidence_attached=${included}`);
       } catch (error) {
-        if (controller.signal.aborted) {
-          postToPanel(targetPanel, {
-            type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
-            text: "Repository inspection was cancelled. The provider task was not submitted.",
-            elapsedMs: Math.round(performance.now() - startedAt),
-          });
-          writeLog(`request=${requestId} preflight=cancelled task_submitted=false`);
-          return;
-        }
-        postToPanel(targetPanel, {
-          type: "repository-preflight", requestId, state: "fallback", evidenceIncluded: false,
-          text: "Repository inspection could not complete. Vesper will submit the original task without repository evidence; coverage is unknown.",
+        preparation = await understandTask({
+          task: prompt, routeDecision: decision, systemModel: null, projectRoot: cwd, sessionId: session.sessionId,
+          providerId: session.providerId, conversationId: client.getState?.().conversationId || session.providerConversationId || null,
+          signal: controller.signal, maximumTaskLength: MAX_PROMPT_LENGTH, maximumContextLength: MAX_PREFLIGHT_CONTEXT_LENGTH,
         });
         writeLog(`request=${requestId} preflight=fallback code=${safeErrorCode(error)}`);
-        repositoryEvidence = null;
-        providerTask = prompt;
       } finally {
-        try { await runtime?.dispose?.(); } catch { /* Preflight cleanup must not turn into a second provider submission. */ }
+        try { await runtime?.dispose?.(); } catch { /* Inspection cleanup must not trigger another provider submission. */ }
       }
+      lifecycle.setUnderstanding(preparation);
+      if (preparation.state === "cancelled" || controller.signal.aborted) {
+        lifecycle.cancelBeforeSubmission(preparation.note);
+        lifecycle.complete();
+        postWorkflowState();
+        recordRouteMetrics(requestId, decision, Math.round(performance.now() - startedAt), false);
+        postToPanel(targetPanel, {
+          type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
+          text: "Repository inspection was cancelled. The provider task was not submitted.",
+          elapsedMs: Math.round(performance.now() - startedAt),
+        });
+        writeLog(`request=${requestId} preflight=cancelled task_submitted=false`);
+        return;
+      }
+      repositoryEvidence = preparation.repositoryEvidence;
+      providerTask = preparation.providerTask;
+      const included = preparation.evidenceIncluded;
+      const state = preparation.state === "not-needed" ? "complete" : preparation.state;
+      const text = included
+        ? summarizeRepositoryPreflight(preparation.investigation, true)
+        : preparation.note || "Repository evidence was not attached to this task.";
+      postToPanel(targetPanel, {
+        type: "repository-preflight", requestId,
+        state: preparation.state === "fallback" ? "fallback" : state,
+        evidenceIncluded: included,
+        text,
+      });
+      writeLog(`request=${requestId} preflight=${preparation.state} evidence_attached=${included}`);
       if (!isCurrentRequest(requestId, client, session.sessionId, generation)) {
+        lifecycle.cancelBeforeSubmission("The selected project or session changed during repository inspection.");
+        lifecycle.complete();
         postToPanel(targetPanel, {
           type: "assistant-error", requestId, state: "interrupted", preflight: true, providerId: session.providerId,
           text: "The selected project or session changed during repository inspection. The provider task was not submitted.",
@@ -345,7 +362,10 @@ async function handlePrompt(prompt, targetPanel = panel) {
         });
         return;
       }
+    } else {
+      lifecycle.setUnderstanding({ state: "not-needed", evidenceIncluded: false });
     }
+    postWorkflowState();
     const planning = await getPlanningMetadata({
       task: prompt,
       capabilityProvider: capabilityProviderFor(cwd),
@@ -364,12 +384,20 @@ async function handlePrompt(prompt, targetPanel = panel) {
         activeRequestType = "turn";
         postToPanel(targetPanel, { type: "task-submission", requestId, state: "submitting", providerId: session.providerId });
         return client.submitTask({ task: providerTask, projectPath: cwd, repositoryEvidence }).then((result) => {
-          postToPanel(targetPanel, { type: "task-submission", requestId, state: result?.status || "completed", providerId: session.providerId });
+          postToPanel(targetPanel, { type: "task-submission", requestId, state: result?.status || "provider-error", providerId: session.providerId });
           return result;
         });
       },
     });
     const result = routed.fallbackResult;
+    if (!result || !["completed", "interrupted", "timeout"].includes(result.status)) {
+      throw new Error("The provider did not return a confirmed task outcome.");
+    }
+    await captureWorkspaceDiff(lifecycle, permissionedToolRuntime, {
+      isCurrent: () => isCurrentRequest(requestId, client, session.sessionId, generation),
+    });
+    lifecycle.complete({ result });
+    postWorkflowState();
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs, false, routed.routingDecision);
     writeLog(`request=${requestId} fallback=completed elapsed_ms=${elapsedMs} status=${result.status}`);
@@ -388,6 +416,12 @@ async function handlePrompt(prompt, targetPanel = panel) {
         model: client.getState().model || null,
         generatedTextOnly: isTextOnlyProvider(session.providerId),
         truncated: Boolean(result.truncated),
+        workflowStatus: lifecycle.snapshot().status,
+        providerStatus: lifecycle.snapshot().providerStatus,
+        verificationState: lifecycle.snapshot().verification.state,
+        verifiedFiles: lifecycle.snapshot().verifiedFiles,
+        diskVerifiedFiles: lifecycle.snapshot().diskVerifiedFiles,
+        proposedFiles: lifecycle.snapshot().proposedFiles,
       });
     }
     const uncertainInterrupt = result.status === "interrupted" && result.recoveryCode === "submission-outcome-uncertain";
@@ -404,6 +438,16 @@ async function handlePrompt(prompt, targetPanel = panel) {
           : "Connected · this Vesper session is saved.", blocked: false });
     }
   } catch (error) {
+    await captureWorkspaceDiff(lifecycle, permissionedToolRuntime, {
+      isCurrent: () => isCurrentRequest(requestId, client, session.sessionId, generation),
+    });
+    if (error.code === "PREFLIGHT_CANCELLED") {
+      lifecycle.cancelBeforeSubmission("Repository inspection was cancelled; the provider task was not submitted.");
+      lifecycle.complete();
+    } else {
+      lifecycle.complete({ error });
+    }
+    postWorkflowState();
     const elapsedMs = Math.round(performance.now() - startedAt);
     recordRouteMetrics(requestId, decision, elapsedMs, false, routingDecision);
     if (error.code === "PREFLIGHT_CANCELLED") {
@@ -731,14 +775,6 @@ function cancelActiveRepositoryPreflight() {
   return true;
 }
 
-function isPreflightEvidenceScoped(evidence, session, cwd, client) {
-  const context = evidence?.context;
-  if (!context || context.sessionId !== session.sessionId || context.providerId !== session.providerId ||
-      typeof context.projectRoot !== "string" || path.resolve(context.projectRoot) !== path.resolve(cwd)) return false;
-  const expectedConversation = client.getState?.().conversationId || session.providerConversationId || null;
-  return !context.conversationId || !expectedConversation || context.conversationId === expectedConversation;
-}
-
 function summarizeRepositoryPreflight(result, evidenceIncluded) {
   const status = result?.status === "complete" ? "complete" : "partial";
   const lines = [
@@ -757,6 +793,7 @@ function summarizeRepositoryPreflight(result, evidenceIncluded) {
   }
   const impact = result?.impactReport;
   if (impact) lines.push(`Impact: ${impact.definitions.length} definitions · ${impact.callSites.length} call candidates · ${impact.dependencies.length} dependencies · ${impact.tests.length} test references.`);
+  for (const item of (result?.plan || []).slice(0, 2)) lines.push(`Grounded plan: ${item}`);
   for (const finding of (result?.findings || []).slice(0, 3)) {
     const location = finding.path ? `${finding.path}${finding.lineStart ? `:${finding.lineStart}` : ""}` : finding.source || "project";
     const provenance = `${finding.observation || "observed"}${finding.sourceContextRead ? ", source read" : ""}`;
@@ -764,7 +801,8 @@ function summarizeRepositoryPreflight(result, evidenceIncluded) {
   }
   const gap = result?.incomplete?.[0] || impact?.gaps?.[0];
   if (gap) lines.push(`Coverage: ${gap}`);
-  for (const question of (result?.unresolved || []).slice(0, 2)) lines.push(`Unresolved: ${question}`);
+  for (const question of (result?.unresolved || []).slice(0, 2)) lines.push(`Unresolved assumption: ${question}`);
+  for (const item of (result?.verificationRequirements || []).slice(0, 2)) lines.push(`Suggested verification, not run: ${item}`);
   return redactSensitiveText(lines.join("\n")).slice(0, MAX_PREFLIGHT_SUMMARY_LENGTH);
 }
 
@@ -1198,6 +1236,7 @@ function getHtml(webview) {
     const retryResume = document.getElementById('retry-resume');
     const startNewSession = document.getElementById('start-new-session');
     let activeAssistant;
+    let activeDiff;
     let activeRequestId;
     let currentProviderId = 'codex-app-server';
     let currentProviderName = 'Codex app-server';
@@ -1289,6 +1328,7 @@ function getHtml(webview) {
         if ((projectPath.dataset.currentPath || '') !== (message.path || '')) {
           messages.replaceChildren();
           activeAssistant = undefined;
+          activeDiff = undefined;
           activeRequestId = undefined;
           stop.hidden = true;
           historyState.textContent = 'Checking this project’s saved conversation history…';
@@ -1299,6 +1339,7 @@ function getHtml(webview) {
         projectPath.title = message.path || '';
       }
       if (message.type === 'conversation-history') {
+        activeDiff = undefined;
         historyState.textContent = typeof message.text === 'string' ? message.text : 'Conversation history status unavailable.';
         if (message.state === 'loading') {
           if (activeRequestId === undefined) messages.replaceChildren();
@@ -1394,6 +1435,7 @@ function getHtml(webview) {
       }
       if (message.type === 'assistant-start') {
         activeRequestId = message.requestId;
+        activeDiff = undefined;
         if (typeof message.providerId === 'string') currentProviderId = message.providerId;
         activeAssistant = addMessage('assistant', currentProviderName + ' · connecting…', '');
         stop.hidden = false;
@@ -1422,6 +1464,42 @@ function getHtml(webview) {
           if (activeAssistant) activeAssistant.title.textContent = currentProviderName + ' · ' + label.toLowerCase() + '…';
         }
       }
+      if (message.type === 'workflow-state' && message.requestId === activeRequestId) {
+        const workflow = message.workflow || {};
+        const verification = workflow.verification && workflow.verification.state ? ' · verification ' + workflow.verification.state : '';
+        status.textContent = currentProviderName + ' · workflow ' + (workflow.status || 'running') + ' · ' + (workflow.stage || 'understanding') + verification;
+        if (workflow.diff && workflow.diff.source === 'workspace') {
+          const diff = workflow.diff;
+          const readBackFiles = [...new Set([...(workflow.verifiedFiles || []), ...(workflow.diskVerifiedFiles || [])])].join(', ');
+          const heading = 'Vesper working-tree diff · ' + (diff.evidenceState || 'unavailable') + (readBackFiles ? ' · read-back: ' + readBackFiles : '') + ' · may include earlier edits';
+          let body = diff.evidenceState === 'available' && typeof diff.diff === 'string' ? diff.diff : 'Workspace diff unavailable: ' + (diff.evidenceState || 'unknown') + '.';
+          if (diff.truncated) body += '\\n[diff display omitted after Vesper limit]';
+          if (!activeDiff) activeDiff = addMessage('activity', heading, body);
+          else {
+            activeDiff.title.textContent = heading;
+            activeDiff.body.textContent = body;
+          }
+        }
+      }
+      if (message.type === 'file-change-activity' && message.requestId === activeRequestId) {
+        const files = Array.isArray(message.files) ? message.files.map((entry) => entry && entry.path).filter((item) => typeof item === 'string').slice(0, 16) : [];
+        const body = files.length ? files.map((item) => '• ' + item).join('\\n') + '\\n\\n' + (message.note || '') : (message.note || 'No safe file paths are available.');
+        addMessage('activity', 'Codex file-change evidence · ' + (message.state || 'unknown') + ' · disk state unverified', body);
+      }
+      if (message.type === 'turn-diff' && message.requestId === activeRequestId) {
+        const activity = message.activity || {};
+        const heading = 'Codex aggregate diff · ' + (activity.closeReason || 'unknown') + ' · server-reported; disk state unverified';
+        let body = 'Aggregate diff unavailable: ' + (activity.evidenceReason || activity.evidenceState || 'unknown') + '.';
+        if (activity.evidenceState === 'empty') body = 'The latest aggregate snapshot is empty; no diff lines were supplied.';
+        else if (activity.evidenceState === 'available' && typeof activity.diff === 'string') body = activity.diff || '(empty diff)';
+        if (activity.truncated) body += '\\n[diff display omitted after Vesper limit]';
+        if (!activeDiff) activeDiff = addMessage('activity', heading, body);
+        else {
+          activeDiff.title.textContent = heading;
+          activeDiff.body.textContent = body;
+        }
+        messages.scrollTop = messages.scrollHeight;
+      }
       if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
         status.textContent = message.phase === 'preflight'
           ? 'Vesper · cancelling repository inspection; provider task has not been submitted…'
@@ -1435,14 +1513,21 @@ function getHtml(webview) {
       if (message.type === 'assistant-done' && message.requestId === activeRequestId && activeAssistant) {
         const generated = message.generatedTextOnly || message.providerId === 'openai-chat-completions';
         const generatedName = message.providerId === 'nvidia-nim' ? 'NVIDIA NIM' : 'OpenAI';
-        activeAssistant.title.textContent = (generated ? generatedName + ' · generated text · not executed · files unchanged' : 'Codex · completed') + (message.truncated ? ' · response truncated' : '') + ' · ' + message.elapsedMs + ' ms · ' + message.usage + (message.model ? ' · ' + message.model : '');
+        const verifiedFiles = Array.isArray(message.verifiedFiles) ? message.verifiedFiles.length : 0;
+        const diskVerifiedFiles = Array.isArray(message.diskVerifiedFiles) ? message.diskVerifiedFiles.length : 0;
+        const proposedFiles = Array.isArray(message.proposedFiles) ? message.proposedFiles.length : 0;
+        const fileOutcome = verifiedFiles ? ' · ' + verifiedFiles + ' file(s) applied and read-back verified'
+          : diskVerifiedFiles ? ' · ' + diskVerifiedFiles + ' approved path(s) confirmed in working-tree diff'
+          : proposedFiles ? ' · ' + proposedFiles + ' path(s) reported; disk state unverified'
+            : generated ? ' · files unchanged' : ' · no file changes reported';
+        activeAssistant.title.textContent = (generated ? generatedName + ' · generated text · not executed' + fileOutcome : 'Codex provider response completed' + fileOutcome) + ' · workflow ' + (message.workflowStatus || 'completed') + ' · verification ' + (message.verificationState || 'not-run') + (message.truncated ? ' · response truncated' : '') + ' · ' + message.elapsedMs + ' ms · ' + message.usage + (message.model ? ' · ' + message.model : '');
         activeAssistant = undefined;
       }
       if (message.type === 'assistant-done' && message.requestId === activeRequestId) {
         activeRequestId = undefined;
-        status.textContent = message.generatedTextOnly || message.providerId === 'openai-chat-completions'
-          ? (message.providerId === 'nvidia-nim' ? 'NVIDIA NIM' : 'OpenAI') + ' · text generated, not executed' + (message.truncated ? ' · response truncated' : '')
-          : 'Codex · completed';
+        status.textContent = (message.generatedTextOnly || message.providerId === 'openai-chat-completions'
+          ? (message.providerId === 'nvidia-nim' ? 'NVIDIA NIM' : 'OpenAI') + ' · text generated, not executed'
+          : 'Codex provider response completed') + ' · workflow ' + (message.workflowStatus || 'completed') + ' · verification ' + (message.verificationState || 'not-run') + (message.truncated ? ' · response truncated' : '');
         stop.hidden = true;
         setBusy(false);
       }
@@ -1475,6 +1560,22 @@ function safeMessage(error) {
   if (!error) return "Unknown error.";
   const message = typeof error.message === "string" ? error.message : String(error);
   return message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").slice(0, 800);
+}
+
+function normalizeTurnDiffForPanel(activity) {
+  const evidenceState = ["available", "empty", "unavailable"].includes(activity?.evidenceState) ? activity.evidenceState : "unavailable";
+  const rawDiff = evidenceState === "available" && typeof activity?.diff === "string" ? activity.diff : "";
+  const safeDiff = redactSensitiveText(rawDiff).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, " ");
+  const truncated = safeDiff.length > 32 * 1024;
+  return Object.freeze({
+    evidenceState: truncated ? "unavailable" : evidenceState,
+    evidenceReason: typeof activity?.evidenceReason === "string" && /^[a-z_]{1,80}$/u.test(activity.evidenceReason)
+      ? activity.evidenceReason : truncated ? "oversized" : null,
+    closeReason: ["completed", "interrupted", "failed", "disconnected", "timeout", "client_closed", "unknown"].includes(activity?.closeReason)
+      ? activity.closeReason : "inProgress",
+    diff: truncated ? "" : safeDiff,
+    truncated,
+  });
 }
 
 function isSafeProtocolIdentity(value) {

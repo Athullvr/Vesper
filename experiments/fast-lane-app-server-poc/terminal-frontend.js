@@ -1,6 +1,7 @@
 "use strict";
 
 const readline = require("node:readline");
+const crypto = require("node:crypto");
 const { RouteMetrics, ROUTING_REASON_COUNT_CODES, classifyRequest, createRoutingDecisionRecord, routeRequest } = require("./routing-core");
 const { createFileChangeSnapshot } = require("./file-change-approval");
 const { CommandActivityStore, escapeTerminalField, escapeTerminalOutput, redactSensitiveText, renderActivityUpdates } = require("./command-activity");
@@ -10,7 +11,8 @@ const { createExecutionProvider, listProviders } = require("./execution-provider
 const { assertExecutionProvider } = require("./execution-interface");
 const { createPermissionedToolRuntime, renderToolApproval } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
-const { createSystemModel, renderSystemModelReport, shouldInvestigateTask } = require("./system-model");
+const { createSystemModel, renderSystemModelReport } = require("./system-model");
+const { TaskLifecycle, understandTask, renderPreflightSummary, renderTaskLifecycle, captureWorkspaceDiff } = require("./task-workflow");
 const { codexApprovalResponse, normalizeApprovalRequest } = require("./codex-execution-provider");
 const { getPlanningMetadata } = require("./capability-planner");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
@@ -44,7 +46,7 @@ const STREAM_SENSITIVE_MARKER_NAMES = [
 ];
 
 class TerminalFrontend {
-  constructor({ cwd, handlers, executionProvider, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedConversationId = null, savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, onExecutionState, capabilityProvider = null, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
+  constructor({ cwd, handlers, executionProvider, appServer, input = process.stdin, output = process.stdout, lineIO, metrics = new RouteMetrics(), savedConversationId = null, savedThreadId = null, sessionId = null, onWorkspaceCommand, onTask, onExecutionState, capabilityProvider = null, commandExecutionEnabled = process.env.VESPER_ENABLE_ISOLATED_COMMANDS === "1", commandWorkspaceWriteEnabled = process.env.VESPER_ENABLE_SANDBOX_WRITES === "1", commandBackend, toolExecFileImpl, routingDiagnostics = process.env.VESPER_ROUTING_DEBUG === "1" } = {}) {
     if (typeof cwd !== "string" || !cwd) throw new TypeError("A project directory is required.");
     if (!handlers || typeof handlers !== "object") throw new TypeError("Local handlers are required.");
     const provider = executionProvider || (appServer ? createExecutionProvider({ client: appServer }) : null);
@@ -55,9 +57,18 @@ class TerminalFrontend {
     this.savedConversationId = savedConversationId || savedThreadId || null;
     this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
     this.sessionId = sessionId;
+    this.commandExecutionEnabled = commandExecutionEnabled === true;
+    this.commandWorkspaceWriteEnabled = commandWorkspaceWriteEnabled === true;
+    this.commandBackend = commandBackend;
+    this.toolExecFileImpl = typeof toolExecFileImpl === "function" ? toolExecFileImpl : undefined;
     this.toolRuntime = null;
     this.systemModel = null;
     this.repositoryInspectionActive = false;
+    this.preflightController = null;
+    this.activeLifecycle = null;
+    this.lastTaskLifecycle = null;
+    this.lastTaskPrompt = null;
+    this.verificationCandidates = [];
     this.onWorkspaceCommand = onWorkspaceCommand;
     this.onTask = onTask;
     this.onExecutionState = onExecutionState;
@@ -106,7 +117,7 @@ class TerminalFrontend {
     this.write(`Vesper · local routing with ${this.providerDisplayName()} fallback\n`);
     this.write(`Execution provider: ${this.providerDisplayName()}\n`);
     this.write(`Project: ${safeTerminalText(this.cwd)}\n`);
-    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, :inspect [TASK], :impact TASK, and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
+    this.write("Use :sessions, :switch ID, :new [PROVIDER [MODEL]], :providers, :tools, :capabilities status|show ID, :plan TASK, :inspect [TASK], :impact TASK, :verify [N], and :routing for session counts; :quit exits. Local answers do not start provider tasks.\n\n");
 
     try {
       while (!this.closed && !this.exitAfterTurn) {
@@ -133,6 +144,15 @@ class TerminalFrontend {
 
   async handlePrompt(prompt) {
     if (prompt.startsWith(":")) {
+      if (prompt === ":verify" || prompt.startsWith(":verify ")) {
+        const index = prompt.slice(":verify".length).trim();
+        if (index && !/^\d{1,2}$/u.test(index)) {
+          this.write("Usage: :verify [N]\n");
+          return;
+        }
+        await this.verifyLastTask(index ? Number(index) : null);
+        return;
+      }
       if (prompt.trim() === ":routing") {
         this.write(renderRoutingSummary(this.metrics, this.sessionId));
         return;
@@ -201,62 +221,77 @@ class TerminalFrontend {
       return;
     }
 
+    const lifecycle = new TaskLifecycle({
+      requestId: crypto.randomUUID(),
+      sessionId: this.sessionId,
+      providerId: this.executionProvider.id,
+      projectRoot: this.cwd,
+      task: prompt,
+    });
+    this.activeLifecycle = lifecycle;
+    this.lastTaskLifecycle = null;
+    this.lastTaskPrompt = prompt;
+    this.verificationCandidates = [];
     let repositoryEvidence = null;
     let providerTask = prompt;
-    if (this.systemModel && shouldInvestigateTask(prompt)) {
-      this.activeRequest = true;
-      this.repositoryInspectionActive = true;
-      this.interruptPending = false;
+    this.activeRequest = true;
+    this.repositoryInspectionActive = true;
+    this.interruptPending = false;
+    const preflightController = new AbortController();
+    this.preflightController = preflightController;
+    let knownConversationId = this.savedConversationId;
+    try { knownConversationId = this.executionProvider.getState?.().conversationId || knownConversationId; } catch { /* Use the saved identity when provider state is unavailable. */ }
+    const preflight = await understandTask({
+      task: prompt,
+      routeDecision: decision,
+      systemModel: this.systemModel,
+      projectRoot: this.cwd,
+      sessionId: this.sessionId,
+      providerId: this.executionProvider.id,
+      conversationId: knownConversationId,
+      signal: preflightController.signal,
+      maximumTaskLength: 32 * 1024,
+    });
+    lifecycle.setUnderstanding(preflight);
+    if (preflight.evidenceIncluded && preflight.investigation?.project?.commands) {
+      this.verificationCandidates = selectVerificationCandidates(preflight.investigation.project.commands);
+    }
+    if (preflight.state !== "not-needed") {
       this.write("\n[Vesper · inspecting bounded local repository evidence; no commands or scripts will run]\n");
-      let investigation;
-      try {
-        investigation = await this.systemModel.investigate({ task: prompt, routeDecision: decision });
-        repositoryEvidence = investigation.evidence;
-        this.write(`[Repository intelligence · ${safeTerminalText(investigation.status)} · ${investigation.project?.fileCount || 0} files discovered · ${investigation.findings?.length || 0} findings]\n`);
-        if (investigation.modelPlanning) {
-          const planning = investigation.modelPlanning;
-          this.write(`[Investigation planning · ${safeTerminalText(planning.mode)} · ${planning.calls} model calls · stopped: ${safeTerminalText(investigation.stopReason || "unknown")} · ${investigation.findings?.length || 0} findings across ${investigation.inspectedPaths?.length || 0} paths · ${planning.sourceBytesSent || 0} source bytes sent · ${safeTerminalText(planning.reason)}]\n`);
-          for (const question of (investigation.unresolved || planning.unresolvedQuestions || []).slice(0, 2)) this.write(`  Unresolved: ${safeTerminalText(question)}\n`);
-          for (const hypothesis of (planning.hypotheses || []).slice(0, 2)) this.write(`  Model hypothesis (unverified): ${safeTerminalText(hypothesis.text)}\n`);
-        }
-        if (investigation.candidateDiscovery) {
-          const discovery = investigation.candidateDiscovery;
-          this.write(`[Cross-file search · ${safeTerminalText(discovery.status)} · ${discovery.scannedFiles || 0}/${discovery.searchedFiles || 0} selected files · ${discovery.matches || 0} literal candidates${discovery.partialReason ? ` · ${safeTerminalText(discovery.partialReason)}` : ""}]\n`);
-        }
-        if (investigation.impactReport) {
-          const impact = investigation.impactReport;
-          this.write(`[Change impact · ${safeTerminalText(impact.status)} · ${impact.definitions.length} definitions · ${impact.callSites.length} call candidates · ${impact.dependencies.length} dependency candidates · ${impact.tests.length} test references]\n`);
-          if (impact.gaps[0]) this.write(`  Impact limitation: ${safeTerminalText(impact.gaps[0])}\n`);
-        }
-        for (const step of (investigation.plan || []).slice(0, 5)) this.write(`- ${safeTerminalText(step)}\n`);
-        for (const note of (investigation.incomplete || []).slice(0, 2)) this.write(`  Coverage: ${safeTerminalText(note)}\n`);
-        const context = investigation.providerContext;
-        if (typeof context === "string" && context && prompt.length + context.length + 64 <= 32 * 1024) {
-          providerTask = `${prompt}\n\n${context}`;
-        } else if (context) {
-          this.write("[Repository evidence omitted from provider context because the task is at the provider input limit; local findings remain available above.]\n");
-        }
-      } catch {
-        this.write("[Repository intelligence unavailable; continuing with the original task and no repository evidence.]\n");
-      } finally {
+      this.write(`${safeStreamText(renderPreflightSummary(preflight))}\n`);
+      if (preflight.state === "cancelled" || this.interruptPending) {
+        lifecycle.cancelBeforeSubmission(preflight.note);
+        lifecycle.complete();
+        this.lastTaskLifecycle = lifecycle;
+        this.activeLifecycle = null;
+        this.preflightController = null;
         this.repositoryInspectionActive = false;
         this.activeRequest = false;
-      }
-      if (this.interruptPending || investigation?.status === "cancelled") {
-        this.write("[Vesper] Repository inspection cancelled; the provider task was not submitted.\n");
+        this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
         return;
       }
+      repositoryEvidence = preflight.repositoryEvidence;
+      providerTask = preflight.providerTask;
     }
+    this.preflightController = null;
+    this.repositoryInspectionActive = false;
+    this.activeRequest = false;
+    lifecycle.setStage("planning");
 
     // The planner is an advisory catalog consumer. It does not alter the
     // already-selected route or cause runtime inspection beyond the provider's
     // existing passive/local discovery behavior.
-    const planning = await getPlanningMetadata({
-      task: prompt,
-      capabilityProvider: this.capabilityProvider,
-      routeDecision: decision,
-      projectContext: { cwd: this.cwd },
-    });
+    let planning = null;
+    try {
+      planning = await getPlanningMetadata({
+        task: prompt,
+        capabilityProvider: this.capabilityProvider,
+        routeDecision: decision,
+        projectContext: { cwd: this.cwd },
+      });
+    } catch {
+      this.write("[Vesper advisory planning catalog unavailable; continuing with the selected route and repository evidence.]\n");
+    }
 
     let routingDecision;
     this.activeRequest = true;
@@ -290,6 +325,13 @@ class TerminalFrontend {
         },
       });
       const result = routed.fallbackResult;
+      if (!result || !["completed", "interrupted", "timeout"].includes(result.status)) {
+        throw new Error("The provider did not return a confirmed task outcome.");
+      }
+      await captureWorkspaceDiff(lifecycle, this.toolRuntime, { isCurrent: () => this.toolRuntime?.sessionId === this.sessionId });
+      lifecycle.complete({ result });
+      this.lastTaskLifecycle = lifecycle;
+      const workflowStatus = lifecycle.snapshot().status;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs, { routingDecision: routed.routingDecision });
       const uncertainInterrupt = result?.status === "interrupted" && result?.recoveryCode === "submission-outcome-uncertain";
@@ -302,12 +344,16 @@ class TerminalFrontend {
           ? "text generated · approved file change applied and verified"
           : "text generated · commands not executed · files unchanged";
         this.write(`\n\n[${safeTerminalText(this.providerShortName())} ${actionStatus}${result.truncated ? " · response truncated" : ""} · ${elapsedMs} ms]\n`);
-      } else if (result?.status === "completed") this.write(`\n\n[Codex · completed · ${elapsedMs} ms]\n`);
+      } else if (result?.status === "completed") this.write(`\n\n[Codex provider response completed · workflow ${safeTerminalText(workflowStatus)} · ${elapsedMs} ms]\n`);
       else if (result?.status === "interrupted" && uncertainInterrupt) this.write(`\n\n[${safeTerminalText(this.providerShortName())} request interrupted locally · remote completion unknown · start a new conversation to continue]\n`);
       else if (result?.status === "interrupted") this.write("\n\n[Codex · interrupted]\n");
       else if (result?.status === "timeout") this.write("\n\n[Codex · timed out and interrupted]\n");
       else this.write(`\n\n[${this.providerShortName()} · ended with status ${safeTerminalText(result?.status || "unknown")}]\n`);
+      this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
     } catch (error) {
+      await captureWorkspaceDiff(lifecycle, this.toolRuntime, { isCurrent: () => this.toolRuntime?.sessionId === this.sessionId });
+      lifecycle.complete({ error });
+      this.lastTaskLifecycle = lifecycle;
       const elapsedMs = Math.max(0, Date.now() - startedAt);
       this.metrics.record(decision, elapsedMs, { routingDecision });
       if (["PROVIDER_UNAVAILABLE", "CONNECTION_LOST", "RESUME_FAILED", "SUBMISSION_OUTCOME_UNCERTAIN", "UNSUPPORTED_OPERATION"].includes(error?.code)) {
@@ -320,10 +366,14 @@ class TerminalFrontend {
       }
       this.finishStream();
       this.write(`\n\n[${this.providerShortName()} error · ${elapsedMs} ms] ${safeTerminalText(error?.message || error)}\n`);
+      this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
     } finally {
       this.finishStream();
       this.turnDiffView.end();
       this.activeRequest = false;
+      this.repositoryInspectionActive = false;
+      this.preflightController = null;
+      this.activeLifecycle = null;
       this.commandActivity = null;
       if (this.pendingApprovals.size) {
         this.write("[Vesper] Waiting for the pending approval decision before the next prompt.\n");
@@ -496,6 +546,10 @@ class TerminalFrontend {
     this.sessionId = sessionId;
     this.savedConversationId = nextSavedConversationId;
     this.savedHistoryState = this.savedConversationId ? "pending" : "not-needed";
+    this.activeLifecycle = null;
+    this.lastTaskLifecycle = null;
+    this.lastTaskPrompt = null;
+    this.verificationCandidates = [];
     this.turnDiffIdentity = null;
     this.turnDiffRendered = false;
     this.pendingTurnDiffFinal = null;
@@ -514,9 +568,12 @@ class TerminalFrontend {
     const runtime = createPermissionedToolRuntime({
       projectRoot: this.cwd,
       sessionId,
-      approvalHandler: hasStructuredTools && this.canReviewToolChanges ? (snapshot) => this.requestToolApproval(snapshot) : undefined,
-      commandExecutionEnabled: false,
+      approvalHandler: (hasStructuredTools || this.commandExecutionEnabled) && this.canReviewToolChanges
+        ? (snapshot, options) => this.requestToolApproval(snapshot, options) : undefined,
+      commandExecutionEnabled: this.commandExecutionEnabled,
       commandWorkspaceWriteEnabled: false,
+      ...(this.commandBackend ? { commandBackend: this.commandBackend } : {}),
+      ...(this.toolExecFileImpl ? { execFileImpl: this.toolExecFileImpl } : {}),
     });
     if (runtime.sessionId !== sessionId) {
       void runtime.dispose();
@@ -540,18 +597,143 @@ class TerminalFrontend {
   }
 
   async requestToolApproval(snapshot, { signal } = {}) {
-    if (!this.canReviewToolChanges || !snapshot || snapshot.toolId !== "apply_file_change") return "decline";
+    const fileChange = snapshot?.toolId === "apply_file_change";
+    const command = snapshot?.toolId === "run_command";
+    if (!this.canReviewToolChanges || (!fileChange && !command) || (command && !this.commandExecutionEnabled) ||
+        (command && snapshot.operation?.workspaceAccess !== "read-only")) return "decline";
     if (signal?.aborted) return "cancel";
     const review = renderToolApproval(snapshot);
     if (review.includes("[review truncated; approval refused]")) return "decline";
     this.write(`\n\n${review}\n`);
-    this.write("This is a model-requested file change. Type yes to approve this exact change once, cancel to cancel, or anything else to decline.\n");
-    const answer = await this.lineIO.question("Approve file change once? ", { signal });
+    this.write(fileChange
+      ? "This is a model-requested file change. Type yes to approve this exact change once, cancel to cancel, or anything else to decline.\n"
+      : "This verification command runs once in the validated isolated container with a read-only project mount and network disabled. Type yes to approve this exact argv once, cancel to cancel, or anything else to decline.\n");
+    const answer = await this.lineIO.question(fileChange ? "Approve file change once? " : "Run verification once? ", { signal });
     if (!this.canReviewToolChanges || this.closed || signal?.aborted || answer === null || answer === undefined) return "cancel";
     const choice = String(answer).trim().toLowerCase();
     const decision = choice === "yes" ? "approve-once" : choice === "cancel" ? "cancel" : "decline";
-    this.write(`[Vesper] File-change approval: ${decision === "approve-once" ? "approved once" : decision}.\n`);
+    this.write(`[Vesper] ${fileChange ? "File-change" : "Verification command"} approval: ${decision === "approve-once" ? "approved once" : decision}.\n`);
     return decision;
+  }
+
+  async verifyLastTask(index) {
+    if (this.activeRequest) {
+      this.write("[Vesper] Wait for the active task or verification to finish first.\n");
+      return;
+    }
+    const lifecycle = this.lastTaskLifecycle;
+    const prior = lifecycle?.snapshot();
+    if (!prior || prior.sessionId !== this.sessionId || prior.providerId !== this.executionProvider.id ||
+        prior.projectRoot !== this.cwd || !this.lastTaskPrompt) {
+      this.write("[Vesper] No completed task in this project and session has verification suggestions.\n");
+      return;
+    }
+    if (!this.systemModel || !this.toolRuntime || this.toolRuntime.sessionId !== this.sessionId) {
+      this.write("[Vesper] Verification is unavailable for this project/session; no command ran.\n");
+      return;
+    }
+    this.activeRequest = true;
+    this.repositoryInspectionActive = true;
+    this.interruptPending = false;
+    this.preflightController = new AbortController();
+    let investigation;
+    try {
+      this.write("\n[Vesper · refreshing bounded project verification suggestions; no command will run during inspection]\n");
+      investigation = await this.systemModel.investigate({ task: "", intent: "overview", signal: this.preflightController.signal });
+    } catch {
+      this.write("[Vesper] Verification suggestions could not be refreshed; no command ran.\n");
+      this.activeRequest = false;
+      return;
+    } finally {
+      this.repositoryInspectionActive = false;
+      this.preflightController = null;
+    }
+    if (this.interruptPending || investigation?.status === "cancelled") {
+      this.write("[Vesper] Verification inspection was cancelled; no command ran.\n");
+      this.activeRequest = false;
+      return;
+    }
+    const candidates = selectVerificationCandidates(investigation?.project?.commands || []);
+    this.verificationCandidates = candidates;
+    if (!candidates.length) {
+      this.write("[Vesper] No test/build/check scripts were identified in the fresh bounded manifest inspection. No command ran.\n");
+      this.activeRequest = false;
+      return;
+    }
+
+    let commandStatus = null;
+    if (this.commandExecutionEnabled) {
+      try { commandStatus = await this.toolRuntime.getCommandExecutionStatus(); }
+      catch { commandStatus = { enabled: false, message: "The local sandbox status could not be verified." }; }
+    }
+    this.write("Verification suggestions · refreshed from project manifests · not run:\n");
+    for (const [position, item] of candidates.entries()) {
+      this.write(`  ${position + 1}. ${safeTerminalText(item.name)}: ${safeTerminalText(item.command)} (${safeTerminalText(item.path)}${item.inferred ? "; inferred" : ""})\n`);
+    }
+    if (!this.commandExecutionEnabled) {
+      this.write("Isolated verification is disabled by the host. Enablement remains opt-in; no command ran.\n");
+    } else if (commandStatus?.enabled !== true) {
+      this.write(`Isolated verification is unavailable: ${safeTerminalText(commandStatus?.message || "sandbox prerequisites were not verified")}. No command ran.\n`);
+    } else {
+      this.write("Validated read-only sandbox is available. Use :verify N to request one fresh approval for a listed command.\n");
+    }
+    if (index === null) {
+      this.activeRequest = false;
+      return;
+    }
+    const candidate = candidates[index - 1];
+    if (!candidate) {
+      this.write(`[Vesper] Verification option ${index} is not in the refreshed list; no command ran.\n`);
+      this.activeRequest = false;
+      return;
+    }
+    if (!this.commandExecutionEnabled || commandStatus?.enabled !== true) {
+      this.write("[Vesper] The selected verification cannot run because the existing isolated runtime is not enabled and validated.\n");
+      lifecycle.recordVerification({ state: "unavailable", errorCode: "ISOLATION_UNAVAILABLE" }, []);
+      this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
+      this.activeRequest = false;
+      return;
+    }
+    if (!this.canReviewToolChanges) {
+      this.write("[Vesper] Verification needs an interactive terminal for exact one-time approval; no command ran.\n");
+      lifecycle.recordVerification({ state: "rejected", errorCode: "APPROVAL_REQUIRED" }, []);
+      this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
+      this.activeRequest = false;
+      return;
+    }
+    const argv = parseVerificationArgv(candidate.command);
+    if (!argv) {
+      this.write("[Vesper] This manifest command contains shell syntax or unsupported tokens, so it remains a suggestion. No command ran.\n");
+      lifecycle.recordVerification({ state: "unavailable", errorCode: "UNSUPPORTED_OPERATION" }, []);
+      this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
+      this.activeRequest = false;
+      return;
+    }
+
+    this.repositoryInspectionActive = false;
+    this.verificationActive = true;
+    this.write(`\n[Vesper] Requesting one-time approval for: ${safeTerminalText(JSON.stringify(argv))}\n`);
+    try {
+      const result = await this.toolRuntime.invoke({
+        toolId: "run_command",
+        input: { argv, workspaceAccess: "read-only" },
+        context: { projectRoot: this.cwd, sessionId: this.sessionId },
+        requestId: crypto.randomUUID(),
+      });
+      lifecycle.recordVerification(result, argv);
+      const execution = result?.result;
+      if (execution?.stdout) this.write(`[verification stdout]\n${safeTerminalText(execution.stdout)}\n`);
+      if (execution?.stderr) this.write(`[verification stderr]\n${safeTerminalText(execution.stderr)}\n`);
+      if (execution && Number.isInteger(execution.exitCode)) this.write(`[Vesper] Verification command exit code: ${execution.exitCode}.\n`);
+      else if (result?.error?.message) this.write(`[Vesper] Verification command: ${safeTerminalText(result.error.message)}\n`);
+    } catch (error) {
+      lifecycle.recordVerification({ state: "failed", error: { code: error?.code || "COMMAND_FAILED" }, executed: false }, argv);
+      this.write(`[Vesper] Verification operation failed: ${safeTerminalText(error?.message || error)}\n`);
+    } finally {
+      this.verificationActive = false;
+      this.activeRequest = false;
+      this.write(`${safeStreamText(renderTaskLifecycle(lifecycle.snapshot()))}\n`);
+    }
   }
 
   attachPermissionedToolRuntime(provider, sessionId) {
@@ -633,6 +815,7 @@ class TerminalFrontend {
 
   handleExecutionEvent(event) {
     if (!event || typeof event !== "object") return;
+    this.activeLifecycle?.observe(event);
     switch (event.type) {
       case "text-delta": this.writeStreamDelta(event.text); break;
       case "conversation-state":
@@ -771,10 +954,14 @@ class TerminalFrontend {
       if (this.interruptPending) return;
       this.interruptPending = true;
       this.lineIO.cancelPending?.();
+      if (this.repositoryInspectionActive) this.preflightController?.abort("repository-inspection-interrupted");
       this.write(this.repositoryInspectionActive
         ? "\n[Vesper] Ctrl+C received; cancelling local repository inspection. No provider task has been submitted.\n"
-        : "\n[Vesper] Ctrl+C received; interrupting this turn. Vesper will return to the prompt when it ends.\n");
-      const interruption = this.repositoryInspectionActive ? this.systemModel?.interrupt?.() : this.executionProvider.interrupt();
+        : this.verificationActive
+          ? "\n[Vesper] Ctrl+C received; cancelling the approved verification operation.\n"
+          : "\n[Vesper] Ctrl+C received; interrupting this turn. Vesper will return to the prompt when it ends.\n");
+      const interruption = this.repositoryInspectionActive ? this.systemModel?.interrupt?.()
+        : this.verificationActive ? this.toolRuntime?.interrupt?.() : this.executionProvider.interrupt();
       Promise.resolve(interruption).catch((error) => {
         this.write(`[Vesper interrupt error] ${safeTerminalText(error?.message || error)}\n`);
       });
@@ -857,6 +1044,21 @@ function renderRoutingSummary(metrics, sessionId = null) {
 
 function isTextOnlyProvider(providerId) {
   return providerId === "openai-chat-completions" || providerId === "nvidia-nim";
+}
+
+function selectVerificationCandidates(commands) {
+  return (Array.isArray(commands) ? commands : []).filter((item) => item && typeof item === "object" &&
+    typeof item.name === "string" && /^(?:test(?:[: -].*)?|build|check|lint)(?:\s|$)/iu.test(item.name) &&
+    typeof item.command === "string" && item.command.trim() && typeof item.path === "string")
+    .slice(0, 8).map((item) => Object.freeze({
+      name: item.name.slice(0, 80), command: item.command.slice(0, 240), path: item.path.slice(0, 240), inferred: item.inferred === true,
+    }));
+}
+
+function parseVerificationArgv(command) {
+  if (typeof command !== "string" || !command.trim() || command.length > 240 || !/^[A-Za-z0-9_.+@/:=-]+(?:\s+[A-Za-z0-9_.+@/:=-]+)*$/u.test(command.trim())) return null;
+  const argv = command.trim().split(/\s+/u);
+  return argv.length > 0 && argv.length <= 32 ? argv : null;
 }
 
 function createLineIO(input, output) {

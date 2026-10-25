@@ -81,6 +81,9 @@ test("VS Code preflights a code task and submits only scoped bounded evidence on
   const messageOrder = panel.messages.map((message) => message.type);
   assert.ok(messageOrder.indexOf("repository-preflight") < messageOrder.indexOf("assistant-running"));
   assert.equal(panel.last("assistant-done").providerId, "codex-app-server");
+  assert.equal(panel.last("assistant-done").workflowStatus, "completed");
+  assert.equal(panel.last("assistant-done").verificationState, "not-run");
+  assert.equal(panel.all("workflow-state").at(-1).workflow.status, "completed");
 });
 
 test("VS Code preflight uses bounded model-assisted investigation for a complex task", async (t) => {
@@ -197,6 +200,7 @@ test("a provider failure after preflight is not retried or submitted twice", asy
   assert.equal(harness.requests.filter((request) => request.method === "turn/start").length, 1);
   assert.equal(panel.all("assistant-error").length, 1);
   assert.equal(panel.last("assistant-error").state, "failed");
+  assert.equal(panel.all("workflow-state").at(-1).workflow.status, "failed");
 });
 
 test("stopping VS Code preflight cancels before provider submission", async (t) => {
@@ -232,6 +236,7 @@ test("stopping VS Code preflight cancels before provider submission", async (t) 
   assert.equal(harness.requests.some((request) => request.method === "thread/start" || request.method === "turn/start"), false);
   assert.match(panel.last("assistant-error").text, /provider task was not submitted/u);
   assert.equal(panel.last("assistant-error").preflight, true);
+  assert.equal(panel.last("workflow-state").workflow.status, "cancelled");
   assert.equal(harness.store().findLatestByCwd(fs.realpathSync(project)).providerConversationId, null);
 });
 

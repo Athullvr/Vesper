@@ -664,6 +664,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
             toolId: result.toolId || call.function.name,
             state: result.state,
             verified: result.verified === true,
+            ...(Array.isArray(result.changedFiles) ? { changedFiles: result.changedFiles } : {}),
             ...(result.summary ? { summary: result.summary } : {}),
             ...(result.errorCode ? { errorCode: result.errorCode } : {}),
           });
@@ -816,6 +817,8 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     let summary = "";
     try { summary = redactSensitiveText(JSON.stringify(sanitizeModelValue(summaryValue))).slice(0, 500); } catch { /* No UI summary for an unserializable tool result. */ }
     return { toolId: name, state: result.state, verified: result.verified === true, summary,
+      ...(name === "apply_file_change" && result.state === "verified" && result.verified === true && result.proposalState === "applied" && typeof result.result?.path === "string"
+        ? { changedFiles: [result.result.path] } : {}),
       ...(result.error?.code ? { errorCode: String(result.error.code).slice(0, 80) } : {}), content };
   }
 

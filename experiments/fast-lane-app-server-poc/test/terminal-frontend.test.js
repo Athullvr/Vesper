@@ -162,7 +162,7 @@ test("local question is labeled local, uses no app-server turn, and Codex fallba
   assert.match(text, /\[Route · Codex · no local intent matched\]/u);
   assert.match(text, /\[Codex · connecting\]/u);
   assert.match(text, /A rebase replays commits\./u);
-  assert.match(text, /Codex · completed/u);
+  assert.match(text, /Codex provider response completed · workflow completed/u);
   assert.equal(appServer.turns.length, 1);
 });
 
@@ -236,7 +236,7 @@ test("initialization failures and timeouts are visible and the input loop recove
   assert.match(output(), /Codex error .* provider reported that the task failed/u);
   assert.doesNotMatch(output(), /mock app-server initialization failure/u);
   assert.match(output(), /Codex · timed out and interrupted/u);
-  assert.match(output(), /Codex · completed/u);
+  assert.match(output(), /Codex provider response completed · workflow completed/u);
   assert.equal(appServer.turns.length, 3);
 });
 
@@ -312,7 +312,7 @@ test("Codex deltas reach the terminal before the turn completes", async () => {
   await setup.frontend.run();
 
   assert.match(setup.output(), /The streamed answer continues here\./u);
-  assert.ok(setup.output().indexOf("continues here.") < setup.output().indexOf("[Codex · completed"));
+  assert.ok(setup.output().indexOf("continues here.") < setup.output().indexOf("[Codex provider response completed · workflow completed"));
 });
 
 test("Ctrl+C interrupts the active turn and the workspace accepts a later task", async () => {
@@ -337,7 +337,7 @@ test("Ctrl+C interrupts the active turn and the workspace accepts a later task",
   assert.match(setup.output(), /interrupting this turn/u);
   assert.match(setup.output(), /Codex · interrupted/u);
   assert.match(setup.output(), /The next task still works\./u);
-  assert.match(setup.output(), /Codex · completed/u);
+  assert.match(setup.output(), /Codex provider response completed · workflow completed/u);
   assert.equal(turnCount, 2);
   assert.equal(setup.io.closed, true);
 });
