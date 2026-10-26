@@ -1,96 +1,57 @@
 # Vesper
 
-Vesper is a local-first coding-agent interface prototype. It combines a small VS Code conversation panel and a terminal CLI with deterministic local project checks and the Codex app-server as its current coding and reasoning runtime.
+Vesper is a local-first coding-agent interface with a terminal CLI and a VS Code panel. The runnable implementation is in [`experiments/fast-lane-app-server-poc`](experiments/fast-lane-app-server-poc/).
 
-> **Project status:** the runnable implementation lives in [`experiments/fast-lane-app-server-poc`](experiments/fast-lane-app-server-poc/). It has extensive automated coverage, but authenticated, model-backed VS Code integration and real file-change workflows have not yet been validated end to end. Treat the project as an active prototype, not a production release.
+> **Project status:** Vesper is an active prototype. Deterministic repository inspection and the offline System Model evaluation are covered by automated tests. Authenticated model turns, real file-change approval flows, the VS Code Extension Development Host, and the optional Podman sandbox have not been validated end to end. Focused test success is not a production-readiness claim.
 
-## Current architecture
+## What Vesper does
 
-```mermaid
-flowchart TD
-    VSC[VS Code panel]
-    CLI[Terminal CLI]
-    ROUTER[Deterministic routing core]
-    LOCAL[Fixed local Git and test-evidence handlers]
-    REPO[Bounded repository intelligence and System Model]
-    CLIENT[Codex app-server client]
-    CODEX[Installed Codex CLI app-server]
-    STORE[(Vesper session metadata)]
+- Inspects a selected repository with bounded, read-only filesystem and Git evidence.
+- Routes a limited set of explicit Git and test-result questions to deterministic local handlers.
+- Uses the installed Codex CLI app-server by default for coding tasks. OpenAI Chat Completions and NVIDIA NIM are optional API providers.
+- Offers the same project and session lifecycle from the terminal and VS Code.
+- Preserves provider-specific approvals. Codex keeps its native app-server approval flow. Vesper-managed file proposals require a fresh one-time approval. Provider tools cannot run shell commands.
 
-    VSC --> ROUTER
-    CLI --> ROUTER
-    ROUTER -->|explicit supported local question| LOCAL
-    ROUTER -->|terminal provider task| REPO
-    REPO -->|bounded findings; same route and provider| CLIENT
-    ROUTER -->|other tasks or VS Code provider task| CLIENT
-    CLIENT <-->|JSON-RPC over stdio| CODEX
-    VSC <--> STORE
-    CLI <--> STORE
-    CLIENT -->|thread start, resume, turn events| VSC
-    CLIENT -->|thread start, resume, turn events| CLI
-```
+Vesper does not automatically run project tests, claim a complete call graph, execute generated code, or treat a proposed diff as proof of a disk write. It is not a hosted service or a replacement for Git, test, or security review.
 
-- **Two frontends, one runtime path:** the VS Code extension and `vesper` terminal CLI share the routing core, app-server client, and session store.
-- **Local-first routing:** a narrow set of explicit Git and test-evidence questions is answered from local evidence. Unsupported or ambiguous requests go to Codex. Local answers do not start a model turn.
-- **Codex app-server:** Vesper starts or resumes a Codex thread and streams turn events through the installed CLI's app-server using JSON-RPC over stdio. The app-server remains the coding and reasoning backend; Vesper is its interface and safety-aware adapter.
-- **Session identity:** Vesper stores a session ID, canonical project path, Codex thread ID, schema version, and timestamps under `~/.vesper/sessions/` (or `$VESPER_HOME/sessions/`). It does not store prompts or model transcripts. The VS Code panel restores supported persisted history from the Codex thread; local answers are not part of that history.
-- **Capability planning:** a normalized local catalog feeds a deterministic advisory planner, available from the CLI, terminal workspace, and VS Code panel. Planning preserves the router's decision, distinguishes unknown and stale runtime evidence, and never activates or executes a capability.
-- **Repository intelligence:** `vesper inspect [TASK]`, terminal `:inspect [TASK]`, and `:impact TASK` run bounded, read-only project and Git analysis through the existing permissioned tool runtime. Change-impact queries search a vetted inventory of at most 128 source/config files for up to four literal terms, then prioritize targeted source reads; incomplete coverage is reported. Code-oriented terminal and VS Code provider tasks receive scoped synthesized findings, impact summaries, and suggested-but-not-run verification steps. Paths, lines, provenance, uncertainty, and coverage limits remain explicit. The deterministic System Model does not add another model call or change routing. If VS Code preflight fails, the panel explicitly reports that limitation and submits the original task without repository evidence; cancelling preflight prevents provider submission.
-- **Bounded activity views:** command activity, per-item file-change evidence, and turn-level aggregate diffs have separate projections. They are correlated to their supported thread/turn/item identities, bounded, and escaped before display. An aggregate diff or proposed file change is not proof of a disk write.
+## Quick start
 
-## Safety boundaries
+Requirements: Node.js 18 or newer and Git. Codex CLI is required for Codex-backed tasks. See [installation and configuration](experiments/fast-lane-app-server-poc/INSTALL.md) for provider setup and environment limits.
 
-- The VS Code extension uses a read-only sandbox and declines approval requests. It does not silently create a replacement thread after a failed resume.
-- The terminal does not automatically approve requests. It requires an explicit one-time decision when the server offers one; missing, stale, malformed, oversized, or mismatched file-change evidence fails closed.
-- Rendering command or diff activity does not execute commands or authorize changes. Approval status and execution outcome remain separate.
-- Local Git checks use repository evidence and do not contact a remote. Their limits and freshness are reported rather than inferred.
-- Capability plans use local metadata and already observed passive MCP startup notifications. A ready notification does not prove an individual tool works; unknown and stale states remain explicit.
-
-## Run the prototype
-
-Requirements: Node.js 18 or newer, Git, and the Codex CLI on `PATH` for Codex-backed tasks. The prototype has no npm runtime dependencies.
+From a Vesper checkout:
 
 ```sh
 cd experiments/fast-lane-app-server-poc
-npm test
-npm run cli -- --new /path/to/project
+npm install --global .
+vesper setup
+vesper doctor --project /path/to/project
+vesper inspect "Trace handleCheckout through the service layer" --project /path/to/project
 ```
 
-The CLI prints a Vesper session ID. Resume it with:
+Start a coding session and enter a task in the workspace:
 
 ```sh
-npm run cli -- --resume SESSION_ID /path/to/project
+vesper --new /path/to/project
 ```
 
-For the VS Code development host, isolated test homes, and the disposable fixture procedure, see the [prototype README](experiments/fast-lane-app-server-poc/README.md). The extension package is directly loadable from that folder; no build or VSIX is required.
+For example, enter `Add tax validation to handleCheckout`. Vesper runs a bounded local preflight, then sends the task through the configured provider. Codex is the default and uses Codex CLI authentication; it does not require an API key. Run `vesper --help` for commands and [`INSTALL.md`](experiments/fast-lane-app-server-poc/INSTALL.md) for optional OpenAI and NVIDIA setup.
 
-## What is implemented
+## Safety and privacy
 
-- Deterministic local routing for supported Git and test-result questions, with explicit evidence and uncertainty.
-- Codex thread creation, streaming turns, interruption, resume, and bounded history restoration in the VS Code panel.
-- Persistent project-to-session/thread mapping using Vesper's existing session store.
-- Unified capability discovery and a deterministic plan preview with CLI, terminal, and VS Code entry points.
-- Bounded command lifecycle visibility and terminal-safe rendering.
-- Separate file-change approval evidence and aggregate turn-diff visibility, with fail-closed approval handling.
-- Recovery states that distinguish connected, restoring, disconnected, and unavailable history/session cases.
+`vesper inspect` is local and read-only by default. `VESPER_LOCAL_ONLY=1` disables optional model-assisted investigation planning; it does not prevent a coding task from being sent to its selected provider. OpenAI and NVIDIA tasks send task text and bounded synthesized repository findings; structured tool calls can send bounded tool definitions and results. Review provider data handling before using remote APIs with private repositories. No network check is performed by `setup` or `doctor`.
 
-## Planned direction
+The terminal asks before accepting supported approval requests. The VS Code extension keeps a read-only Codex policy and declines native approval requests. Command execution is disabled by default. The optional Podman backend is Linux-only, requires local validation, and is not validated in the current release-check environment.
 
-The next build steps extend this architecture rather than replace it:
+## Developer checks
 
-1. Complete a visible, authenticated VS Code/app-server validation using the disposable project and isolated homes. Current automated app-server tests are mocked; live extension activation, model turns, and real file operations remain unverified.
-2. Add project-scoped saved-session selection and older-turn history navigation while keeping Codex thread history authoritative and Vesper metadata minimal.
-3. Improve conversation input and task-state UX, including multiline composition, clearer retry/interruption progress, and recovery feedback.
-4. Expand tool and result visibility only after verifying each installed protocol event and its authorization boundaries. Keep command, file, and aggregate-diff evidence distinct.
-5. Package and distribute Vesper after extension-host validation and core recovery flows are reliable.
+Run from `experiments/fast-lane-app-server-poc`:
 
-Capability discovery and supported plugin/MCP management are implemented for the local sources and documented Codex interfaces already present. Automatic capability selection, skill activation, tool-health checks, model or sandbox settings editors, project memory, and ML engineering workflows remain future work and must preserve Codex's configuration and Vesper's approval boundaries.
+```sh
+npm test
+npm run evaluate:system-model
+npm run release:check
+```
 
-## Project documentation
+The release check tests the npm artifact from a clean temporary prefix and runs repository inspection from that installation. It reports VSIX packaging or graphical extension activation as skipped when the required tools or host are unavailable. See [developer task workflow](experiments/fast-lane-app-server-poc/DEVELOPER-WORKFLOW.md) and [reliability audit](experiments/fast-lane-app-server-poc/RELIABILITY-AUDIT.md) for behavior and validation limits.
 
-- [Prototype usage and extension setup](experiments/fast-lane-app-server-poc/README.md)
-- [Shared developer task workflow and limitations](experiments/fast-lane-app-server-poc/DEVELOPER-WORKFLOW.md)
-- [Interface inventory and roadmap](experiments/fast-lane-app-server-poc/INTERFACE-ROADMAP.md)
-- [Reliability audit and validation history](experiments/fast-lane-app-server-poc/RELIABILITY-AUDIT.md)
-- [TTY smoke and integration-readiness procedure](experiments/fast-lane-app-server-poc/TTY-INTEGRATION-READINESS.md)
-- [Benchmark methodology](experiments/fast-lane-app-server-poc/benchmark/README.md)
+When reporting a bug, include the command and arguments, Node/Git/Codex/VS Code versions from `vesper doctor`, expected and observed results, and a minimal reproducible project. Remove credentials, tokens, private source, and private repository paths from logs before sharing them.

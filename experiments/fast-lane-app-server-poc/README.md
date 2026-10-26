@@ -1,36 +1,35 @@
-# Fast Lane and Vesper prototype
+# Vesper CLI and VS Code extension
 
-This prototype has two frontends over the same small routing core:
+Vesper is a local-first coding-agent interface with two frontends over the same routing core:
 
 - A VS Code extension panel that answers explicit Git and test-evidence questions locally and sends other prompts to the selected execution provider.
-- A minimal terminal frontend named `vesper` with the same local-first routing and provider-owned conversation continuity per Vesper session.
+- A terminal CLI named `vesper` with local-first repository inspection and provider-backed coding sessions.
 
-The prototype uses Node.js built-ins, Git, the VS Code Extension API for the panel, and the installed Codex CLI. It has no npm runtime dependencies.
-
-The [reliability audit](RELIABILITY-AUDIT.md) records the verified fixes, test matrix, and offline runtime results. The [interface inventory and roadmap](INTERFACE-ROADMAP.md) maps the terminal's remaining features to the installed protocol and describes an incremental architecture.
+The package uses Node.js built-ins, Git, the VS Code Extension API, and (for the default provider) the installed Codex CLI. It has no npm runtime dependencies. The [installation guide](INSTALL.md) covers first run, provider configuration, diagnostics, privacy, reset, and uninstall.
 
 The [developer task workflow](DEVELOPER-WORKFLOW.md) documents the shared terminal/VS Code lifecycle, status rules, one-time approval gates, `:verify`, the deterministic multi-package scenario, and the current host/sandbox limitations.
 
-The [TTY smoke and integration-readiness procedure](TTY-INTEGRATION-READINESS.md) documents the no-Codex CLI lifecycle PTY check, the synthetic-event PTY check, and a prepared disposable Git repository for a future explicitly authorized live test. Run `npm run test:pty` for the CLI lifecycle check.
+From the source checkout, `npm run test:pty` exercises the CLI lifecycle in a pseudo-terminal. Test files and benchmark fixtures are deliberately omitted from the packed runtime installation.
 
 ## Terminal frontend
 
-Requirements: Node.js 18 or newer, Git, and Codex CLI on `PATH`. From this folder, print help or run Vesper against a project:
+Requirements: Node.js 18 or newer and Git. Codex CLI on `PATH` is required for Codex-backed tasks. Install from this folder and review local prerequisites:
 
 ```sh
-npm run cli -- --help
-npm run cli -- /path/to/project
-```
-
-Vesper resolves the selected project to its canonical real path. Without a path, it uses the current working directory. To make the `vesper` command available in the current npm environment, link this package once, then run it from any project directory:
-
-```sh
-cd experiments/fast-lane-app-server-poc
-npm link
-cd /path/to/project
+npm install --global .
 vesper --help
-vesper
+vesper setup
+vesper doctor --project /path/to/project
 ```
+
+Inspect a project locally or run the CLI from source without a global install:
+
+```sh
+npm run cli -- inspect "Trace handleCheckout" --project /path/to/project
+vesper inspect "Trace handleCheckout" --project /path/to/project
+```
+
+Setup and doctor are read-only and do not validate remote credentials. The default Codex integration uses Codex CLI authentication and does not require an API key. Optional OpenAI and NVIDIA API setup is documented in [INSTALL.md](INSTALL.md).
 
 The default launch resumes the most recently updated Vesper session for that exact canonical project, or creates one if none exists. Use `vesper --new` to create a separate session. `vesper run` is an explicit alias for the normal terminal workflow.
 
@@ -389,7 +388,7 @@ Audit records retain at most 50 structured state events with tool ID, Vesper ses
 
 ## VS Code extension
 
-This repository is directly loadable as a VS Code extension: `package.json` points to the existing `extension.js` entry point. No build step or VSIX is required. There is no checked-in `.vscode/launch.json`, so use the command below instead of relying on `F5` to select an extension-host configuration.
+This source folder is directly loadable as a VS Code extension: `package.json` points to the existing `extension.js` entry point. No build step is required. VSIX packaging is optional and has not been validated; use the release-check workflow to see whether `vsce` is available in the current environment. There is no checked-in `.vscode/launch.json`, so use the command below instead of relying on `F5` to select an extension-host configuration.
 
 For an isolated run, start it from a desktop terminal outside any restricted Linux command sandbox, from this repository directory. The fixture and dedicated homes are prepared by the integration procedure above; the VS Code profile and extension directories are also kept under the ignored `.audit-artifacts` directory:
 
@@ -408,7 +407,7 @@ code --new-window \
   "$E2E_PROJECT"
 ```
 
-The `code` command's exit status alone does not prove that Electron created a usable window. In this environment, launching it inside the restricted command sandbox produced `sandbox_host_linux.cc:41: Operation not permitted` while the CLI still returned status 0. Do not work around that restriction with `--no-sandbox`; run the command from the desktop session instead. Verify a separate VS Code window opened on the disposable project, run **Fast Lane: Open Panel** from the Command Palette, and confirm the Vesper webview appears. The Vesper Output channel and the Extension Host log can confirm activation after the command is invoked. Startup logs are under the selected VS Code user-data directory's `logs` folder; keep them local and do not share raw logs.
+The `code` command's exit status alone does not prove that Electron created a usable window. In the previously tested restricted command sandbox, launching it produced `Operation not permitted` while the CLI returned status 0. Do not work around that restriction with `--no-sandbox`; run the command from the desktop session instead. Verify that a separate VS Code window opens on the disposable project, run **Vesper: Open Panel** from the Command Palette, and confirm the Vesper webview appears. The Vesper Output channel and Extension Host log can confirm activation after the command is invoked. Startup logs are under the selected VS Code user-data directory's `logs` folder; keep them local and do not share raw logs.
 
 The extension panel keeps its VS Code message bridge and local-first routing, and uses the same provider-neutral execution interface and session store as the terminal frontend. The Codex adapter continues to wrap the tested app-server client.
 
@@ -420,7 +419,7 @@ After a saved thread is verified, the panel requests its latest 50 persisted tur
 
 ## Tests and manual checks
 
-Run the full prototype test suite from this folder:
+Run these checks from the source checkout; test files are not included in the packed runtime installation:
 
 ```sh
 npm test
@@ -449,4 +448,4 @@ For terminal fallback, submit `Explain what a Git rebase does in one sentence.` 
 - The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and the request is reported as an error. Another fallback tries to resume the same saved thread; it never silently starts a replacement conversation.
 - Local Git checks do not fetch or contact a remote. Their results are bounded by local repository evidence and its freshness.
 - Upstream freshness uses the tracking ref's latest recorded reflog update (`%gD` with `--date=raw`), not the referenced commit's date. Missing or invalid reflog evidence leaves freshness unknown, even when the local ahead count is confirmed. An unchanged fetch need not add a reflog entry; a recent entry never confirms live remote state.
-- Remove `experiments/fast-lane-app-server-poc/` to discard the prototype. Runtime use creates no project configuration, dependencies, or Git changes.
+- Uninstalling the npm package removes the CLI and extension files only; it leaves Vesper session/history data and project data in place. See [INSTALL.md](INSTALL.md) for uninstall and reset guidance. Vesper runtime use does not add project dependencies or project configuration automatically.

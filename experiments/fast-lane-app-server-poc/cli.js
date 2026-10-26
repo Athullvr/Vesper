@@ -35,6 +35,7 @@ const { escapeTerminalOutput, redactSensitiveText } = require("./command-activit
 const { createPermissionedToolRuntime, renderToolApproval, renderToolDefinitions } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
 const { createSystemModel, isComplexInvestigation, isModelAssistedEnabled, renderSystemModelReport } = require("./system-model");
+const { collectDiagnostics, renderDiagnostics } = require("./diagnostics");
 
 const USAGE = `Vesper terminal frontend
 
@@ -47,6 +48,8 @@ Usage:
   vesper sessions new [PROJECT_DIRECTORY]
   vesper providers
   vesper providers status [--provider PROVIDER_ID] [--check]
+  vesper setup [--provider PROVIDER_ID]
+  vesper doctor [--project PROJECT_DIRECTORY]
   vesper --provider PROVIDER_ID [--model MODEL_ID] [--new] [PROJECT_DIRECTORY]
   vesper --model MODEL_ID --new [PROJECT_DIRECTORY]
   vesper plugins [PROJECT_DIRECTORY]
@@ -150,8 +153,28 @@ rootless Podman image and verified isolation controls. Configure it with VESPER_
 VESPER_ENABLE_ISOLATED_COMMANDS=1. Writable mounts also require VESPER_ENABLE_SANDBOX_WRITES=1.
 `;
 
+const SETUP_USAGE = `Vesper first-run setup (read-only)
+
+Usage:
+  vesper setup [--provider PROVIDER_ID]
+
+Setup validates local prerequisites and explains provider configuration. It never edits shell files,
+changes provider selection, changes permissions, stores credentials, or calls provider APIs.
+`;
+
+const DOCTOR_USAGE = `Vesper local diagnostics (offline)
+
+Usage:
+  vesper doctor [--project PROJECT_DIRECTORY]
+
+Diagnostics check local tools, configuration shape, project metadata, and extension prerequisites.
+They may read the Codex CLI's local sign-in status, but do not call provider APIs or launch the VS Code extension host.
+`;
+
 function parseArgs(argv) {
   const args = [...argv];
+  if (args[0] === "setup") return parseSetupArgs(args.slice(1));
+  if (args[0] === "doctor") return parseDoctorArgs(args.slice(1));
   if (args[0] === "providers") return parseProvidersArgs(args.slice(1));
   if (args[0] === "sessions") return parseSessionsArgs(args.slice(1));
   if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
@@ -161,6 +184,42 @@ function parseArgs(argv) {
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
   return parseRunArgs(args);
+}
+
+function parseSetupArgs(args) {
+  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command: "setup", help: true };
+  let providerId = null;
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== "--provider" || providerId || !args[index + 1]) {
+      throw new Error("Usage: vesper setup [--provider PROVIDER_ID].");
+    }
+    providerId = args[index + 1];
+    index += 1;
+    if (!listProviders().some((provider) => provider.id === providerId)) {
+      throw new Error(`Unknown provider ${safeCliField(providerId)}. Run vesper providers to see supported providers.`);
+    }
+  }
+  return { command: "setup", providerId, help: false };
+}
+
+function parseDoctorArgs(args) {
+  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command: "doctor", help: true };
+  let projectDirectory = null;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === "--project") {
+      if (projectDirectory || !args[index + 1] || args[index + 1].startsWith("--")) {
+        throw new Error("Usage: vesper doctor [--project PROJECT_DIRECTORY].");
+      }
+      projectDirectory = args[index + 1];
+      index += 1;
+    } else if (!projectDirectory && !value.startsWith("--")) {
+      projectDirectory = value;
+    } else {
+      throw new Error("Usage: vesper doctor [--project PROJECT_DIRECTORY].");
+    }
+  }
+  return { command: "doctor", projectDirectory, help: false };
 }
 
 function parseToolsArgs(args) {
@@ -460,11 +519,21 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
     return 2;
   }
 
+  if (options.help && options.command === "setup") {
+    output.write(SETUP_USAGE);
+    return 0;
+  }
+  if (options.help && options.command === "doctor") {
+    output.write(DOCTOR_USAGE);
+    return 0;
+  }
   if (options.help) {
     output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  VESPER_SYSTEM_MODEL_ASSISTED=1 opts complex repository investigations into bounded planning calls through the selected OpenAI/NVIDIA provider and model; Codex uses deterministic planning. VESPER_LOCAL_ONLY=1 disables those calls.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "inspect" ? "Vesper repository intelligence\n\nUsage:\n  vesper inspect [TASK] [--project PROJECT_DIRECTORY]\n\nInspects bounded local filesystem and Git evidence through the permissioned read-only tool runtime. Deterministic planning is the default; when explicitly enabled, complex questions may send bounded, redacted task and evidence metadata to the selected OpenAI/NVIDIA model. No commands are run, files are modified, or complete call graphs claimed.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
   }
 
+  if (options.command === "setup") return runSetup(options, dependencies, output, errorOutput);
+  if (options.command === "doctor") return runDoctor(options, dependencies, output, errorOutput);
   if (options.command === "providers") return runProviders(options, dependencies, output, errorOutput);
   if (options.command === "plan") return runPlan(options, dependencies, output, errorOutput);
   if (options.command === "inspect") return runInspect(options, dependencies, output, errorOutput);
@@ -502,6 +571,71 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   }
 
   return runInteractiveVesper(options, dependencies, output, errorOutput);
+}
+
+async function runSetup(options, dependencies, output, errorOutput) {
+  const environment = dependencies.environment || process.env;
+  let providerId = options.providerId || resolveDefaultProviderId(environment);
+  const input = dependencies.input || process.stdin;
+  if (!options.providerId && input.isTTY && output.isTTY) {
+    const providers = listProviders();
+    output.write("Choose the provider to configure or validate:\n");
+    providers.forEach((provider, index) => output.write(`  ${index + 1}. ${provider.id} · ${provider.name}${provider.id === providerId ? " · current default" : ""}\n`));
+    const interfaceFactory = dependencies.setupReadlineFactory || readline.createInterface;
+    const prompt = interfaceFactory({ input, output });
+    try {
+      const answer = (await prompt.question(`Provider [${providerId}]: `)).trim();
+      if (answer) {
+        const selected = /^\d+$/u.test(answer) ? providers[Number(answer) - 1] : providers.find((provider) => provider.id === answer);
+        if (!selected) {
+          errorOutput.write("[Vesper setup error] Choose a listed number or provider id. No settings were changed.\n");
+          return 2;
+        }
+        providerId = selected.id;
+      }
+    } catch {
+      errorOutput.write("[Vesper setup] Setup was cancelled. No settings were changed.\n");
+      return 130;
+    } finally { prompt.close(); }
+  }
+
+  const report = collectDiagnostics({
+    ...(dependencies.diagnosticOptions || {}),
+    projectDirectory: dependencies.projectDirectory || process.cwd(),
+    providerId,
+    environment,
+  });
+  output.write("Vesper first-run setup · read-only\n");
+  output.write(`Provider under review: ${safeCliField(providerId)}\n`);
+  output.write(`Default provider for new sessions: ${safeCliField(report.selectedProviderId)}\n`);
+  output.write("\nProvider setup guidance:\n");
+  if (providerId === DEFAULT_PROVIDER_ID) {
+    output.write("- Codex uses the installed Codex CLI and its existing sign-in. It does not require an OpenAI API key. Check with `codex login status`; sign in with `codex login` if needed.\n");
+  } else if (providerId === OPENAI_PROVIDER_ID) {
+    output.write("- OpenAI Chat Completions requires OPENAI_API_KEY or VESPER_OPENAI_API_KEY and VESPER_OPENAI_MODEL in the process environment. The key value is never printed.\n");
+  } else if (providerId === NVIDIA_PROVIDER_ID) {
+    output.write("- NVIDIA NIM requires NVIDIA_API_KEY or VESPER_NVIDIA_API_KEY and VESPER_NVIDIA_MODEL in the process environment. VESPER_NVIDIA_BASE_URL is optional; the NVIDIA hosted endpoint is the default. The key value is never printed.\n");
+  }
+  output.write("- VESPER_PROVIDER chooses the default for new sessions. `--provider` chooses one new session. Setup does not change either setting or edit shell files.\n");
+  output.write("- Use `vesper --provider PROVIDER_ID --new PROJECT_DIRECTORY` for one session, then `vesper providers status --provider PROVIDER_ID` to validate configuration locally.\n");
+  output.write("- Vesper setup and doctor do not send repository contents or credentials. API keys stay in your environment; never commit them.\n\n");
+  output.write(renderDiagnostics(report));
+  return report.blocking ? 1 : 0;
+}
+
+function runDoctor(options, dependencies, output, errorOutput) {
+  try {
+    const report = collectDiagnostics({
+      ...(dependencies.diagnosticOptions || {}),
+      projectDirectory: options.projectDirectory || dependencies.projectDirectory || process.cwd(),
+      environment: dependencies.environment || process.env,
+    });
+    output.write(renderDiagnostics(report));
+    return report.blocking ? 1 : 0;
+  } catch (error) {
+    errorOutput.write(`[Vesper doctor error] ${safeTerminalText(error?.message || error)}\n`);
+    return 1;
+  }
 }
 
 async function runProviders(options, dependencies, output, errorOutput) {
@@ -1229,7 +1363,9 @@ module.exports = {
   SESSIONS_USAGE,
   USAGE,
   parseArgs,
+  parseDoctorArgs,
   parseInspectArgs,
+  parseSetupArgs,
   resolveProjectDirectory,
   runGitCommand,
   parsePlanArgs,

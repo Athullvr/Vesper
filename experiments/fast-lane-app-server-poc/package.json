@@ -1,13 +1,21 @@
 {
   "name": "fast-lane-app-server-poc",
-  "displayName": "Fast Lane App-Server PoC",
-  "description": "Disposable local-first prompt routing experiment for VS Code and Codex app-server.",
+  "displayName": "Vesper",
+  "description": "Local-first coding-agent CLI and VS Code extension with Codex and optional API providers.",
   "version": "0.1.0",
   "publisher": "local-experiment",
   "bin": {
     "vesper": "./bin/vesper.js"
   },
+  "files": [
+    "*.js",
+    "bin/vesper.js",
+    "README.md",
+    "INSTALL.md",
+    "DEVELOPER-WORKFLOW.md"
+  ],
   "engines": {
+    "node": ">=18",
     "vscode": "^1.85.0"
   },
   "categories": [
@@ -21,13 +29,14 @@
     "test": "node ./test/run-tests.js",
     "test:pty": "python3 ./test/pty-cli-smoke.py",
     "cli": "node ./bin/vesper.js",
-    "evaluate:system-model": "node ./benchmark/run-system-model.js"
+    "evaluate:system-model": "node ./benchmark/run-system-model.js",
+    "release:check": "node ./scripts/release-check.js"
   },
   "contributes": {
     "commands": [
       {
         "command": "fastLane.openPanel",
-        "title": "Fast Lane: Open Panel"
+        "title": "Vesper: Open Panel"
       }
     ]
   }

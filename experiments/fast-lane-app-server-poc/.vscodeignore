@@ -1,0 +1,10 @@
+.git/**
+node_modules/**
+test/**
+benchmark/**
+.audit-artifacts/**
+.fast-lane-test-result.json
+**/.env
+**/.env.*
+**/*.log
+**/*.tmp
