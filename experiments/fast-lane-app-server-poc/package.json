@@ -14,8 +14,11 @@
     "INSTALL.md",
     "DEVELOPER-WORKFLOW.md",
     "PREVIEW-GUIDE.md",
+    "PREVIEW-VALIDATION-CHECKLIST.md",
     "PREVIEW-FEEDBACK.md",
-    "PROVIDER-LIVE-VALIDATION.md"
+    "PROVIDER-LIVE-VALIDATION.md",
+    "LICENSE",
+    "LICENSE.*"
   ],
   "engines": {
     "node": ">=18",
@@ -33,6 +36,7 @@
     "test:pty": "python3 ./test/pty-cli-smoke.py",
     "cli": "node ./bin/vesper.js",
     "package:vsix": "node ./scripts/package-vsix.js",
+    "package:preview": "node ./scripts/package-preview.js",
     "evaluate:system-model": "node ./benchmark/run-system-model.js",
     "release:check": "node ./scripts/release-check.js"
   },

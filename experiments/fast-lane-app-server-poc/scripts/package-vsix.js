@@ -17,6 +17,7 @@ fs.mkdirSync(path.dirname(output), { recursive: true });
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), "vesper-vsix-stage-"));
 try {
   createStage(stage);
+  normalizeStageTimestamps(stage);
   const packed = spawnSync(vsce, ["package", "--no-dependencies", "--allow-missing-repository", "--out", output], {
     cwd: stage, encoding: "utf8", timeout: 120_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true,
   });
@@ -31,6 +32,7 @@ try {
     process.exitCode = 1;
   } else {
     try {
+      normalizeArchiveTimestamps(output);
       inspectArchive(output);
       process.stdout.write(`Verified VSIX: ${output}\n`);
     } catch (error) {
@@ -67,7 +69,7 @@ function validateManifest() {
 function inspectArchive(artifact) {
   const listing = run("unzip", ["-Z1", artifact]);
   const files = listing.stdout.split(/\r?\n/u).filter(Boolean);
-  const required = new Set(["extension.vsixmanifest", "[Content_Types].xml", "extension/package.json", "extension/readme.md", "extension/INSTALL.md", "extension/PREVIEW-GUIDE.md", "extension/PREVIEW-FEEDBACK.md", "extension/PROVIDER-LIVE-VALIDATION.md"]);
+  const required = new Set(["extension.vsixmanifest", "[Content_Types].xml", "extension/package.json", "extension/readme.md", "extension/INSTALL.md", "extension/PREVIEW-GUIDE.md", "extension/PREVIEW-VALIDATION-CHECKLIST.md", "extension/PREVIEW-FEEDBACK.md", "extension/PROVIDER-LIVE-VALIDATION.md"]);
   for (const file of ["extension/extension.js", "extension/cli.js", "extension/bin/vesper.js", ...fs.readdirSync(root).filter((entry) => entry.endsWith(".js")).map((entry) => `extension/${entry}`)]) {
     required.add(file);
   }
@@ -105,15 +107,60 @@ function createStage(stage) {
   for (const entry of fs.readdirSync(root).filter((name) => name.endsWith(".js"))) {
     fs.copyFileSync(path.join(root, entry), path.join(stage, entry));
   }
-  for (const relative of ["bin/vesper.js", "README.md", "INSTALL.md", "DEVELOPER-WORKFLOW.md", "PREVIEW-GUIDE.md", "PREVIEW-FEEDBACK.md", "PROVIDER-LIVE-VALIDATION.md"]) {
+  const files = ["bin/vesper.js", "README.md", "INSTALL.md", "DEVELOPER-WORKFLOW.md", "PREVIEW-GUIDE.md", "PREVIEW-VALIDATION-CHECKLIST.md", "PREVIEW-FEEDBACK.md", "PROVIDER-LIVE-VALIDATION.md"];
+  files.push(...fs.readdirSync(root).filter((name) => /^LICENSE(?:\..*)?$/iu.test(name)));
+  for (const relative of files) {
     const destination = path.join(stage, relative);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.copyFileSync(path.join(root, relative), destination);
   }
 }
 
-function run(command, args) {
-  const result = spawnSync(command, args, { cwd: root, encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+function normalizeStageTimestamps(directory) {
+  const fixedTime = new Date(Date.UTC(1980, 0, 1, 0, 0, 0));
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) normalizeStageTimestamps(entryPath);
+    fs.utimesSync(entryPath, fixedTime, fixedTime);
+  }
+  fs.utimesSync(directory, fixedTime, fixedTime);
+}
+
+function normalizeArchiveTimestamps(artifact) {
+  const extracted = fs.mkdtempSync(path.join(os.tmpdir(), "vesper-vsix-normalize-"));
+  const normalized = path.join(path.dirname(artifact), `.vesper-normalized-${process.pid}-${Date.now()}.vsix`);
+  const fixedTime = new Date(Date.UTC(1980, 0, 1, 0, 0, 0));
+  try {
+    run("unzip", ["-q", artifact, "-d", extracted]);
+    const files = [];
+    function walk(directory, relative = "") {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+        const entryPath = path.join(directory, entry.name);
+        const entryRelative = path.posix.join(relative, entry.name);
+        if (entry.isDirectory()) walk(entryPath, entryRelative);
+        else {
+          fs.utimesSync(entryPath, fixedTime, fixedTime);
+          files.push(entryRelative);
+        }
+      }
+    }
+    walk(extracted);
+    const zipped = spawnSync("zip", ["-X", "-q", normalized, "-@"], {
+      cwd: extracted, encoding: "utf8", input: `${files.join("\n")}\n`, timeout: 120_000,
+      maxBuffer: 2 * 1024 * 1024, windowsHide: true, env: { ...process.env, TZ: "UTC" },
+    });
+    if (zipped.error || zipped.status !== 0 || !fs.existsSync(normalized)) {
+      throw new Error(`zip normalization failed (${zipped.error?.code || zipped.status}): ${(zipped.stderr || "").trim()}`);
+    }
+    fs.renameSync(normalized, artifact);
+  } finally {
+    fs.rmSync(normalized, { force: true });
+    fs.rmSync(extracted, { recursive: true, force: true });
+  }
+}
+
+function run(command, args, cwd = root) {
+  const result = spawnSync(command, args, { cwd, encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
   if (result.error || result.status !== 0) {
     const error = result.error?.code || `exit ${result.status}`;
     throw new Error(`${command} ${args[0]} failed (${error}): ${(result.stderr || "").trim().slice(-1_000)}`);

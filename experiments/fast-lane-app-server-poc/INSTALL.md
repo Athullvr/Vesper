@@ -89,6 +89,14 @@ npm run package:vsix
 
 The generated artifact is `.audit-artifacts/vesper-preview-VERSION.vsix`. `package:vsix` stages only runtime files and preview documentation, then inspects the VSIX archive and manifest. The pinned `@vscode/vsce` 3.6.0 toolchain is isolated under `tooling/vsce` and is excluded from user packages. Its packager requires Node.js 20 or newer.
 
+To assemble the npm tarball, VSIX, tester documents, and SHA-256 checksums into a single local candidate kit, run:
+
+```sh
+npm run package:preview
+```
+
+The output is `.audit-artifacts/vesper-private-preview-VERSION.tar.gz`. The helper uses GNU `tar` and `gzip`, plus `zip`/`unzip` for normalized VSIX creation; it has only been verified on Linux x64 with Node.js 20.18.0. VSIX and outer archive timestamps are normalized for repeatable same-toolchain builds. It marks the current package as blocked while owner identity/license fields are unresolved. Building the kit does not authorize sharing it.
+
 For a clean installation, use dedicated extension and user-data directories so the normal VS Code profile is untouched:
 
 ```sh
@@ -100,7 +108,7 @@ code --list-extensions --show-versions \
   --extensions-dir /tmp/vesper-preview-code-extensions
 ```
 
-Then open that profile with the disposable project and run **Vesper: Open Panel** from the Command Palette. The extension contributes no VS Code settings; Codex remains the default unless `VESPER_PROVIDER` selects another configured provider. Extension-host activation and authenticated tasks are reported separately from packaging and VSIX installation. The release check installs into temporary directories and skips graphical activation if it cannot launch a desktop host.
+Then open that profile with the disposable project and run **Vesper: Open Panel** from the Command Palette. To suppress VS Code telemetry, updates, and experiments during a manual check, add `--disable-telemetry --disable-updates --disable-experiments` to the launch command; VS Code may still make other product metadata requests. The extension contributes no VS Code settings; Codex remains the default unless `VESPER_PROVIDER` selects another configured provider. Extension-host activation and authenticated tasks are reported separately from packaging and VSIX installation. See `PREVIEW-VALIDATION-CHECKLIST.md` for the manual behavior checks.
 
 ## Troubleshooting
 

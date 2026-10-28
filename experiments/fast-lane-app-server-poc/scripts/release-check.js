@@ -127,6 +127,7 @@ try {
   }
 
   checkVsixPackaging(temp);
+  checkPrivatePreviewKit(temp);
   skip("VS Code Extension Development Host activation", "requires launching a graphical VS Code host; mocked activation and routing tests are in the regression suite");
 } finally {
   fs.rmSync(temp, { recursive: true, force: true });
@@ -234,6 +235,24 @@ function checkVsixPackaging(directory) {
         !list.stdout.toLowerCase().split(/\r?\n/u).some((line) => line.startsWith(`${identifier}@${manifest.version}`))) {
       fail(`VS Code's isolated extension inventory did not contain ${identifier}@${manifest.version}.`, list.stdout);
     }
+  }
+}
+
+function checkPrivatePreviewKit(directory) {
+  const localVsce = path.join(root, "tooling", "vsce", "node_modules", ".bin", process.platform === "win32" ? "vsce.cmd" : "vsce");
+  const vsce = process.env.VESPER_VSCE_BIN || (fs.existsSync(localVsce) ? localVsce : "vsce");
+  const version = runCommand(vsce, ["--version"], { maxBuffer: 64 * 1024 });
+  if (version.status !== 0 || version.error) {
+    skip("Private preview kit", "the pinned @vscode/vsce packager is unavailable");
+    return;
+  }
+  const artifact = path.join(directory, `vesper-private-preview-${process.versions.node}.tar.gz`);
+  const result = runCommand(process.execPath, ["scripts/package-preview.js", artifact], {
+    env: { VESPER_VSCE_BIN: vsce }, maxBuffer: 4 * 1024 * 1024,
+  });
+  if (report("Private preview kit build and inspection", result)) {
+    if (!fs.existsSync(artifact) || fs.statSync(artifact).size === 0) fail("Preview kit builder returned success without creating a non-empty archive.");
+    else process.stdout.write(`PASS Private preview candidate artifact · ${fs.statSync(artifact).size} bytes · kept inside release-check temp directory\n`);
   }
 }
 

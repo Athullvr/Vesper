@@ -390,7 +390,7 @@ Audit records retain at most 50 structured state events with tool ID, Vesper ses
 
 ## VS Code extension
 
-This source folder is directly loadable as a VS Code extension: `package.json` points to `extension.js`. No build step is required. Run `npm run package:vsix` from the source checkout to create and inspect a VSIX; it remains local and is not published to the Marketplace. `INSTALL.md` documents an isolated extension-directory install; `PREVIEW-GUIDE.md` describes the developer preview.
+This source folder is directly loadable as a VS Code extension: `package.json` points to `extension.js`. No build step is required. Run `npm run package:vsix` from the source checkout to create and inspect a VSIX; it remains local and is not published to the Marketplace. `npm run package:preview` assembles the CLI tarball, VSIX, guide, manual validation checklist, and feedback template into one local candidate kit. The kit is not cleared for external distribution while owner identity or license decisions are pending. `INSTALL.md` documents an isolated extension-directory install; `PREVIEW-GUIDE.md` describes first use and `PREVIEW-VALIDATION-CHECKLIST.md` gives the manual test procedure.
 
 For an isolated run, start it from a desktop terminal outside any restricted Linux command sandbox, from this repository directory. The fixture and dedicated homes are prepared by the integration procedure above; the VS Code profile and extension directories are also kept under the ignored `.audit-artifacts` directory:
 

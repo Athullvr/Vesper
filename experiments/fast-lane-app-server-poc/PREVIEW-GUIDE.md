@@ -70,3 +70,5 @@ The VS Code panel can inspect and discuss a project, but its current Codex polic
 - This checkout has no root `LICENSE` file or package license declaration. The VSIX packager warns about this; do not publish or redistribute the artifact until the project license is decided.
 
 For a reproducible bug report, copy [PREVIEW-FEEDBACK.md](PREVIEW-FEEDBACK.md), remove private paths and source, and never include keys, tokens, or request headers.
+
+For the isolated VS Code interaction, approval-boundary, provider-failure, and shutdown checks, use [PREVIEW-VALIDATION-CHECKLIST.md](PREVIEW-VALIDATION-CHECKLIST.md). Return results only with the tester's explicit consent.
