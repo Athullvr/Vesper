@@ -1425,7 +1425,7 @@ function getHtml(webview) {
         setBusy(false);
       }
       if (message.type === 'error') {
-        addMessage('assistant', (message.label || 'Fast Lane') + ' · ' + message.elapsedMs + ' ms', message.text);
+        addMessage('assistant', (message.label || 'Vesper') + ' · ' + message.elapsedMs + ' ms', message.text);
         setBusy(false);
       }
       if (message.type === 'input-error') {

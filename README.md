@@ -52,6 +52,6 @@ npm run evaluate:system-model
 npm run release:check
 ```
 
-The release check tests the npm artifact from a clean temporary prefix and runs repository inspection from that installation. It reports VSIX packaging or graphical extension activation as skipped when the required tools or host are unavailable. See [developer task workflow](experiments/fast-lane-app-server-poc/DEVELOPER-WORKFLOW.md) and [reliability audit](experiments/fast-lane-app-server-poc/RELIABILITY-AUDIT.md) for behavior and validation limits.
+The release check tests clean npm and VSIX installs when the packager is available. See the [external preview guide](experiments/fast-lane-app-server-poc/PREVIEW-GUIDE.md), [provider validation procedure](experiments/fast-lane-app-server-poc/PROVIDER-LIVE-VALIDATION.md), and [feedback template](experiments/fast-lane-app-server-poc/PREVIEW-FEEDBACK.md). The [developer task workflow](experiments/fast-lane-app-server-poc/DEVELOPER-WORKFLOW.md) describes behavior and validation limits.
 
 When reporting a bug, include the command and arguments, Node/Git/Codex/VS Code versions from `vesper doctor`, expected and observed results, and a minimal reproducible project. Remove credentials, tokens, private source, and private repository paths from logs before sharing them.

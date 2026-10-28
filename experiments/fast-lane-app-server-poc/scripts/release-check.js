@@ -189,21 +189,63 @@ function verifyPackContents(packagedPaths) {
 }
 
 function checkVsixPackaging(directory) {
-  const version = runCommand("vsce", ["--version"], { maxBuffer: 64 * 1024 });
+  const localVsce = path.join(root, "tooling", "vsce", "node_modules", ".bin", process.platform === "win32" ? "vsce.cmd" : "vsce");
+  const vsce = process.env.VESPER_VSCE_BIN || (fs.existsSync(localVsce) ? localVsce : "vsce");
+  const version = runCommand(vsce, ["--version"], { maxBuffer: 64 * 1024 });
   if (version.status !== 0 || version.error?.code === "ENOENT") {
-    skip("VSIX packaging", "@vscode/vsce is not installed in this environment");
+    skip("VSIX packaging and isolated installation", "set VESPER_VSCE_BIN to an installed @vscode/vsce executable");
     return;
   }
   if (version.error) {
     skip("VSIX packaging", `vsce could not be launched (${version.error.code || "environment error"})`);
     return;
   }
-  const artifact = path.join(directory, "vesper.vsix");
-  const packageResult = runCommand("vsce", ["package", "--no-dependencies", "--out", artifact]);
+  const artifact = path.join(directory, "vesper-preview.vsix");
+  const packageResult = runCommand(process.execPath, ["scripts/package-vsix.js", artifact], {
+    env: { VESPER_VSCE_BIN: vsce }, maxBuffer: 2 * 1024 * 1024,
+  });
   if (report("VSIX packaging", packageResult)) {
-    if (!fs.existsSync(artifact) || fs.statSync(artifact).size === 0) fail("VSIX packager returned success without creating a non-empty artifact.");
-    else process.stdout.write(`PASS VSIX artifact · ${fs.statSync(artifact).size} bytes\n`);
+    if (!fs.existsSync(artifact) || fs.statSync(artifact).size === 0) {
+      fail("VSIX packager returned success without creating a non-empty artifact.");
+      return;
+    }
+    process.stdout.write(`PASS VSIX archive inspection · ${fs.statSync(artifact).size} bytes\n`);
+    const code = process.env.VESPER_CODE_BIN || "code";
+    const codeVersion = runCommand(code, ["--version"], { maxBuffer: 64 * 1024 });
+    if (codeVersion.status !== 0 || codeVersion.error) {
+      skip("VSIX installation", "VS Code CLI is unavailable; archive contents were still inspected");
+      return;
+    }
+    const userData = path.join(directory, "vscode-user-data");
+    const extensions = path.join(directory, "vscode-extensions");
+    fs.mkdirSync(userData, { recursive: true });
+    fs.mkdirSync(extensions, { recursive: true });
+    writeIsolatedVsCodeSettings(userData);
+    const install = runCommand(code, ["--install-extension", artifact, "--user-data-dir", userData, "--extensions-dir", extensions], {
+      env: { VSCODE_IPC_HOOK_CLI: "", VSCODE_PID: "" }, maxBuffer: 2 * 1024 * 1024,
+    });
+    if (!report("VSIX install into isolated VS Code directories", install)) return;
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+    const identifier = `${manifest.publisher}.${manifest.name}`.toLowerCase();
+    const list = runCommand(code, ["--list-extensions", "--show-versions", "--user-data-dir", userData, "--extensions-dir", extensions], {
+      env: { VSCODE_IPC_HOOK_CLI: "", VSCODE_PID: "" }, maxBuffer: 512 * 1024,
+    });
+    if (report("VSIX appears in isolated VS Code extension inventory", list) &&
+        !list.stdout.toLowerCase().split(/\r?\n/u).some((line) => line.startsWith(`${identifier}@${manifest.version}`))) {
+      fail(`VS Code's isolated extension inventory did not contain ${identifier}@${manifest.version}.`, list.stdout);
+    }
   }
+}
+
+function writeIsolatedVsCodeSettings(userData) {
+  const settingsDirectory = path.join(userData, "User");
+  fs.mkdirSync(settingsDirectory, { recursive: true });
+  fs.writeFileSync(path.join(settingsDirectory, "settings.json"), `${JSON.stringify({
+    "telemetry.telemetryLevel": "off",
+    "workbench.enableExperiments": false,
+    "extensions.autoCheckUpdates": false,
+    "extensions.autoUpdate": false,
+  }, null, 2)}\n`);
 }
 
 function skip(label, reason) {

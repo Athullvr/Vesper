@@ -5,9 +5,11 @@ Vesper is a local-first coding-agent interface with two frontends over the same 
 - A VS Code extension panel that answers explicit Git and test-evidence questions locally and sends other prompts to the selected execution provider.
 - A terminal CLI named `vesper` with local-first repository inspection and provider-backed coding sessions.
 
-The package uses Node.js built-ins, Git, the VS Code Extension API, and (for the default provider) the installed Codex CLI. It has no npm runtime dependencies. The [installation guide](INSTALL.md) covers first run, provider configuration, diagnostics, privacy, reset, and uninstall.
+The package uses Node.js built-ins, Git, the VS Code Extension API, and (for the default provider) the installed Codex CLI. It has no npm runtime dependencies. `INSTALL.md` covers first run, provider configuration, diagnostics, privacy, reset, and uninstall.
 
-The [developer task workflow](DEVELOPER-WORKFLOW.md) documents the shared terminal/VS Code lifecycle, status rules, one-time approval gates, `:verify`, the deterministic multi-package scenario, and the current host/sandbox limitations.
+`DEVELOPER-WORKFLOW.md` documents the shared terminal/VS Code lifecycle, status rules, one-time approval gates, `:verify`, the deterministic multi-package scenario, and the current host/sandbox limitations.
+
+New external developers should start with `PREVIEW-GUIDE.md` and use `PREVIEW-FEEDBACK.md`. Live OpenAI/NVIDIA checks are opt-in; see `PROVIDER-LIVE-VALIDATION.md`.
 
 From the source checkout, `npm run test:pty` exercises the CLI lifecycle in a pseudo-terminal. Test files and benchmark fixtures are deliberately omitted from the packed runtime installation.
 
@@ -29,7 +31,7 @@ npm run cli -- inspect "Trace handleCheckout" --project /path/to/project
 vesper inspect "Trace handleCheckout" --project /path/to/project
 ```
 
-Setup and doctor are read-only and do not validate remote credentials. The default Codex integration uses Codex CLI authentication and does not require an API key. Optional OpenAI and NVIDIA API setup is documented in [INSTALL.md](INSTALL.md).
+Setup and doctor are read-only and do not validate remote credentials. The default Codex integration uses Codex CLI authentication and does not require an API key. Optional OpenAI and NVIDIA API setup is documented in `INSTALL.md`.
 
 The default launch resumes the most recently updated Vesper session for that exact canonical project, or creates one if none exists. Use `vesper --new` to create a separate session. `vesper run` is an explicit alias for the normal terminal workflow.
 
@@ -388,7 +390,7 @@ Audit records retain at most 50 structured state events with tool ID, Vesper ses
 
 ## VS Code extension
 
-This source folder is directly loadable as a VS Code extension: `package.json` points to the existing `extension.js` entry point. No build step is required. VSIX packaging is optional and has not been validated; use the release-check workflow to see whether `vsce` is available in the current environment. There is no checked-in `.vscode/launch.json`, so use the command below instead of relying on `F5` to select an extension-host configuration.
+This source folder is directly loadable as a VS Code extension: `package.json` points to `extension.js`. No build step is required. Run `npm run package:vsix` from the source checkout to create and inspect a VSIX; it remains local and is not published to the Marketplace. `INSTALL.md` documents an isolated extension-directory install; `PREVIEW-GUIDE.md` describes the developer preview.
 
 For an isolated run, start it from a desktop terminal outside any restricted Linux command sandbox, from this repository directory. The fixture and dedicated homes are prepared by the integration procedure above; the VS Code profile and extension directories are also kept under the ignored `.audit-artifacts` directory:
 
@@ -448,4 +450,4 @@ For terminal fallback, submit `Explain what a Git rebase does in one sentence.` 
 - The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and the request is reported as an error. Another fallback tries to resume the same saved thread; it never silently starts a replacement conversation.
 - Local Git checks do not fetch or contact a remote. Their results are bounded by local repository evidence and its freshness.
 - Upstream freshness uses the tracking ref's latest recorded reflog update (`%gD` with `--date=raw`), not the referenced commit's date. Missing or invalid reflog evidence leaves freshness unknown, even when the local ahead count is confirmed. An unchanged fetch need not add a reflog entry; a recent entry never confirms live remote state.
-- Uninstalling the npm package removes the CLI and extension files only; it leaves Vesper session/history data and project data in place. See [INSTALL.md](INSTALL.md) for uninstall and reset guidance. Vesper runtime use does not add project dependencies or project configuration automatically.
+- Uninstalling the npm package removes the CLI and extension files only; it leaves Vesper session/history data and project data in place. See `INSTALL.md` for uninstall and reset guidance. Vesper runtime use does not add project dependencies or project configuration automatically.

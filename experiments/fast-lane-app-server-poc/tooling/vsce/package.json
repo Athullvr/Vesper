@@ -1,0 +1,12 @@
+{
+  "name": "vesper-vsix-packager-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned, isolated tooling for building the Vesper VSIX preview artifact.",
+  "devDependencies": {
+    "@vscode/vsce": "3.6.0"
+  },
+  "overrides": {
+    "cheerio": "1.0.0"
+  }
+}

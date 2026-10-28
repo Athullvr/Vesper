@@ -80,13 +80,27 @@ Command execution is disabled by default. The optional sandbox backend only supp
 
 ## VS Code extension
 
-From the package directory, launch an Extension Development Host:
+Package the extension from a source checkout. The packager is installed into a separate tooling prefix, not as a runtime dependency or into users' projects:
 
 ```sh
-code --extensionDevelopmentPath="$PWD"
+npm ci --prefix tooling/vsce --ignore-scripts --no-audit --no-fund
+npm run package:vsix
 ```
 
-In the new window, run **Vesper: Open Panel** from the Command Palette. This requires the `code` CLI. The VS Code API tests are mocked; the extension host has not been launched as part of the release check. The `@vscode/vsce` tool is not a runtime dependency; `npm run release:check` reports VSIX packaging as skipped when `vsce` is unavailable.
+The generated artifact is `.audit-artifacts/vesper-preview-VERSION.vsix`. `package:vsix` stages only runtime files and preview documentation, then inspects the VSIX archive and manifest. The pinned `@vscode/vsce` 3.6.0 toolchain is isolated under `tooling/vsce` and is excluded from user packages. Its packager requires Node.js 20 or newer.
+
+For a clean installation, use dedicated extension and user-data directories so the normal VS Code profile is untouched:
+
+```sh
+code --install-extension .audit-artifacts/vesper-preview-VERSION.vsix \
+  --user-data-dir /tmp/vesper-preview-code-data \
+  --extensions-dir /tmp/vesper-preview-code-extensions
+code --list-extensions --show-versions \
+  --user-data-dir /tmp/vesper-preview-code-data \
+  --extensions-dir /tmp/vesper-preview-code-extensions
+```
+
+Then open that profile with the disposable project and run **Vesper: Open Panel** from the Command Palette. The extension contributes no VS Code settings; Codex remains the default unless `VESPER_PROVIDER` selects another configured provider. Extension-host activation and authenticated tasks are reported separately from packaging and VSIX installation. The release check installs into temporary directories and skips graphical activation if it cannot launch a desktop host.
 
 ## Troubleshooting
 
@@ -102,6 +116,8 @@ In the new window, run **Vesper: Open Panel** from the Command Palette. This req
 ## Upgrade, reset, and uninstall
 
 Upgrades replace the CLI/extension package only. Vesper does not keep provider settings in a Vesper config file: provider selection and OpenAI/NVIDIA values come from the process environment, and the Codex CLI manages its own config and authentication. Setup never overwrites either source.
+
+The current npm slug `fast-lane-app-server-poc` and publisher `local-experiment` are development placeholders awaiting final identity approval; this repository has not published the npm package or Marketplace extension. If the approved identity changes, remove a local global CLI install with `npm uninstall --global fast-lane-app-server-poc`, then install the renamed package or checkout. The `vesper` command and `VESPER_HOME` data location remain unchanged. If the old local VSIX is installed, remove `local-experiment.fast-lane-app-server-poc` with `code --uninstall-extension local-experiment.fast-lane-app-server-poc` before installing the new VSIX. These steps do not remove sessions, Codex authentication, or project files.
 
 By default, Vesper’s session metadata and provider conversation history live under `~/.vesper/sessions/`; set `VESPER_HOME` to use a different root. These files are outside project directories. Uninstalling the package leaves this state and all project data in place.
 
@@ -123,6 +139,6 @@ npm run evaluate:system-model
 npm run release:check
 ```
 
-`release:check` runs syntax checks, provider and approval regressions, the full suite, the offline System Model evaluation, package-content checks, an offline global install from the generated tarball, and a repository inspection from that installed CLI. It records unavailable VSIX/GUI checks as skipped rather than passed.
+`release:check` runs syntax checks, provider and approval regressions, the full suite, the offline System Model evaluation, npm package-content checks, clean npm installs, and packaged CLI inspection. When `VESPER_VSCE_BIN` is set, it also packages and inspects a VSIX and installs it into isolated VS Code directories. Graphical extension activation is a separate desktop check and is never inferred from installation.
 
 For a reproducible bug report, include the exact command and arguments, relevant version output from `vesper doctor`, expected and observed results, and the smallest project that reproduces it. Redact keys, tokens, private paths, and private source before sharing logs.

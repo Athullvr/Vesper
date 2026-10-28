@@ -1,2 +1,3 @@
 /.fast-lane-test-result.json
 /.audit-artifacts/
+/tooling/vsce/node_modules/
