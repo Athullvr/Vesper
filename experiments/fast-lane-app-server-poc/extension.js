@@ -587,6 +587,7 @@ async function runInspectionCommand(context, mode) {
     return;
   }
   if (typeof value !== "string" || !value.trim()) return;
+  if (panel !== targetPanel) return;
   const latestProject = selectedProjectContext();
   if (!latestProject.available || latestProject.path !== project.path) {
     postToPanel(targetPanel, { type: "status", text: "The selected workspace changed. Repository investigation was not started." });
@@ -784,7 +785,7 @@ async function switchSavedSession(targetPanel = panel) {
   if (!picked) return;
   try {
     const currentProject = selectedProjectContext();
-    if (!currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
+    if (panel !== targetPanel || !currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
       postToPanel(targetPanel, { type: "status", text: "The project or active task changed while the session picker was open. No session was switched." });
       return;
     }
@@ -877,7 +878,7 @@ async function createSessionWithProvider(targetPanel = panel) {
     }
   }
   const currentProject = selectedProjectContext();
-  if (!currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
+  if (panel !== targetPanel || !currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
     postToPanel(targetPanel, { type: "status", text: "The project or active task changed while provider selection was open. No session was created." });
     return;
   }
