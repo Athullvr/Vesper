@@ -1,6 +1,6 @@
 const vscode = require("vscode");
 const { execFile } = require("node:child_process");
-const { randomBytes } = require("node:crypto");
+const { randomBytes, randomUUID } = require("node:crypto");
 const path = require("node:path");
 const { performance } = require("node:perf_hooks");
 const { DEFAULT_PROVIDER_ID, NVIDIA_PROVIDER_ID, OPENAI_PROVIDER_ID, createExecutionProvider, getProviderStatus, listProviders, resolveDefaultProviderId } = require("./execution-provider");
@@ -14,7 +14,7 @@ const { createCapabilityPlan, getPlanningMetadata, renderCapabilityPlan } = requ
 const { unavailableHistory } = require("./conversation-history");
 const { createPermissionedToolRuntime } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
-const { createSystemModel, shouldInvestigateTask } = require("./system-model");
+const { createSystemModel, isComplexInvestigation, isModelAssistedEnabled, renderSystemModelReport, shouldInvestigateTask } = require("./system-model");
 const { TaskLifecycle, understandTask, captureWorkspaceDiff } = require("./task-workflow");
 const { redactSensitiveText } = require("./command-activity");
 
@@ -43,6 +43,7 @@ let historyLoadSequence = 0;
 let historyLoadingSessionId;
 let deferredHistoryRestore = false;
 let activeRepositoryPreflight;
+let activeRepositoryInspection;
 let repositoryToolRuntimeFactory = createPermissionedToolRuntime;
 const capabilityProviders = new Map();
 
@@ -56,12 +57,17 @@ function activate(context, dependencies = {}) {
 
   context.subscriptions.push(
     output,
+    vscode.commands.registerCommand("fastLane.inspectRepository", () => runInspectionCommand(context, "inspect")),
+    vscode.commands.registerCommand("fastLane.assessChangeImpact", () => runInspectionCommand(context, "impact")),
+    vscode.commands.registerCommand("fastLane.switchSession", () => runSessionCommand(context)),
+    vscode.commands.registerCommand("fastLane.newSessionWithProvider", () => runProviderSessionCommand(context)),
     vscode.commands.registerCommand("fastLane.openPanel", () => openPanel(context)),
     { dispose: () => disposeCurrentAppServer() }
   );
 }
 
 function deactivate() {
+  cancelActiveRepositoryInspection();
   cancelActiveRepositoryPreflight();
   disposeCurrentAppServer();
   repositoryToolRuntimeFactory = createPermissionedToolRuntime;
@@ -70,7 +76,7 @@ function deactivate() {
 function openPanel(context) {
   if (panel) {
     panel.reveal(vscode.ViewColumn.Beside);
-    return;
+    return panel;
   }
 
   panel = vscode.window.createWebviewPanel(
@@ -83,7 +89,10 @@ function openPanel(context) {
   panel.webview.html = getHtml(panel.webview);
 
   panel.onDidDispose(() => {
-    if (panel === currentPanel) panel = undefined;
+    if (panel === currentPanel) {
+      panel = undefined;
+      if (activeRepositoryInspection) cancelActiveRepositoryInspection();
+    }
   }, null, context.subscriptions);
 
   panel.webview.onDidReceiveMessage(async (message) => {
@@ -110,6 +119,21 @@ function openPanel(context) {
       return;
     }
 
+    if (message?.type === "repository-inspection" && typeof message.task === "string") {
+      await runRepositoryInspection(message.task, message.intent, currentPanel);
+      return;
+    }
+
+    if (message?.type === "switch-session") {
+      await switchSavedSession(currentPanel);
+      return;
+    }
+
+    if (message?.type === "new-session-with-provider") {
+      await createSessionWithProvider(currentPanel);
+      return;
+    }
+
     if (message?.type === "select-project") {
       await selectProject(currentPanel);
       return;
@@ -129,6 +153,7 @@ function openPanel(context) {
       await interruptRequest(message.requestId, currentPanel);
     }
   }, undefined, context.subscriptions);
+  return currentPanel;
 }
 
 async function handlePrompt(prompt, targetPanel = panel) {
@@ -136,7 +161,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
     postToPanel(targetPanel, { type: "input-error", text: `Enter a task between 1 and ${MAX_PROMPT_LENGTH.toLocaleString()} characters.` });
     return;
   }
-  if (activeCodexRequestId !== undefined) return;
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection) return;
   const requestId = ++requestSequence;
   const startedAt = performance.now();
   const project = selectedProjectContext();
@@ -534,6 +559,331 @@ async function previewPlan(task, targetPanel = panel) {
   }
 }
 
+async function runInspectionCommand(context, mode) {
+  const targetPanel = openPanel(context);
+  ensureInitialProjectSelection();
+  postToPanel(targetPanel, projectMessage());
+  const project = selectedProjectContext();
+  if (!project.available) {
+    postToPanel(targetPanel, { type: "status", text: "Open or choose an available workspace folder before investigating it." });
+    return;
+  }
+  if (typeof vscode.window.showInputBox !== "function") {
+    postToPanel(targetPanel, { type: "status", text: "Repository investigation input is unavailable in this VS Code version." });
+    return;
+  }
+  const selection = vscode.window.activeTextEditor?.document?.getText?.(vscode.window.activeTextEditor.selection)?.trim() || "";
+  const isImpact = mode === "impact";
+  let value;
+  try {
+    value = await vscode.window.showInputBox({
+      prompt: isImpact ? "Describe the proposed change or symbol to assess" : "Ask a read-only question about this repository",
+      placeHolder: isImpact ? "Rename parseConfig and identify likely callers, tests, and dependencies" : "Explain this repository, locate an entry point, or trace a function",
+      value: selection ? (isImpact ? `Assess the change impact of ${selection}` : `Trace ${selection}`) : "",
+      ignoreFocusOut: true,
+    });
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Could not open repository investigation input: ${safeMessage(error)}` });
+    return;
+  }
+  if (typeof value !== "string" || !value.trim()) return;
+  const latestProject = selectedProjectContext();
+  if (!latestProject.available || latestProject.path !== project.path) {
+    postToPanel(targetPanel, { type: "status", text: "The selected workspace changed. Repository investigation was not started." });
+    return;
+  }
+  const task = isImpact && !/\bimpact\b/iu.test(value) ? `Assess the change impact of ${value.trim()}` : value.trim();
+  await runRepositoryInspection(task, isImpact ? "impact" : "inspect", targetPanel);
+}
+
+async function runRepositoryInspection(task, mode = "inspect", targetPanel = panel) {
+  if (typeof task !== "string" || !task.trim() || task.length > MAX_PROMPT_LENGTH) {
+    postToPanel(targetPanel, { type: "repository-inspection-error", text: `Enter a repository question between 1 and ${MAX_PROMPT_LENGTH.toLocaleString()} characters.` });
+    return;
+  }
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection) {
+    postToPanel(targetPanel, { type: "status", text: "Wait for the active Vesper operation to finish before starting another." });
+    return;
+  }
+  const project = selectedProjectContext();
+  if (!project.available) {
+    postToPanel(targetPanel, { type: "repository-inspection-error", text: "Choose an available workspace folder before starting a repository investigation." });
+    return;
+  }
+
+  const query = mode === "impact" && !/\bimpact\b/iu.test(task) ? `Assess the change impact of ${task.trim()}` : task.trim();
+  const requestId = ++requestSequence;
+  const generation = projectGeneration;
+  const controller = new AbortController();
+  const inspection = { requestId, controller, systemModel: null, projectPath: project.path, generation };
+  activeRepositoryInspection = inspection;
+  postToPanel(targetPanel, { type: "repository-inspection-start", requestId, mode: mode === "impact" ? "impact" : "inspect" });
+  writeLog(`request=${requestId} repository_inspection=started mode=${mode === "impact" ? "impact" : "inspect"}`);
+
+  let runtime;
+  let planner;
+  let ownsPlanner = false;
+  try {
+    const session = selectedSession?.cwd === project.path ? selectedSession : null;
+    const providerId = session?.providerId || resolveDefaultProviderId(process.env);
+    const sessionId = randomUUID();
+    const runtimeOptions = {
+      projectRoot: project.path,
+      sessionId,
+      commandExecutionEnabled: false,
+      commandWorkspaceWriteEnabled: false,
+    };
+    runtime = await repositoryToolRuntimeFactory(runtimeOptions);
+    if (!runtime || runtime.sessionId !== sessionId) throw new Error("Vesper could not bind the read-only inspection runtime to its session.");
+
+    const modelPlanningRequested = isModelAssistedEnabled(process.env) && isComplexInvestigation(query) &&
+      [OPENAI_PROVIDER_ID, NVIDIA_PROVIDER_ID].includes(providerId);
+    if (modelPlanningRequested) {
+      try {
+        planner = createExecutionProvider({
+          providerId,
+          environment: process.env,
+          ...(session?.modelId ? { modelId: session.modelId } : {}),
+        });
+        ownsPlanner = true;
+        if (typeof planner?.planInvestigation !== "function") {
+          try { await planner?.dispose?.(); } catch { /* Provider discovery must not hide the local investigation. */ }
+          planner = null;
+          ownsPlanner = false;
+        }
+      } catch {
+        planner = null;
+      }
+    }
+
+    const repositoryIntelligence = createRepositoryIntelligence({
+      toolRuntime: runtime,
+      projectRoot: project.path,
+      sessionId,
+      providerId,
+      getConversationId: () => session?.providerConversationId || null,
+    });
+    const systemModel = createSystemModel({
+      repositoryIntelligence,
+      planner,
+      plannerUnavailableReason: modelPlanningRequested && !planner ? "selected-provider-setup-unavailable" : null,
+      environment: process.env,
+    });
+    inspection.systemModel = systemModel;
+    const result = await systemModel.investigate({ task: query, signal: controller.signal });
+    if (!isCurrentInspection(inspection)) {
+      if (activeRepositoryInspection === inspection) {
+        postToPanel(targetPanel, {
+          type: "repository-inspection-error",
+          requestId,
+          state: controller.signal.aborted ? "cancelled" : "stale",
+          text: controller.signal.aborted
+            ? "Repository investigation cancelled. No project files were changed and no provider coding task was submitted."
+            : "The selected project changed during investigation. Vesper discarded the stale report; no provider coding task was submitted.",
+        });
+      }
+      return;
+    }
+    const renderedReport = renderSystemModelReport(result);
+    const report = renderedReport.length > 32 * 1024
+      ? renderedReport.slice(0, 32 * 1024 - 32) + "\n[report display truncated by Vesper]\n"
+      : renderedReport;
+    postToPanel(targetPanel, {
+      type: "repository-inspection-result",
+      requestId,
+      mode: mode === "impact" ? "impact" : "inspect",
+      status: result.status || "unknown",
+      report,
+    });
+    writeLog(`request=${requestId} repository_inspection=${result.status || "unknown"} findings=${result.findings?.length || 0}`);
+  } catch (error) {
+    if (activeRepositoryInspection !== inspection) return;
+    const cancelled = controller.signal.aborted || error?.name === "AbortError";
+    postToPanel(targetPanel, {
+      type: "repository-inspection-error",
+      requestId,
+      state: cancelled ? "cancelled" : "failed",
+      text: cancelled ? "Repository investigation cancelled. No project files were changed and no provider coding task was submitted." : `Repository investigation failed: ${safeMessage(error)}`,
+    });
+    writeLog(`request=${requestId} repository_inspection=${cancelled ? "cancelled" : "failed"} code=${safeErrorCode(error)}`);
+  } finally {
+    try { await runtime?.dispose?.(); } catch { /* Inspection cleanup does not alter its report. */ }
+    if (ownsPlanner) {
+      try { await planner?.dispose?.(); } catch { /* Planner cleanup does not alter local findings. */ }
+    }
+    if (activeRepositoryInspection === inspection) activeRepositoryInspection = undefined;
+  }
+}
+
+function isCurrentInspection(inspection) {
+  const project = selectedProjectContext();
+  return activeRepositoryInspection === inspection && projectGeneration === inspection.generation &&
+    project.available && project.path === inspection.projectPath;
+}
+
+function cancelActiveRepositoryInspection() {
+  const inspection = activeRepositoryInspection;
+  if (!inspection) return false;
+  inspection.controller.abort("repository-inspection-cancelled");
+  try { Promise.resolve(inspection.systemModel?.interrupt?.()).catch(() => undefined); } catch { /* Cancellation remains best-effort. */ }
+  return true;
+}
+
+function runSessionCommand(context) {
+  const targetPanel = openPanel(context);
+  ensureInitialProjectSelection();
+  postToPanel(targetPanel, projectMessage());
+  return switchSavedSession(targetPanel);
+}
+
+function runProviderSessionCommand(context) {
+  const targetPanel = openPanel(context);
+  ensureInitialProjectSelection();
+  postToPanel(targetPanel, projectMessage());
+  return createSessionWithProvider(targetPanel);
+}
+
+async function switchSavedSession(targetPanel = panel) {
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection) {
+    postToPanel(targetPanel, { type: "status", text: "Wait for the active Vesper operation to finish before switching sessions." });
+    return;
+  }
+  const project = selectedProjectContext();
+  if (!project.available) {
+    postToPanel(targetPanel, { type: "status", text: "Choose an available workspace folder before switching sessions." });
+    return;
+  }
+  if (typeof vscode.window.showQuickPick !== "function") {
+    postToPanel(targetPanel, { type: "status", text: "Saved session selection is unavailable in this VS Code version." });
+    return;
+  }
+  let sessions;
+  try {
+    sessions = sessionStore.listByCwd(project.path);
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Could not list saved sessions: ${safeMessage(error)}` });
+    return;
+  }
+  if (!sessions.length) {
+    postToPanel(targetPanel, { type: "status", text: "This project has no saved Vesper sessions yet." });
+    return;
+  }
+  const items = sessions.map((session) => ({
+    label: `${providerDisplayName(session.providerId)}${session.modelId ? ` · ${session.modelId}` : ""}`,
+    description: `${session.status === "recovery-required" ? "recovery required" : session.providerConversationId ? "saved conversation" : "new conversation"} · updated ${new Date(session.updatedAt).toLocaleString()}`,
+    detail: session.sessionId,
+    sessionId: session.sessionId,
+  }));
+  let picked;
+  try {
+    picked = await vscode.window.showQuickPick(items, { placeHolder: "Choose a saved Vesper session for this project", matchOnDetail: true });
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Session selection failed: ${safeMessage(error)}` });
+    return;
+  }
+  if (!picked) return;
+  try {
+    const currentProject = selectedProjectContext();
+    if (!currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
+      postToPanel(targetPanel, { type: "status", text: "The project or active task changed while the session picker was open. No session was switched." });
+      return;
+    }
+    const session = sessionStore.load(picked.sessionId);
+    if (session.cwd !== project.path) throw new Error("The selected session belongs to a different project.");
+    invalidateHistoryLoad();
+    disposeCurrentAppServer();
+    selectedSession = session;
+    sessionLookupError = undefined;
+    sessionView = session.providerConversationId
+      ? { state: "saved", text: `Saved ${providerDisplayName(session.providerId)} conversation selected. Vesper will verify it before continuing.`, blocked: false }
+      : { state: "new", text: `Saved Vesper session selected for ${providerDisplayName(session.providerId)}.`, blocked: false };
+    postSessionView(targetPanel);
+    await restoreSelectedHistory(targetPanel);
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Could not switch sessions: ${safeMessage(error)}` });
+    postSessionView(targetPanel);
+  }
+}
+
+async function createSessionWithProvider(targetPanel = panel) {
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection) {
+    postToPanel(targetPanel, { type: "status", text: "Wait for the active Vesper operation to finish before creating a provider session." });
+    return;
+  }
+  const project = selectedProjectContext();
+  if (!project.available) {
+    postToPanel(targetPanel, { type: "status", text: "Choose an available workspace folder before creating a provider session." });
+    return;
+  }
+  if (typeof vscode.window.showQuickPick !== "function") {
+    postToPanel(targetPanel, { type: "status", text: "Provider selection is unavailable in this VS Code version." });
+    return;
+  }
+  const defaultProviderId = resolveDefaultProviderId(process.env);
+  const items = listProviders().map((provider) => {
+    const status = getProviderStatus(provider.id, process.env);
+    const readiness = provider.id === DEFAULT_PROVIDER_ID
+      ? "Codex CLI authentication is managed by Codex"
+      : status.configured ? `configured · ${status.model || "model unknown"} · not live-verified` : "configuration required";
+    return {
+      label: provider.name,
+      description: `${provider.id}${provider.id === defaultProviderId ? " · default for new sessions" : ""}`,
+      detail: `${readiness}. ${provider.description}`,
+      providerId: provider.id,
+      status,
+    };
+  });
+  let picked;
+  try {
+    picked = await vscode.window.showQuickPick(items, { placeHolder: "Choose a provider for a new Vesper session", matchOnDescription: true, matchOnDetail: true });
+  } catch (error) {
+    postToPanel(targetPanel, { type: "status", text: `Provider selection failed: ${safeMessage(error)}` });
+    return;
+  }
+  if (!picked) return;
+  const status = picked.status || getProviderStatus(picked.providerId, process.env);
+  if (picked.providerId !== DEFAULT_PROVIDER_ID && status.configured !== true) {
+    const remediation = picked.providerId === OPENAI_PROVIDER_ID
+      ? "Set OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL."
+      : "Set VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL.";
+    const text = `${picked.label} needs configuration. ${remediation} Then reload the VS Code window and select it again.`;
+    postToPanel(targetPanel, { type: "status", text });
+    if (typeof vscode.window.showWarningMessage === "function") await vscode.window.showWarningMessage(text);
+    return;
+  }
+  let modelId = status.model || null;
+  if (picked.providerId !== DEFAULT_PROVIDER_ID) {
+    if (typeof vscode.window.showInputBox !== "function") {
+      postToPanel(targetPanel, { type: "status", text: "Model selection is unavailable in this VS Code version; use the configured provider model from the process environment." });
+      return;
+    }
+    let requestedModel;
+    try {
+      requestedModel = await vscode.window.showInputBox({
+        prompt: `Model ID for this ${picked.label} session (saved with this session; provider support is not verified here)`,
+        value: status.model || "",
+        placeHolder: "Enter the exact model ID configured with the provider",
+        ignoreFocusOut: true,
+      });
+    } catch (error) {
+      postToPanel(targetPanel, { type: "status", text: `Model selection failed: ${safeMessage(error)}` });
+      return;
+    }
+    if (typeof requestedModel !== "string") return;
+    modelId = requestedModel.trim();
+    if (!modelId || modelId.length > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(modelId)) {
+      postToPanel(targetPanel, { type: "status", text: "Enter a model ID from 1 to 200 characters without control characters. The existing session was kept." });
+      return;
+    }
+  }
+  const currentProject = selectedProjectContext();
+  if (!currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
+    postToPanel(targetPanel, { type: "status", text: "The project or active task changed while provider selection was open. No session was created." });
+    return;
+  }
+  startNewSession(targetPanel, { providerId: picked.providerId, modelId });
+}
+
 function capabilityProviderFor(cwd) {
   if (typeof cwd !== "string" || !cwd) return null;
   if (!capabilityProviders.has(cwd)) capabilityProviders.set(cwd, createCapabilityProvider({
@@ -546,7 +896,7 @@ function capabilityProviderFor(cwd) {
 }
 
 async function selectProject(targetPanel) {
-  if (activeCodexRequestId !== undefined) return;
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection) return;
   if (typeof vscode.window.showWorkspaceFolderPick !== "function") {
     postToPanel(targetPanel, { type: "status", text: "Project selection is unavailable in this VS Code version." });
     return;
@@ -575,7 +925,7 @@ async function selectProject(targetPanel) {
 }
 
 async function retryResume(targetPanel) {
-  if (activeCodexRequestId !== undefined || !sessionView.canRetry) return;
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection || !sessionView.canRetry) return;
   const project = selectedProjectContext();
   if (!project.available || !selectedSession?.providerConversationId) return;
 
@@ -611,8 +961,8 @@ async function retryResume(targetPanel) {
   }
 }
 
-function startNewSession(targetPanel) {
-  if (activeCodexRequestId !== undefined) return;
+function startNewSession(targetPanel, { providerId = null, modelId = undefined } = {}) {
+  if (activeCodexRequestId !== undefined || activeRepositoryInspection) return;
   const project = selectedProjectContext();
   if (!project.available) {
     postToPanel(targetPanel, { type: "status", text: "The selected workspace folder is unavailable; no session was changed." });
@@ -622,7 +972,8 @@ function startNewSession(targetPanel) {
     const previousSessionId = selectedSession?.sessionId;
     invalidateHistoryLoad();
     disposeCurrentAppServer();
-    selectedSession = createProviderSession(project.path, selectedProviderForNewSession());
+    const selectedProviderId = providerId || selectedProviderForNewSession();
+    selectedSession = createProviderSession(project.path, selectedProviderId, modelId);
     sessionLookupError = undefined;
     sessionView = {
       state: "new",
@@ -645,6 +996,11 @@ function startNewSession(targetPanel) {
 }
 
 async function interruptRequest(requestId, targetPanel) {
+  if (activeRepositoryInspection?.requestId === requestId) {
+    cancelActiveRepositoryInspection();
+    postToPanel(targetPanel, { type: "interrupt-requested", requestId, phase: "inspection" });
+    return;
+  }
   if (requestId !== activeCodexRequestId) return;
   if (activeRepositoryPreflight?.requestId === requestId) {
     cancelActiveRepositoryPreflight();
@@ -1065,11 +1421,16 @@ function postSessionView(targetPanel) {
   const providerStatus = listProviders().some((provider) => provider.id === providerId) ? getProviderStatus(providerId, process.env) : null;
   const configuredModel = providerStatus?.model || null;
   const activeState = executionProviderSessionId === selectedSession?.sessionId ? executionProvider?.getState?.() : null;
+  const readiness = providerId === DEFAULT_PROVIDER_ID
+    ? "Codex CLI sign-in is managed by Codex; run vesper doctor to check it locally"
+    : providerStatus?.configured === true ? "configured; provider reachability not checked" : "provider configuration required";
   postToPanel(targetPanel, {
     type: "provider-info",
     providerId,
     displayName: providerDisplayName(providerId),
     model: selectedSession?.modelId || configuredModel,
+    readiness,
+    modelFreshness: selectedSession?.modelId || configuredModel ? "configured; not live-verified" : "not configured or not exposed",
     toolCallingEnabled: activeState?.toolCallingEnabled === true || providerStatus?.toolCallingEnabled === true,
   });
 }
@@ -1096,8 +1457,8 @@ function isTextOnlyProvider(providerId) {
   return providerId === OPENAI_PROVIDER_ID || providerId === NVIDIA_PROVIDER_ID;
 }
 
-function createProviderSession(cwd, providerId) {
-  const modelId = getProviderStatus(providerId, process.env).model;
+function createProviderSession(cwd, providerId, requestedModelId = undefined) {
+  const modelId = requestedModelId === undefined ? getProviderStatus(providerId, process.env).model : requestedModelId;
   return sessionStore.create(cwd, { providerId, modelId });
 }
 
@@ -1168,6 +1529,9 @@ function getHtml(webview) {
     #project-path { color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
     #session-state { color: var(--vscode-descriptionForeground); font-size: 12px; margin-top: 4px; }
     #history-state { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 4px; }
+    #session-actions, #workspace-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    #session-actions { margin-top: 8px; }
+    #workspace-actions { margin-top: 2px; }
     #recovery-actions { display: flex; gap: 8px; margin-top: 8px; }
     #recovery-actions[hidden], #retry-resume[hidden], #start-new-session[hidden] { display: none; }
     #messages { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
@@ -1199,15 +1563,23 @@ function getHtml(webview) {
       <div id="status">Starting…</div>
       <div id="session-state" role="status">Checking saved Vesper sessions…</div>
       <div id="history-state" role="status">Conversation history has not been checked.</div>
+      <div id="session-actions">
+        <button id="switch-session" type="button">Switch session</button>
+        <button id="new-provider-session" type="button">New provider session</button>
+      </div>
       <div id="recovery-actions" hidden>
         <button id="retry-resume" type="button" hidden>Retry connection</button>
         <button id="start-new-session" type="button" hidden>Start new conversation</button>
       </div>
     </header>
     <section id="messages" aria-live="polite"></section>
+    <div id="workspace-actions">
+      <button id="inspect-repository" type="button">Inspect repository</button>
+      <button id="assess-impact" type="button">Change impact</button>
+      <button id="preview-plan" type="button">Capabilities</button>
+    </div>
     <form id="form">
       <textarea id="prompt" aria-label="Prompt" placeholder="Ask a developer question…" maxlength="32768" required></textarea>
-      <button id="preview-plan" type="button">Plan</button>
       <button id="send" type="submit">Send</button>
       <button id="stop" type="button" hidden>Stop</button>
     </form>
@@ -1226,8 +1598,12 @@ function getHtml(webview) {
     const prompt = document.getElementById('prompt');
     const send = document.getElementById('send');
     const previewPlan = document.getElementById('preview-plan');
+    const inspectRepository = document.getElementById('inspect-repository') || { disabled: false, addEventListener() {} };
+    const assessImpact = document.getElementById('assess-impact') || { disabled: false, addEventListener() {} };
     const stop = document.getElementById('stop');
     const chooseProject = document.getElementById('choose-project');
+    const switchSession = document.getElementById('switch-session') || { disabled: false, addEventListener() {} };
+    const newProviderSession = document.getElementById('new-provider-session') || { disabled: false, addEventListener() {} };
     const projectName = document.getElementById('project-name');
     const projectPath = document.getElementById('project-path');
     const sessionState = document.getElementById('session-state');
@@ -1238,6 +1614,7 @@ function getHtml(webview) {
     let activeAssistant;
     let activeDiff;
     let activeRequestId;
+    let activeActionType;
     let currentProviderId = 'codex-app-server';
     let currentProviderName = 'Codex app-server';
     let sessionBlocked = false;
@@ -1261,8 +1638,12 @@ function getHtml(webview) {
     function setBusy(busy) {
       send.disabled = busy || sessionBlocked || recoveryLoading;
       previewPlan.disabled = busy;
+      inspectRepository.disabled = busy;
+      assessImpact.disabled = busy;
       prompt.disabled = busy || sessionBlocked || recoveryLoading;
       chooseProject.disabled = busy;
+      switchSession.disabled = busy;
+      newProviderSession.disabled = busy;
       if (!busy && !sessionBlocked) prompt.focus();
     }
 
@@ -1287,6 +1668,19 @@ function getHtml(webview) {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) form.requestSubmit();
     });
 
+    inspectRepository.addEventListener('click', () => {
+      const task = prompt.value.trim() || 'Explain this repository, identify likely entry points, and summarize its major modules.';
+      vscode.postMessage({ type: 'repository-inspection', intent: 'inspect', task });
+    });
+
+    assessImpact.addEventListener('click', () => {
+      const task = prompt.value.trim() || 'Assess the change impact of the current working-tree changes.';
+      vscode.postMessage({ type: 'repository-inspection', intent: 'impact', task });
+    });
+
+    switchSession.addEventListener('click', () => vscode.postMessage({ type: 'switch-session' }));
+    newProviderSession.addEventListener('click', () => vscode.postMessage({ type: 'new-session-with-provider' }));
+
     chooseProject.addEventListener('click', () => {
       if (chooseProject.disabled) return;
       vscode.postMessage({ type: 'select-project' });
@@ -1307,7 +1701,9 @@ function getHtml(webview) {
     stop.addEventListener('click', () => {
       if (activeRequestId === undefined || stop.disabled) return;
       stop.disabled = true;
-      status.textContent = 'Interrupt requested · waiting for ' + currentProviderName + ' task state…';
+      status.textContent = activeActionType === 'inspection'
+        ? 'Interrupt requested · waiting for the repository investigation to stop…'
+        : 'Interrupt requested · waiting for ' + currentProviderName + ' task state…';
       vscode.postMessage({ type: 'interrupt', requestId: activeRequestId });
     });
 
@@ -1317,7 +1713,7 @@ function getHtml(webview) {
       if (message.type === 'provider-info') {
         currentProviderId = typeof message.providerId === 'string' ? message.providerId : 'codex-app-server';
         currentProviderName = typeof message.displayName === 'string' ? message.displayName : currentProviderId;
-        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '') + (message.toolCallingEnabled ? ' · project inspection/proposals enabled; file writes unavailable in panel' : '');
+        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '') + (message.readiness ? ' · ' + message.readiness : '') + (message.modelFreshness ? ' · ' + message.modelFreshness : '') + (message.toolCallingEnabled ? ' · project inspection/proposals enabled; file writes unavailable in panel' : '');
         providerPrivacy.textContent = currentProviderId === 'openai-chat-completions'
           ? (message.toolCallingEnabled ? 'OpenAI receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'For code-oriented tasks, OpenAI receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
           : currentProviderId === 'nvidia-nim'
@@ -1330,6 +1726,7 @@ function getHtml(webview) {
           activeAssistant = undefined;
           activeDiff = undefined;
           activeRequestId = undefined;
+          activeActionType = undefined;
           stop.hidden = true;
           historyState.textContent = 'Checking this project’s saved conversation history…';
         }
@@ -1382,6 +1779,7 @@ function getHtml(webview) {
       }
       if (message.type === 'active-request') {
         activeRequestId = message.requestId;
+        activeActionType = message.kind || 'turn';
         setBusy(true);
         if (message.kind === 'preflight') {
           activeAssistant = addMessage('activity', 'Vesper · inspecting repository…', 'The provider task has not been submitted.');
@@ -1396,8 +1794,49 @@ function getHtml(webview) {
       }
       if (message.type === 'user-message') return;
       if (message.type === 'plan-preview') {
-        addMessage(message.error ? 'error' : 'assistant', 'Vesper plan · advisory · not executed', message.text || 'No plan output is available.');
+        addMessage(message.error ? 'error' : 'assistant', 'Vesper capability plan · advisory · not executed', message.text || 'No capability plan output is available.');
         previewPlan.disabled = false;
+      }
+      if (message.type === 'repository-inspection-start') {
+        activeRequestId = message.requestId;
+        activeActionType = 'inspection';
+        activeAssistant = addMessage('activity', message.mode === 'impact' ? 'Vesper · assessing change impact…' : 'Vesper · inspecting repository…', 'Read-only bounded evidence collection. No coding task has been submitted.');
+        stop.hidden = false;
+        stop.disabled = false;
+        setBusy(true);
+        status.textContent = 'Vesper · collecting bounded read-only repository evidence';
+      }
+      if (message.type === 'repository-inspection-result' && message.requestId === activeRequestId) {
+        if (activeAssistant) {
+          activeAssistant.title.textContent = 'Vesper ' + (message.mode === 'impact' ? 'change impact' : 'repository investigation') + ' · ' + (message.status || 'unknown') + ' · read-only';
+          activeAssistant.body.textContent = message.report || 'No investigation report is available.';
+          activeAssistant = undefined;
+        } else {
+          addMessage('activity', 'Vesper ' + (message.mode === 'impact' ? 'change impact' : 'repository investigation') + ' · ' + (message.status || 'unknown') + ' · read-only', message.report || 'No investigation report is available.');
+        }
+        activeRequestId = undefined;
+        activeActionType = undefined;
+        stop.hidden = true;
+        setBusy(false);
+        status.textContent = 'Vesper · repository investigation ' + (message.status || 'finished');
+      }
+      if (message.type === 'repository-inspection-error') {
+        if (message.requestId !== undefined && message.requestId !== activeRequestId) return;
+        if (activeAssistant && message.requestId === activeRequestId) {
+          activeAssistant.title.textContent = message.state === 'cancelled' ? 'Vesper repository investigation · cancelled' : message.state === 'stale' ? 'Vesper repository investigation · stale report discarded' : 'Vesper repository investigation · failed';
+          activeAssistant.body.textContent = message.text || 'Repository investigation failed.';
+          activeAssistant = undefined;
+        } else {
+          const label = message.state === 'cancelled' ? 'Repository investigation cancelled' : message.state === 'stale' ? 'Repository investigation discarded' : 'Repository investigation unavailable';
+          addMessage('error', label, message.text || 'No report was produced.');
+        }
+        if (message.requestId === undefined || message.requestId === activeRequestId) {
+          activeRequestId = undefined;
+          activeActionType = undefined;
+          stop.hidden = true;
+          setBusy(false);
+          status.textContent = message.text || 'Repository investigation failed.';
+        }
       }
       if (message.type === 'repository-preflight' && message.requestId === activeRequestId) {
         if (message.state === 'running') {
@@ -1435,6 +1874,7 @@ function getHtml(webview) {
       }
       if (message.type === 'assistant-start') {
         activeRequestId = message.requestId;
+        activeActionType = 'turn';
         activeDiff = undefined;
         if (typeof message.providerId === 'string') currentProviderId = message.providerId;
         activeAssistant = addMessage('assistant', currentProviderName + ' · connecting…', '');
@@ -1501,7 +1941,9 @@ function getHtml(webview) {
         messages.scrollTop = messages.scrollHeight;
       }
       if (message.type === 'interrupt-requested' && message.requestId === activeRequestId) {
-        status.textContent = message.phase === 'preflight'
+        status.textContent = message.phase === 'inspection'
+          ? 'Vesper · cancelling repository investigation…'
+          : message.phase === 'preflight'
           ? 'Vesper · cancelling repository inspection; provider task has not been submitted…'
           : 'Interrupt sent · waiting for ' + currentProviderName + ' to stop…';
       }
@@ -1525,6 +1967,7 @@ function getHtml(webview) {
       }
       if (message.type === 'assistant-done' && message.requestId === activeRequestId) {
         activeRequestId = undefined;
+        activeActionType = undefined;
         status.textContent = (message.generatedTextOnly || message.providerId === 'openai-chat-completions'
           ? (message.providerId === 'nvidia-nim' ? 'NVIDIA NIM' : 'OpenAI') + ' · text generated, not executed'
           : 'Codex provider response completed') + ' · workflow ' + (message.workflowStatus || 'completed') + ' · verification ' + (message.verificationState || 'not-run') + (message.truncated ? ' · response truncated' : '');
@@ -1543,6 +1986,7 @@ function getHtml(webview) {
           addMessage('assistant', label, message.text);
         }
         activeRequestId = undefined;
+        activeActionType = undefined;
         status.textContent = message.preflight ? 'Vesper · provider task not submitted'
           : message.state === 'interrupted' ? currentProviderName + ' · interrupted' : currentProviderName + ' · failed; the conversation remains visible in this panel.';
         stop.hidden = true;

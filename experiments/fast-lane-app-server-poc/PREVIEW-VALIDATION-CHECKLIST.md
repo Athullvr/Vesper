@@ -63,9 +63,9 @@ code --disable-telemetry --disable-updates --disable-experiments --new-window \
   --extensions-dir /tmp/vesper-preview-code-extensions /path/to/disposable-project
 ```
 
-Open the Command Palette and run **Vesper: Open Panel**. Record whether the panel opens, whether its project/session status is understandable, and any extension-host error. The manifest contributes no VS Code settings; the default provider is Codex. Confirm the panel shows status changes from running to completed or failed and that a failed provider request does not switch providers or submit twice.
+Open the Command Palette and run **Vesper: Open Panel**. Record whether the panel opens, whether its project/session status is understandable, and any extension-host error. The manifest contributes no VS Code settings; the default provider is Codex. Try the panel's **Inspect repository** and **Change impact** actions with a known symbol. Check that evidence paths and coverage limitations are visible, no coding task is submitted, and no project files change. Try **Switch session** and confirm the picker lists only sessions for this workspace folder. **New provider session** should require an explicitly selected, configured provider and pin the entered model ID to that new session; its selection must not change the workspace default. Confirm the panel shows provider readiness and model freshness without claiming live verification. Also confirm that a failed provider request does not switch providers or submit twice.
 
-For a provider-backed repository question, Vesper sends the task and bounded synthesized repository findings to the explicitly selected provider. Do not use private source. Simple exact local requests such as **What Git branch am I on?** use Vesper's local handler and do not start a provider.
+For a provider-backed coding question, Vesper sends the task and bounded synthesized repository findings to the explicitly selected provider. Do not use private source. Direct repository inspection uses the read-only System Model path by default; simple exact local requests such as **What Git branch am I on?** use Vesper's local handler and do not start a provider.
 
 ## 4. Approval and task-state boundaries
 
@@ -89,7 +89,7 @@ The expected completion report must distinguish provider completion from tests o
 
 ## 5. Missing-provider error and recovery
 
-In a separate isolated run, explicitly select OpenAI or NVIDIA, provide a non-secret model label, and leave that provider's key unset. Submit only a harmless prompt in the disposable project. Expected behavior: a clear missing-configuration error, a failed task state, no provider switch, and no network request. Then use the exact local Git-status request to confirm the panel remains responsive.
+In a separate isolated run, set `VESPER_PROVIDER` to OpenAI or NVIDIA in the VS Code process environment, provide a non-secret model label, and leave that provider's key unset. Reload the isolated VS Code window and submit only a harmless prompt. Expected behavior: a clear missing-configuration error, a failed task state, no provider switch, and no network request. Then use the exact local Git-status request to confirm the panel remains responsive. The explicit provider picker is expected to refuse creating an API-provider session while its required key or model configuration is missing.
 
 Do not test rejected credentials by entering an invalid key. Mock tests cover rejected HTTP responses. An authenticated provider request is optional, may cost money, and must follow `PROVIDER-LIVE-VALIDATION.md`.
 
@@ -106,8 +106,11 @@ Do not test rejected credentials by entering an invalid key. Mock tests cover re
 | --- | --- | --- |
 | Install and first run |  |  |
 | Local repository inspection |  |  |
+| VS Code impact report and evidence limits |  |  |
 | VSIX install and panel activation |  |  |
 | Panel task-state updates |  |  |
+| Project-scoped session switching |  |  |
+| Explicit provider/model session selection |  |  |
 | Read-only approval boundary |  |  |
 | Terminal one-time approval |  |  |
 | Missing-provider failure and recovery |  |  |

@@ -1,13 +1,13 @@
 # Vesper CLI and VS Code extension
 
-Vesper is a local-first coding-agent interface with two frontends over the same routing core:
+Vesper is a local-first coding-agent workspace with terminal and VS Code frontends over shared repository, session, provider, task-evidence, and permission services:
 
-- A VS Code extension panel that answers explicit Git and test-evidence questions locally and sends other prompts to the selected execution provider.
-- A terminal CLI named `vesper` with local-first repository inspection and provider-backed coding sessions.
+- A VS Code panel and Command Palette actions for repository inspection, change impact, saved-session switching, and explicit provider/model selection for new sessions.
+- A terminal CLI named `vesper` for local repository investigation, Git and test-evidence queries, capability discovery, provider setup, approval-controlled coding sessions, review, and supported verification.
 
 The package uses Node.js built-ins, Git, the VS Code Extension API, and (for the default provider) the installed Codex CLI. It has no npm runtime dependencies. `INSTALL.md` covers first run, provider configuration, diagnostics, privacy, reset, and uninstall.
 
-`DEVELOPER-WORKFLOW.md` documents the shared terminal/VS Code lifecycle, status rules, one-time approval gates, `:verify`, the deterministic multi-package scenario, and the current host/sandbox limitations.
+`DEVELOPER-WORKFLOW.md` documents the shared terminal/VS Code lifecycle, status rules, one-time approval gates, repository investigation, impact analysis, and the current host/sandbox limitations.
 
 New external developers should start with `PREVIEW-GUIDE.md` and use `PREVIEW-FEEDBACK.md`. Live OpenAI/NVIDIA checks are opt-in; see `PROVIDER-LIVE-VALIDATION.md`.
 
@@ -29,6 +29,7 @@ Inspect a project locally or run the CLI from source without a global install:
 ```sh
 npm run cli -- inspect "Trace handleCheckout" --project /path/to/project
 vesper inspect "Trace handleCheckout" --project /path/to/project
+vesper impact "Assess a change to handleCheckout" --project /path/to/project
 ```
 
 Setup and doctor are read-only and do not validate remote credentials. The default Codex integration uses Codex CLI authentication and does not require an API key. Optional OpenAI and NVIDIA API setup is documented in `INSTALL.md`.
@@ -45,7 +46,7 @@ vesper sessions new
 
 `list` shows at most the 50 newest sessions for the selected canonical project and prints the Vesper id, update time, provider, and whether a provider conversation is saved. Session metadata does not retain a title or prompt preview. `resume` defaults to the current project and rejects a session saved for another project; it resumes with the same provider recorded on that session. `new` creates a separate session and leaves existing sessions intact. Each command accepts an optional project directory.
 
-The interactive workspace keeps task text separate from workspace commands. Use `:providers` and `:tools` to inspect local support, `:new [PROVIDER_ID [MODEL_ID]]` to create a separately scoped provider/model session, `:plan TASK` to preview an advisory plan, `:inspect [TASK]` to inspect this repository locally, and `:capabilities` to inspect discovered extensions. Ordinary terminal input is routed as a Vesper task or local query; Vesper does not intercept arbitrary shell commands. Code-oriented provider tasks get a bounded, read-only repository preflight before dispatch. Explicit commands remain behind the isolated, approval-gated `run_command` tool.
+The interactive workspace keeps task text separate from workspace commands. Use `:providers` and `:tools` to inspect local support, `:new [PROVIDER_ID [MODEL_ID]]` to create a separately scoped provider/model session, `:plan TASK` to preview an advisory capability plan, `:inspect [TASK]` for local repository investigation, `:impact TASK` for change-impact analysis, and `:capabilities` to inspect discovered integrations. The equivalent one-shot CLI commands are `vesper inspect` and `vesper impact`. Ordinary terminal input is routed as a Vesper task or local query; Vesper does not intercept arbitrary shell commands. Code-oriented provider tasks get a bounded, read-only repository preflight before dispatch. Explicit commands remain behind the isolated, approval-gated `run_command` tool.
 
 Read-only integration discovery is available from the terminal. `vesper plugins` checks project and personal local marketplace manifests plus the local plugin cache; `vesper mcp` uses Codex's JSON listing command; and `vesper skills` checks project and user skill directories. These commands show only names, status, and source, never MCP command arguments, environment values, skill instructions, or conversation text. `vesper modules` is not implemented.
 
@@ -76,7 +77,7 @@ The installed `codex-cli 0.162.1` schema also contains a richer MCP status RPC, 
 
 ## Advisory capability plans
 
-`vesper plan TASK [--project PROJECT_DIRECTORY]` prints a deterministic, read-only preview based on the normalized local catalog and the existing router decision. In the terminal workspace, use `:plan TASK`. The VS Code panel's **Plan** button previews the text currently in the prompt box without sending it. Plan output is labeled advisory and not executed; it never starts or resumes Codex, activates a skill/plugin, launches an MCP server, or calls an MCP tool.
+`vesper plan TASK [--project PROJECT_DIRECTORY]` prints a deterministic, read-only capability preview based on the normalized local catalog and existing router decision. In the terminal workspace, use `:plan TASK`. The VS Code panel's **Capabilities** button previews the text currently in the prompt box without sending it. It is a capability catalog preview, not an implementation plan. It never starts or resumes Codex, activates a skill/plugin, launches an MCP server, or calls an MCP tool. Use **Inspect repository** or **Change impact** for grounded System Model reports and suggested implementation or verification steps.
 
 The planner uses bounded topic and metadata matching over capability IDs, names, descriptions, declared capabilities, and supported command names when present. It does not use a model. Local Git and test handlers remain authoritative for their existing local routes; a matching capability can be shown in a preview, but it is declined because the local handler already covers the request. On Codex routes it adds only a bounded category, relevant IDs, eligibility states, and reason codes to the existing in-process routing context. This metadata is not included in routing diagnostics or telemetry and does not change the route.
 
@@ -444,7 +445,7 @@ For terminal fallback, submit `Explain what a Git rebase does in one sentence.` 
 ## Limitations
 
 - Vesper is its own frontend. It does not attach to, import, or continue the original interactive Codex CLI conversation.
-- When multiple Vesper sessions exist for one canonical workspace path, the extension restores the record with the latest `updatedAt`; it does not yet offer a session-history picker. The panel restores at most the latest 50 Codex turns; older turns are marked as omitted when the server provides a continuation cursor. Locally answered Git/test questions are not in Codex history and are not restored.
+- When multiple Vesper sessions exist for one canonical workspace path, the extension restores the latest record by default and **Vesper: Switch Session** lets the developer choose another session for that same project. The panel restores at most the latest 50 provider turns; older turns are marked as omitted when the server provides a continuation cursor. Direct local investigation reports and local Git/test answers are not part of the provider transcript and are not restored.
 - Codex app-server is experimental in the inspected CLI version; protocol behavior can change. Recheck the installed generated schema before updating protocol methods.
 - The live aggregate diff view uses cursor movement and erase sequences only when both streams are TTYs and `TERM` is usable. Its terminal cell-width calculation is an approximation for combining marks and emoji sequences, so unusual glyph widths may cause imperfect wrapping. The installed event schema has no sequence/version field; Vesper scopes events by process, thread and turn and applies same-turn snapshots in transport arrival order. A local PTY smoke check exercised synthetic events and redirected output; it did not validate authenticated model behavior, live app-server delivery, or real file operations.
 - The app-server turn timeout is five minutes. Vesper asks the server to interrupt after timeout; if the server does not confirm a terminal event, the connection is closed and the request is reported as an error. Another fallback tries to resume the same saved thread; it never silently starts a replacement conversation.

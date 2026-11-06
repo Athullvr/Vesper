@@ -1,6 +1,6 @@
 # Developer task workflow
 
-Phase 4J connects the existing repository inspector, System Model, execution providers, permissioned runtime, and both frontends through one task lifecycle. `task-workflow.js` owns the shared evidence preflight and event-based status projection; terminal and VS Code keep their provider/session state and UI, and do not run a second orchestration engine.
+The repository inspector, System Model, execution providers, permissioned runtime, and both frontends use the shared task lifecycle. `task-workflow.js` owns evidence preflight and event-based status projection; terminal and VS Code retain their interface-specific state and presentation without creating a second orchestration engine. Standalone inspection and impact actions in both interfaces use the same bounded repository intelligence and System Model services.
 
 ## Lifecycle
 
@@ -24,6 +24,12 @@ Statuses describe evidence Vesper received. A Codex server diff is not proof of 
 
 `:verify` lists fresh test/build/check/lint scripts without running them. After reviewing the list, `:verify N` requests approval for one listed argv and does not retry it. Command execution is disabled by default. `VESPER_ENABLE_ISOLATED_COMMANDS=1` is only an opt-in; the supported host and local sandbox image must still pass the runtime's checks. Vesper does not pull or build an image.
 
+## VS Code use
+
+The panel's **Inspect repository** and **Change impact** actions run bounded read-only reports without submitting a coding task. **Capabilities** previews the discovered local catalog and is labeled separately from implementation planning. The Command Palette also provides **Vesper: Inspect Repository**, **Vesper: Assess Change Impact**, **Vesper: Switch Session**, and **Vesper: New Session with Provider**. Session switching is scoped to the selected workspace folder. Provider selection creates a new session, leaves the default provider unchanged, and pins the supplied API model ID to that session. Codex inherits its installed CLI configuration.
+
+The extension does not offer Codex model/reasoning controls, command-approval UI, or verification-command approval UI. Codex approval requests are declined in the panel. Use the terminal for the existing one-time approval paths.
+
 ## Reproducible scenario and tests
 
 `test/task-workflow-scenario.test.js` creates an isolated two-package pricing/checkout repository with a related pricing and checkout test. It uses an in-memory OpenAI protocol mock, mocked read-only Git responses, and a deterministic `run_command` backend. The scenario traces `calculateTotal`, checks cross-package impact and test references, approves three file proposals, inspects the resulting bounded diff, and verifies the result through the permissioned runtime's one-time approval path. It does not contact a provider or start a real sandbox. `test/task-workflow.test.js` covers stale/mismatched evidence, completion without a verified write, failed verification, rejected approval, provider failure, interruption, timeout, cancellation, and state bounds.
@@ -39,7 +45,7 @@ npm test
 ## Current limitations
 
 - Native Codex file changes stay under Codex's own approval path. Vesper reports server-reported diff and file activity, but cannot independently claim those writes were read-back verified.
-- The VS Code panel has no per-command approval UI and keeps its existing read-only Codex policy: native Codex approval requests are declined. It shows verification suggestions as unrun; terminal verification is available only with the validated runtime and interactive approval.
+- The VS Code panel has no per-command approval UI and keeps its existing read-only Codex policy: native Codex approval requests are declined. It shows verification suggestions as unrun; terminal verification is available only with host opt-in, the supported sandbox prerequisites, and interactive approval.
 - Host sandbox support is not assumed. No live Podman run, provider-backed run, or VS Code extension-host validation is implied by deterministic tests.
 - Workspace `git diff` covers tracked changes and can include earlier edits; new untracked files may not appear in Git diff output.
 - Verification commands containing shell composition, globbing, quoting, or other unsupported tokens remain suggestions for manual handling.

@@ -65,6 +65,7 @@ Usage:
   vesper capabilities enable|disable <ID> [PROJECT_DIRECTORY]
   vesper plan <TASK> [--project PROJECT_DIRECTORY]
   vesper inspect [TASK] [--project PROJECT_DIRECTORY]
+  vesper impact [TASK] [--project PROJECT_DIRECTORY]
   vesper tools [list]
   vesper tools status
   vesper tools preview <TOOL_ID> '<JSON>' [--project PROJECT_DIRECTORY]
@@ -180,6 +181,7 @@ function parseArgs(argv) {
   if (args[0] === "capabilities") return parseCapabilityArgs(args.slice(1));
   if (args[0] === "plan") return parsePlanArgs(args.slice(1));
   if (args[0] === "inspect") return parseInspectArgs(args.slice(1));
+  if (args[0] === "impact") return parseImpactArgs(args.slice(1));
   if (args[0] === "tools") return parseToolsArgs(args.slice(1));
   if (["plugins", "mcp", "skills"].includes(args[0])) return parseDiscoveryArgs(args[0], args.slice(1));
   if (args[0] === "modules") throw new Error("The vesper modules command is not implemented. Run vesper --help for supported commands.");
@@ -308,22 +310,29 @@ function parsePlanArgs(args) {
   return { command: "plan", task, projectDirectory, help: false };
 }
 
-function parseInspectArgs(args) {
-  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command: "inspect", help: true };
+function parseInspectArgs(args, command = "inspect") {
+  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command, help: true };
   const rest = [...args];
   let projectDirectory = null;
   const projectOption = rest.indexOf("--project");
   if (projectOption >= 0) {
     if (projectOption !== rest.length - 2 || !rest[projectOption + 1]) {
-      throw new Error("Usage: vesper inspect [TASK] [--project PROJECT_DIRECTORY].");
+      throw new Error("Usage: vesper " + command + " [TASK] [--project PROJECT_DIRECTORY].");
     }
     projectDirectory = rest[projectOption + 1];
     rest.splice(projectOption, 2);
   }
   if (rest.some((arg) => arg.startsWith("--")) || rest.some((arg) => ["--help", "-h"].includes(arg))) {
-    throw new Error("Usage: vesper inspect [TASK] [--project PROJECT_DIRECTORY].");
+    throw new Error("Usage: vesper " + command + " [TASK] [--project PROJECT_DIRECTORY].");
   }
-  return { command: "inspect", task: rest.join(" ").trim(), projectDirectory, help: false };
+  return { command, task: rest.join(" ").trim(), projectDirectory, help: false };
+}
+
+function parseImpactArgs(args) {
+  if (args.length === 1 && ["--help", "-h"].includes(args[0])) return { command: "impact", help: true };
+  const parsed = parseInspectArgs(args, "impact");
+  const target = parsed.task || "the current working-tree changes";
+  return { ...parsed, command: "impact", task: "Assess the change impact of " + target };
 }
 
 function parseCapabilityArgs(args) {
@@ -527,6 +536,10 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
     output.write(DOCTOR_USAGE);
     return 0;
   }
+  if (options.help && options.command === "impact") {
+    output.write("Vesper change-impact investigation\n\nUsage:\n  vesper impact [TASK] [--project PROJECT_DIRECTORY]\n\nAssesses bounded, read-only evidence for a proposed change or current working-tree changes. Literal matches and parsed references remain candidates, not a complete call graph or test-coverage claim.\n");
+    return 0;
+  }
   if (options.help) {
     output.write(options.command === "sessions" ? SESSIONS_USAGE : options.command === "providers" ? `${USAGE}\nProvider configuration:\n  OPENAI_API_KEY (or VESPER_OPENAI_API_KEY) and VESPER_OPENAI_MODEL configure OpenAI Chat Completions.\n  VESPER_NVIDIA_API_KEY (or NVIDIA_API_KEY) and VESPER_NVIDIA_MODEL configure NVIDIA NIM.\n  VESPER_NVIDIA_BASE_URL optionally selects a NIM-compatible endpoint; its default is the NVIDIA hosted API.\n  VESPER_OPENAI_TOOL_CALLING_MODEL or VESPER_NVIDIA_TOOL_CALLING_MODEL must equal the exact model id to opt into structured calls to Vesper project tools (inspection and proposals). This does not verify model support. The terminal alone can expose apply_file_change after fresh one-time approval; commands are never sent to models.\n  VESPER_SYSTEM_MODEL_ASSISTED=1 opts complex repository investigations into bounded planning calls through the selected OpenAI/NVIDIA provider and model; Codex uses deterministic planning. VESPER_LOCAL_ONLY=1 disables those calls.\n  Provider-specific MAX_TOOL_CALLS, MAX_TOOL_ITERATIONS, MAX_AGENT_ELAPSED_MS, and MAX_TOOL_RESULT_BYTES settings are bounded by Vesper.\n  VESPER_PROVIDER selects the default provider for new sessions; --provider and --model select an individual new session.\n  API keys are read from the environment and never printed. Listing/status without --check does not contact providers.\n` : options.command === "capabilities" ? CAPABILITIES_USAGE : options.command === "tools" ? TOOLS_USAGE : options.command === "plan" ? "Vesper advisory planning preview\n\nUsage:\n  vesper plan TASK [--project PROJECT_DIRECTORY]\n\nThe task is classified deterministically. The existing route is preserved, and planning does not start Codex, activate capabilities, or execute tools.\n" : options.command === "inspect" ? "Vesper repository intelligence\n\nUsage:\n  vesper inspect [TASK] [--project PROJECT_DIRECTORY]\n\nInspects bounded local filesystem and Git evidence through the permissioned read-only tool runtime. Deterministic planning is the default; when explicitly enabled, complex questions may send bounded, redacted task and evidence metadata to the selected OpenAI/NVIDIA model. No commands are run, files are modified, or complete call graphs claimed.\n" : options.command === "run" ? USAGE : discoveryUsage(options.command));
     return 0;
@@ -536,7 +549,7 @@ async function runVesper(argv = process.argv.slice(2), dependencies = {}) {
   if (options.command === "doctor") return runDoctor(options, dependencies, output, errorOutput);
   if (options.command === "providers") return runProviders(options, dependencies, output, errorOutput);
   if (options.command === "plan") return runPlan(options, dependencies, output, errorOutput);
-  if (options.command === "inspect") return runInspect(options, dependencies, output, errorOutput);
+  if (options.command === "inspect" || options.command === "impact") return runInspect(options, dependencies, output, errorOutput);
   if (options.command === "tools") return runTools(options, dependencies, output, errorOutput);
 
   if (options.command === "capabilities") {

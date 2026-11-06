@@ -28,7 +28,11 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:fastLane.openPanel"
+    "onCommand:fastLane.openPanel",
+    "onCommand:fastLane.inspectRepository",
+    "onCommand:fastLane.assessChangeImpact",
+    "onCommand:fastLane.switchSession",
+    "onCommand:fastLane.newSessionWithProvider"
   ],
   "main": "./extension.js",
   "scripts": {
@@ -45,6 +49,22 @@
       {
         "command": "fastLane.openPanel",
         "title": "Vesper: Open Panel"
+      },
+      {
+        "command": "fastLane.inspectRepository",
+        "title": "Vesper: Inspect Repository"
+      },
+      {
+        "command": "fastLane.assessChangeImpact",
+        "title": "Vesper: Assess Change Impact"
+      },
+      {
+        "command": "fastLane.switchSession",
+        "title": "Vesper: Switch Session"
+      },
+      {
+        "command": "fastLane.newSessionWithProvider",
+        "title": "Vesper: New Session with Provider"
       }
     ]
   }

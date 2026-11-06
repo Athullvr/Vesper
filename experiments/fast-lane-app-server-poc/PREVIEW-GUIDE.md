@@ -34,7 +34,7 @@ vesper doctor --project "$PWD"
 vesper inspect "Trace greet in src/greeting.js" --project "$PWD"
 ```
 
-Inspection is local and read-only by default. It reports bounded evidence and may be partial; it does not run tests or establish a complete call graph.
+Inspection is local and read-only by default. It reports bounded evidence and may be partial; it does not run tests or establish a complete call graph. In VS Code, **Vesper: Inspect Repository** opens a question box and runs the same System Model report. **Vesper: Assess Change Impact** produces a focused impact report from the target or current Git evidence. Both use the selected workspace folder and permissioned read-only runtime. Optional model planning remains disabled unless explicitly enabled in the process environment.
 
 ## Try one reversible coding task
 
@@ -58,7 +58,7 @@ git diff --check
 git diff -- src/greeting.js
 ```
 
-The VS Code panel can inspect and discuss a project, but its current Codex policy is read-only and it declines native approval requests. Use the terminal for this write-task preview. Reset only the known fixture edit after review with `git restore -- src/greeting.js`.
+The VS Code panel can inspect a repository, assess impact, switch among saved sessions for the open project, and start a new session with an explicitly selected configured provider and model. Its current Codex policy is read-only and it declines native approval requests. Use the terminal for this write-task preview. Reset only the known fixture edit after review with `git restore -- src/greeting.js`.
 
 ## Known preview limits
 
