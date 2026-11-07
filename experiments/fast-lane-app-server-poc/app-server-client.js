@@ -220,19 +220,24 @@ class AppServerClient extends EventEmitter {
     return this.threadId;
   }
 
-  readThreadHistory() {
+  readThreadHistory({ cursor } = {}) {
     if (!this.threadId || !this.threadReady) return Promise.reject(new Error("A resumed Codex thread is required before reading conversation history."));
     if (this.activeTurn || this.startingTurn) return Promise.reject(new Error("Cannot read conversation history while a Codex turn is active or starting."));
     if (this.historyReadPromise) return this.historyReadPromise;
+    if (cursor !== undefined && cursor !== null && (typeof cursor !== "string" || !cursor.length || Buffer.byteLength(cursor, "utf8") > 8_192 || /[\u0000-\u001f\u007f-\u009f]/u.test(cursor))) {
+      return Promise.reject(new Error("Codex conversation history cursor is invalid."));
+    }
 
     const threadId = this.threadId;
     const generation = this.connectionGeneration;
-    const promise = this.request("thread/turns/list", {
+    const params = {
       threadId,
       limit: MAX_HISTORY_TURNS,
       sortDirection: "desc",
       itemsView: "full",
-    }).then((response) => {
+      ...(cursor ? { cursor } : {}),
+    };
+    const promise = this.request("thread/turns/list", params).then((response) => {
       if (this.disposed || this.connectionGeneration !== generation || this.threadId !== threadId ||
           !this.threadReady || !this.child) {
         throw new Error("Codex conversation history belongs to a replaced or disconnected thread.");
@@ -241,14 +246,15 @@ class AppServerClient extends EventEmitter {
         throw new Error("Codex app-server returned an invalid conversation history response.");
       }
       if (response.nextCursor !== undefined && response.nextCursor !== null &&
-          (typeof response.nextCursor !== "string" || !response.nextCursor.length || response.nextCursor.length > 8_192)) {
+          (typeof response.nextCursor !== "string" || !response.nextCursor.length || response.nextCursor.length > 8_192 || /[\u0000-\u001f\u007f-\u009f]/u.test(response.nextCursor))) {
         throw new Error("Codex app-server returned an invalid conversation history cursor.");
       }
       const turns = response.data.slice(0, MAX_HISTORY_TURNS).reverse();
       const cursorMissingAtPageLimit = !Object.hasOwn(response, "nextCursor") && response.data.length >= MAX_HISTORY_TURNS;
       const truncated = response.data.length > MAX_HISTORY_TURNS ||
         (typeof response.nextCursor === "string" && response.nextCursor.length > 0) || cursorMissingAtPageLimit;
-      return { threadId, turns, truncated };
+      return { threadId, turns, truncated, nextCursor: typeof response.nextCursor === "string" ? response.nextCursor : null,
+        hasOlder: typeof response.nextCursor === "string" && response.nextCursor.length > 0 };
     }).finally(() => {
       if (this.historyReadPromise === promise) this.historyReadPromise = undefined;
     });

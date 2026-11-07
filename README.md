@@ -44,19 +44,19 @@ Install a locally packaged VSIX from the application directory with `npm run pac
 - **Switch Session** to select a saved session scoped to the current workspace folder.
 - **New Session with Provider** to choose Codex, configured OpenAI, or configured NVIDIA NIM and pin a remote model ID to that new session.
 
-The panel also has **Inspect repository**, **Change impact**, and **Capabilities** actions. The Capabilities action previews the local capability catalog; it does not create an implementation plan or activate an integration. The extension keeps Codex in read-only mode and declines native approval requests. Use the terminal for approval-controlled file changes and supported verification.
+The panel also has **Inspect repository**, **Change impact**, **Capabilities**, and **Refresh verification evidence** actions. It lists recent sessions for the selected project, shows the active provider/model and task status, restores conversation history from the provider's existing storage, and can page older messages where supported. Capability status separates discovery from installation, configuration, availability, runtime loading, and successful operation. OpenAI/NVIDIA Vesper file proposals can be reviewed and approved once in the panel. Codex remains read-only there: native approval requests show a bounded preview and are declined, preserving the existing terminal approval path. Verification suggestions remain unrun until a developer requests one exact command and approves its isolated execution; command execution remains disabled without explicit host opt-in and validated sandbox support.
 
 ## Providers and capabilities
 
 Codex remains the default. OpenAI Chat Completions uses `OPENAI_API_KEY` (or `VESPER_OPENAI_API_KEY`) and `VESPER_OPENAI_MODEL`. NVIDIA NIM uses `NVIDIA_API_KEY` (or `VESPER_NVIDIA_API_KEY`) and `VESPER_NVIDIA_MODEL`. `VESPER_PROVIDER` selects the default for new sessions; CLI flags and the VS Code new-session picker can choose a provider for one session. Provider status and model labels are configuration observations, not proof of successful authentication or model support.
 
-Vesper discovers MCP servers, skills, and plugins using existing local/Codex sources. Run `vesper capabilities`, `vesper capabilities status`, `vesper skills`, `vesper mcp`, or `vesper plugins` to inspect them. Management actions are explicit and limited to supported documented operations; discovery does not prove that an integration is loaded or operational.
+Vesper discovers MCP servers, skills, and plugins using existing local/Codex sources. Run `vesper capabilities`, `vesper capabilities status`, `vesper skills`, `vesper mcp`, or `vesper plugins` to inspect them. Management actions are explicit and limited to supported documented operations; discovery does not prove that an integration is installed, configured, connected, loaded, or operational. In VS Code, API-key presence is not reported as authentication; Codex CLI sign-in remains separate from API-key authentication.
 
 ## Privacy and approvals
 
 Repository inspection is local and read-only by default. Optional model-assisted investigation is disabled unless `VESPER_SYSTEM_MODEL_ASSISTED=1` is set for a supported OpenAI/NVIDIA provider. `VESPER_LOCAL_ONLY=1` disables those planner requests; it does not prevent a coding task from going to its selected provider. Remote coding tasks send task text and bounded synthesized repository findings. Review provider data handling before sending private source.
 
-Codex keeps its native app-server approval semantics. Vesper-managed file proposals require fresh one-time approval in the interactive terminal. Provider tool calls cannot run shell commands. Command execution is disabled by default and, when explicitly enabled, is restricted to the existing Linux rootless Podman path. No hosted backend or telemetry is required by Vesper.
+Codex keeps its native app-server approval semantics. The VS Code panel shows native approval details but declines the request; use the terminal for Codex's existing approval flow. OpenAI/NVIDIA Vesper-managed file proposals can request fresh one-time approval through the panel or terminal. Provider tool calls cannot run shell commands. Command execution is disabled by default and, when explicitly enabled, uses the existing Linux rootless Podman path with read-only workspace access for verification. No hosted backend or telemetry is required by Vesper.
 
 ## Current limits and troubleshooting
 

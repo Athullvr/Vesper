@@ -58,13 +58,13 @@ git diff --check
 git diff -- src/greeting.js
 ```
 
-The VS Code panel can inspect a repository, assess impact, switch among saved sessions for the open project, and start a new session with an explicitly selected configured provider and model. Its current Codex policy is read-only and it declines native approval requests. Use the terminal for this write-task preview. Reset only the known fixture edit after review with `git restore -- src/greeting.js`.
+The VS Code panel can inspect a repository, assess impact, list and switch among saved sessions for the open project, restore provider-backed history, and start a new session with an explicitly selected configured provider and model. OpenAI/NVIDIA Vesper file proposals have a one-time review card. Codex remains read-only in the panel, which displays a review preview and declines native approval requests; use the terminal if you need Codex's native approval flow. Verification candidates are shown as unrun and require a separate explicit request and one-time approval. Command execution still requires the host opt-in and validated isolated runtime. Reset only the known fixture edit after review with `git restore -- src/greeting.js`.
 
 ## Known preview limits
 
 - The npm package name and Marketplace publisher must be finalized before a public registry release. A VSIX preview can be installed from a local file without publishing.
 - Only the stated Linux x64 / Node.js 20 host has been exercised. Other OS and Node versions are unverified.
-- Authenticated provider turns, VS Code graphical activation, and real file-write approval flows remain separate checks; see the release report.
+- Authenticated provider turns, VS Code graphical activation, real file-write approval flows, and isolated verification execution remain separate checks; see the release report.
 - Optional rootless Podman command isolation is not validated and remains disabled by default. Vesper does not fall back to host command execution.
 - Repository inspection is bounded and language coverage is partial. Dynamic dispatch, aliases, reflection, and framework conventions can hide relationships.
 - This checkout has no root `LICENSE` file or package license declaration. The VSIX packager warns about this; do not publish or redistribute the artifact until the project license is decided.

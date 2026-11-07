@@ -63,13 +63,17 @@ code --disable-telemetry --disable-updates --disable-experiments --new-window \
   --extensions-dir /tmp/vesper-preview-code-extensions /path/to/disposable-project
 ```
 
-Open the Command Palette and run **Vesper: Open Panel**. Record whether the panel opens, whether its project/session status is understandable, and any extension-host error. The manifest contributes no VS Code settings; the default provider is Codex. Try the panel's **Inspect repository** and **Change impact** actions with a known symbol. Check that evidence paths and coverage limitations are visible, no coding task is submitted, and no project files change. Try **Switch session** and confirm the picker lists only sessions for this workspace folder. **New provider session** should require an explicitly selected, configured provider and pin the entered model ID to that new session; its selection must not change the workspace default. Confirm the panel shows provider readiness and model freshness without claiming live verification. Also confirm that a failed provider request does not switch providers or submit twice.
+Open the Command Palette and run **Vesper: Open Panel**. Record whether the panel opens, whether its project/session status is understandable, and any extension-host error. The manifest contributes no VS Code settings; the default provider is Codex. Try the panel's **Inspect repository** and **Change impact** actions with a known symbol. Check that evidence paths and coverage limitations are visible, no coding task is submitted, and no project files change. Try **Switch session** and confirm the picker lists only sessions for this workspace folder and displays provider, model, status, and update time. Confirm the panel lists recent sessions and reports provider support, configuration, authentication state, availability, live results, and model freshness as distinct observations. **New provider session** should require an explicitly selected, configured provider and pin the entered model ID to that new session; its selection must not change the workspace default. Also confirm that a failed provider request does not switch providers or submit twice.
 
 For a provider-backed coding question, Vesper sends the task and bounded synthesized repository findings to the explicitly selected provider. Do not use private source. Direct repository inspection uses the read-only System Model path by default; simple exact local requests such as **What Git branch am I on?** use Vesper's local handler and do not start a provider.
 
 ## 4. Approval and task-state boundaries
 
-The VS Code Codex client is read-only and declines native approval requests. It should not write project files. Verify the decline/error is visible and the project diff remains empty. Do not treat this as an approval prompt in the panel.
+The VS Code Codex client is read-only and declines native approval requests. Confirm that a bounded request preview is shown, no approval button appears, the decline is explained, and the project diff remains empty. Do not treat this as an approval prompt in the panel.
+
+With a tool-calling OpenAI/NVIDIA model explicitly configured, confirm that a proposed file change appears as an exact one-time approval card. Reject one proposal and verify no write occurs; in a disposable fixture, approve a separate safe proposal and verify the runtime rechecks and reports the actual result. Confirm the approval cannot be reused after a project, session, proposal, or file-state change.
+
+For verification visibility, confirm investigation requirements and manifest command candidates are labeled as suggestions and nothing runs during refresh. Without `VESPER_ENABLE_ISOLATED_COMMANDS=1`, no run-approval control should be offered. If the opt-in and sandbox prerequisites are deliberately enabled for the isolated disposable fixture, request one candidate, inspect the exact argv and read-only policy, then approve or reject it once. Confirm only an actually executed command displays output/exit status, and exercise cancellation and isolation failure without claiming a pass.
 
 To test the existing one-time file-change approval, use the terminal CLI on the disposable project:
 
@@ -111,7 +115,9 @@ Do not test rejected credentials by entering an invalid key. Mock tests cover re
 | Panel task-state updates |  |  |
 | Project-scoped session switching |  |  |
 | Explicit provider/model session selection |  |  |
-| Read-only approval boundary |  |  |
+| Codex decline-only approval boundary |  |  |
+| Vesper-managed VS Code file approval |  |  |
+| VS Code verification approval and output |  |  |
 | Terminal one-time approval |  |  |
 | Missing-provider failure and recovery |  |  |
 | Clean deactivation and restart |  |  |

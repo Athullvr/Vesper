@@ -38,6 +38,7 @@ const MAX_PLANNER_CONTENT_BYTES = 8 * 1024;
 const MAX_RESPONSE_TEXT_LENGTH = 256 * 1024;
 const MAX_TEXT_EVENT_LENGTH = 32 * 1024;
 const MAX_HISTORY_MESSAGES = 120;
+const MAX_HISTORY_PAGE_MESSAGES = 40;
 const MAX_HISTORY_TEXT_LENGTH = 128 * 1024;
 const DEFAULT_MAX_TOOL_CALLS = 8;
 const HARD_MAX_TOOL_CALLS = 24;
@@ -334,7 +335,7 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     return Object.freeze({ providerId: this.id, conversationId });
   }
 
-  async readConversationHistory() {
+  async readConversationHistory({ cursor } = {}) {
     this.assertLive();
     if (!this.capabilities.conversationHistory) throw unsupportedOperation(this.id, "read conversation history");
     if (!this.conversationId || !this.projectPath) return emptyHistory(this.config.providerName);
@@ -344,11 +345,18 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
     } catch {
       return unavailableHistory("The saved provider conversation history could not be read safely.");
     }
-    const source = record.messages.slice(-MAX_HISTORY_MESSAGES);
+    const end = cursor === undefined || cursor === null ? record.messages.length
+      : typeof cursor === "string" && /^\d{1,12}$/u.test(cursor) ? Number(cursor) : NaN;
+    if (!Number.isSafeInteger(end) || end < 0 || end > record.messages.length) {
+      return unavailableHistory("The saved provider history cursor is invalid; Vesper kept the current session unchanged.");
+    }
+    const start = Math.max(0, end - MAX_HISTORY_PAGE_MESSAGES);
+    const source = record.messages.slice(start, end);
     let visibleLength = 0;
     const entries = [];
-    for (let index = Math.max(0, source.length - MAX_HISTORY_MESSAGES); index < source.length; index += 1) {
-      const message = source[index];
+    for (let pageIndex = 0; pageIndex < source.length; pageIndex += 1) {
+      const index = start + pageIndex;
+      const message = source[pageIndex];
       const toolRequest = message.role === "assistant" && Array.isArray(message.tool_calls);
       const label = message.role === "user" ? "User task"
         : message.role === "tool" ? "Vesper permissioned tool result"
@@ -369,16 +377,19 @@ class CompatibleChatCompletionsProvider extends EventEmitter {
       visibleLength += label.length + text.length;
       if (text.length < messageText.length) break;
     }
-    const partial = record.status !== "ready" || entries.length < record.messages.length;
+    const nextCursor = start > 0 ? String(start) : null;
+    const partial = record.status !== "ready" || entries.length < source.length || Boolean(nextCursor);
     return {
       state: entries.length === 0 ? "empty" : partial ? "partial" : "available",
       entries,
       truncated: partial,
+      nextCursor,
+      hasOlder: Boolean(nextCursor),
       text: record.status === "uncertain" || record.status === "pending"
         ? "Showing the locally saved transcript. The last request has no confirmed completion and was not resubmitted."
         : record.status === "unsupported"
           ? "Showing the locally saved transcript. A requested tool operation was not executed."
-          : entries.length ? "Conversation history restored from Vesper's private local provider store." : "This provider conversation has no saved messages yet.",
+          : entries.length ? (nextCursor ? "Showing the newest saved messages from Vesper's private local transcript." : "Conversation history restored from Vesper's private local provider store.") : "This provider conversation has no saved messages yet.",
     };
   }
 

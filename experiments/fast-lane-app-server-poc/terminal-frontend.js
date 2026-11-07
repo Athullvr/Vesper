@@ -12,7 +12,7 @@ const { assertExecutionProvider } = require("./execution-interface");
 const { createPermissionedToolRuntime, renderToolApproval } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
 const { createSystemModel, renderSystemModelReport } = require("./system-model");
-const { TaskLifecycle, understandTask, renderPreflightSummary, renderTaskLifecycle, captureWorkspaceDiff } = require("./task-workflow");
+const { TaskLifecycle, understandTask, renderPreflightSummary, renderTaskLifecycle, captureWorkspaceDiff, taskStageLabel, selectVerificationCandidates, parseVerificationArgv } = require("./task-workflow");
 const { codexApprovalResponse, normalizeApprovalRequest } = require("./codex-execution-provider");
 const { getPlanningMetadata } = require("./capability-planner");
 const { MAX_TURN_DIFF_LENGTH } = require("./turn-diff-activity");
@@ -1046,21 +1046,6 @@ function isTextOnlyProvider(providerId) {
   return providerId === "openai-chat-completions" || providerId === "nvidia-nim";
 }
 
-function selectVerificationCandidates(commands) {
-  return (Array.isArray(commands) ? commands : []).filter((item) => item && typeof item === "object" &&
-    typeof item.name === "string" && /^(?:test(?:[: -].*)?|build|check|lint)(?:\s|$)/iu.test(item.name) &&
-    typeof item.command === "string" && item.command.trim() && typeof item.path === "string")
-    .slice(0, 8).map((item) => Object.freeze({
-      name: item.name.slice(0, 80), command: item.command.slice(0, 240), path: item.path.slice(0, 240), inferred: item.inferred === true,
-    }));
-}
-
-function parseVerificationArgv(command) {
-  if (typeof command !== "string" || !command.trim() || command.length > 240 || !/^[A-Za-z0-9_.+@/:=-]+(?:\s+[A-Za-z0-9_.+@/:=-]+)*$/u.test(command.trim())) return null;
-  const argv = command.trim().split(/\s+/u);
-  return argv.length > 0 && argv.length <= 32 ? argv : null;
-}
-
 function createLineIO(input, output) {
   const rl = readline.createInterface({ input, output, terminal: Boolean(input.isTTY && output.isTTY) });
   let closed = false;
@@ -1340,16 +1325,8 @@ function safeFileSummaryField(value) {
 }
 
 function workflowStageLabel(stage) {
-  switch (stage) {
-    case "understanding": return "understanding task and project scope";
-    case "inspection": return "inspecting selected project evidence";
-    case "planning": return "planning from inspected evidence";
-    case "proposal": return "preparing a reviewable file proposal";
-    case "approval": return "waiting for fresh one-time approval";
-    case "verification": return "verifying the approved file change";
-    case "report": return "preparing the evidence-based report";
-    default: return "";
-  }
+  const label = taskStageLabel(stage);
+  return label === "Task state unavailable" ? "" : label.toLowerCase();
 }
 
 module.exports = {

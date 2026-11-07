@@ -122,17 +122,18 @@ class CodexExecutionProvider extends EventEmitter {
     }
   }
 
-  async readConversationHistory() {
+  async readConversationHistory({ cursor } = {}) {
     this.assertLive();
     if (!this.capabilities.conversationHistory || typeof this.client.readThreadHistory !== "function") {
       throw unsupportedOperation(this.id, "read conversation history");
     }
     try {
-      const history = await this.client.readThreadHistory();
+      const history = await this.client.readThreadHistory({ cursor });
       if (!history || history.threadId !== this.conversationId) {
         throw createExecutionError("RESUME_FAILED", "Provider history did not match the active Vesper conversation.", { providerId: this.id });
       }
-      return projectConversationHistory(history);
+      return Object.freeze({ ...projectConversationHistory(history), nextCursor: history.nextCursor || null,
+        hasOlder: history.hasOlder === true });
     } catch (error) {
       throw mapProviderError(error, "CONNECTION_LOST");
     }
@@ -456,6 +457,7 @@ function publicApprovalRequest(request) {
     approvalId: request.approvalId,
     requestId: request.requestId,
     reviewTitle: request.review.title,
+    reviewBody: typeof request.review.body === "string" ? request.review.body.slice(0, 20_000) : "",
     reviewTruncated: request.review.truncated,
     canApprove: request.canApprove,
   });

@@ -117,7 +117,8 @@ function renderPreflightSummary(result) {
 }
 
 class TaskLifecycle {
-  constructor({ requestId, sessionId, providerId, projectRoot, task = "" } = {}) {
+  constructor({ requestId, sessionId, providerId, projectRoot, task = "", now = () => new Date().toISOString() } = {}) {
+    this.now = now;
     this.context = {
       requestId: safeIdentity(requestId),
       sessionId: safeIdentity(sessionId),
@@ -144,6 +145,11 @@ class TaskLifecycle {
     this.diff = null;
     this.verification = { state: "not-run", command: null, exitCode: null, summary: "No verification command has run." };
     this.verificationSuggestions = [];
+    this.verificationCandidates = [];
+    this.verificationCandidatesFresh = false;
+    this.verificationCandidatesObservedAt = null;
+    this.startedAt = safeTimestamp(now());
+    this.completedAt = null;
     this.finished = false;
     this.expectsImplementation = isImplementationTask(task);
   }
@@ -154,6 +160,7 @@ class TaskLifecycle {
     const suggestions = preflight?.evidenceIncluded && Array.isArray(investigation?.verificationRequirements)
       ? investigation.verificationRequirements : [];
     this.verificationSuggestions = suggestions.slice(0, 8).map((item) => cleanText(item, 240)).filter(Boolean);
+    this.setVerificationCandidates(investigation?.project?.commands || [], { fresh: false });
     if (preflight?.state === "cancelled") this.cancelBeforeSubmission(preflight.note);
     else this.setStage("planning");
     return this.snapshot();
@@ -161,6 +168,19 @@ class TaskLifecycle {
 
   setStage(stage) {
     if (VALID_STAGES.has(stage)) this.stage = stage;
+    return this.snapshot();
+  }
+
+  setVerificationCandidates(commands, { fresh = false, observedAt = this.now() } = {}) {
+    this.verificationCandidates = selectVerificationCandidates(commands);
+    this.verificationCandidatesFresh = fresh === true;
+    this.verificationCandidatesObservedAt = this.verificationCandidatesFresh ? safeTimestamp(observedAt) : null;
+    return this.snapshot();
+  }
+
+  setVerificationSuggestions(suggestions) {
+    this.verificationSuggestions = (Array.isArray(suggestions) ? suggestions : []).slice(0, 8)
+      .map((item) => cleanText(item, 240)).filter(Boolean);
     return this.snapshot();
   }
 
@@ -363,6 +383,7 @@ class TaskLifecycle {
   }
 
   complete({ result, error } = {}) {
+    this.completedAt ||= safeTimestamp(this.now());
     this.finished = true;
     if (error) {
       const code = safeToken(error.code, 80);
@@ -392,7 +413,8 @@ class TaskLifecycle {
   recordVerification(result, command) {
     const argv = Array.isArray(command) ? command.slice(0, 64).map((item) => cleanText(item, 240)) : [];
     const display = argv.length ? argv.join(" ") : "verification command";
-    const exitCode = Number.isInteger(result?.result?.exitCode) ? result.result.exitCode : null;
+    const executed = result?.executed === true;
+    const exitCode = executed && Number.isInteger(result?.result?.exitCode) ? result.result.exitCode : null;
     const errorCode = safeToken(result?.error?.code || result?.errorCode, 80);
     let state = "unavailable";
     let summary = "The verification command outcome is unavailable.";
@@ -402,17 +424,17 @@ class TaskLifecycle {
     } else if (["APPROVAL_CANCELLED", "TOOL_INTERRUPTED", "COMMAND_INTERRUPTED"].includes(errorCode) || result?.state === "interrupted") {
       state = "cancelled";
       summary = "The verification command was cancelled; its execution was not confirmed.";
-    } else if (result?.state === "executed" && exitCode === 0 && result.result?.signal === null) {
+    } else if (executed && result?.state === "executed" && exitCode === 0 && result.result?.signal === null) {
       state = "passed";
       summary = "The isolated verification command returned exit code 0.";
-    } else if (result?.executed === true || exitCode !== null) {
+    } else if (executed) {
       state = "failed";
       summary = exitCode === null ? "The verification command ran without a confirmed exit code." : `The verification command returned exit code ${exitCode}.`;
     } else if (result?.state === "rejected") {
       state = "rejected";
       summary = "The verification command was rejected and did not run.";
     }
-    this.verification = Object.freeze({ state, command: display, exitCode, summary, errorCode: errorCode || null });
+    this.verification = Object.freeze({ state, command: display, executed, exitCode, summary, errorCode: errorCode || null });
     this.stage = "report";
     this.recomputeStatus();
     return this.snapshot();
@@ -460,6 +482,12 @@ class TaskLifecycle {
       diff: this.diff,
       verification: this.verification,
       verificationSuggestions: Object.freeze(this.verificationSuggestions.slice(0, 8)),
+      verificationCandidates: Object.freeze(this.verificationCandidates.slice(0, 8)),
+      verificationCandidatesFresh: this.verificationCandidatesFresh,
+      verificationCandidatesObservedAt: this.verificationCandidatesObservedAt,
+      startedAt: this.startedAt,
+      completedAt: this.completedAt,
+      finished: this.finished,
       expectsImplementation: this.expectsImplementation,
       operations: Object.freeze(this.operations.slice(0, MAX_TASK_FILES).map((item) => Object.freeze({ ...item }))),
       eventsOmitted: this.eventsOmitted,
@@ -472,7 +500,7 @@ class TaskLifecycle {
 function renderTaskLifecycle(snapshot) {
   const state = snapshot || {};
   const lines = [
-    `Task workflow: ${safeToken(state.status, 40) || "unknown"} · provider ${safeToken(state.providerStatus, 40) || "unknown"} · stage ${safeToken(state.stage, 40) || "unknown"}.`,
+    `Task workflow: ${taskStatusLabel(state.status)} · provider ${safeToken(state.providerStatus, 40) || "unknown"} · stage ${taskStageLabel(state.stage)}.`,
     `Repository evidence: ${safeToken(state.preflightState, 40) || "unknown"}.`,
   ];
   if (state.pendingApprovals) lines.push(`Approvals still pending: ${state.pendingApprovals}.`);
@@ -492,7 +520,54 @@ function renderTaskLifecycle(snapshot) {
   for (const item of (state.verificationSuggestions || []).slice(0, 4)) lines.push(`Suggested verification, not run: ${item}`);
   if (state.errorCode) lines.push(`Provider failure: ${state.errorCode}. Vesper did not retry the task.`);
   if (state.eventsOmitted) lines.push(`Workflow event bound reached; ${state.eventsOmitted} additional events omitted.`);
+  if (state.startedAt) lines.push(`Started: ${state.startedAt}${state.completedAt ? ` · finished: ${state.completedAt}` : ""}.`);
   return lines.join("\n");
+}
+
+function taskStageLabel(stage) {
+  return ({
+    understanding: "Investigating task scope",
+    inspection: "Investigating repository",
+    planning: "Planning",
+    proposal: "Preparing a change proposal",
+    approval: "Waiting for approval",
+    implementation: "Implementing",
+    review: "Reviewing changes",
+    verification: "Verifying",
+    report: "Reporting results",
+  })[stage] || "Task state unavailable";
+}
+
+function taskStatusLabel(status) {
+  return ({
+    running: "In progress",
+    completed: "Completed",
+    partial: "Needs review",
+    failed: "Failed",
+    interrupted: "Interrupted",
+    uncertain: "Outcome uncertain",
+    cancelled: "Cancelled",
+  })[status] || "Status unavailable";
+}
+
+function selectVerificationCandidates(commands) {
+  return (Array.isArray(commands) ? commands : []).filter((item) => item && typeof item === "object" &&
+    typeof item.name === "string" && /^(?:test(?:[: -].*)?|build|check|lint)(?:\s|$)/iu.test(item.name) &&
+    typeof item.command === "string" && item.command.trim() && typeof item.path === "string")
+    .slice(0, 8).map((item) => Object.freeze({
+      name: item.name.slice(0, 80), command: item.command.slice(0, 240), path: item.path.slice(0, 240), inferred: item.inferred === true,
+    }));
+}
+
+function parseVerificationArgv(command) {
+  if (typeof command !== "string" || !command.trim() || command.length > 240 || !/^[A-Za-z0-9_.+@/:=-]+(?:\s+[A-Za-z0-9_.+@/:=-]+)*$/u.test(command.trim())) return null;
+  const argv = command.trim().split(/\s+/u);
+  return argv.length > 0 && argv.length <= 32 ? argv : null;
+}
+
+function safeTimestamp(value) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
 function normalizeProviderState(value, errorCode) {
@@ -569,6 +644,7 @@ async function captureWorkspaceDiff(lifecycle, runtime, { isCurrent = () => true
 
 function normalizeApprovalState(value) {
   if (["pending", "requested", "approval-required"].includes(value)) return "pending";
+  if (["authorized", "authorized-once"].includes(value)) return "authorized";
   if (["approved", "approve", "approve-once"].includes(value)) return "approved";
   if (["cancelled", "canceled"].includes(value)) return "cancelled";
   return "rejected";
@@ -629,4 +705,8 @@ module.exports = {
   renderTaskLifecycle,
   isImplementationTask,
   captureWorkspaceDiff,
+  taskStageLabel,
+  taskStatusLabel,
+  selectVerificationCandidates,
+  parseVerificationArgv,
 };

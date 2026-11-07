@@ -11,16 +11,19 @@ const { resolveProjectDirectory } = require("./cli");
 const { createCapabilityProvider } = require("./capability-catalog");
 const { createCodexRuntimeStatusAdapter } = require("./codex-runtime-status");
 const { createCapabilityPlan, getPlanningMetadata, renderCapabilityPlan } = require("./capability-planner");
-const { unavailableHistory } = require("./conversation-history");
-const { createPermissionedToolRuntime } = require("./permissioned-tool-runtime");
+const { MAX_HISTORY_MESSAGES, MAX_HISTORY_TEXT_LENGTH, unavailableHistory } = require("./conversation-history");
+const { createPermissionedToolRuntime, renderToolApproval } = require("./permissioned-tool-runtime");
 const { createRepositoryIntelligence } = require("./repository-intelligence");
 const { createSystemModel, isComplexInvestigation, isModelAssistedEnabled, renderSystemModelReport, shouldInvestigateTask } = require("./system-model");
-const { TaskLifecycle, understandTask, captureWorkspaceDiff } = require("./task-workflow");
+const { TaskLifecycle, understandTask, captureWorkspaceDiff, taskStageLabel, taskStatusLabel, selectVerificationCandidates, parseVerificationArgv } = require("./task-workflow");
 const { redactSensitiveText } = require("./command-activity");
 
 const MAX_PROMPT_LENGTH = 32 * 1024;
 const MAX_PREFLIGHT_CONTEXT_LENGTH = 7_000;
 const MAX_PREFLIGHT_SUMMARY_LENGTH = 1_400;
+const MAX_PANEL_APPROVAL_REVIEW_LENGTH = 32 * 1024;
+const TOOL_APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_HISTORY_PAGES = 8;
 
 let output;
 let executionProvider;
@@ -44,6 +47,12 @@ let historyLoadingSessionId;
 let deferredHistoryRestore = false;
 let activeRepositoryPreflight;
 let activeRepositoryInspection;
+let activeVerification;
+let lastTaskLifecycle;
+let lastTaskGeneration;
+let activeHistoryPage;
+let providerLiveStatus = new Map();
+let pendingToolApprovals = new Map();
 let repositoryToolRuntimeFactory = createPermissionedToolRuntime;
 const capabilityProviders = new Map();
 
@@ -69,6 +78,8 @@ function activate(context, dependencies = {}) {
 function deactivate() {
   cancelActiveRepositoryInspection();
   cancelActiveRepositoryPreflight();
+  cancelActiveVerification("extension-deactivated");
+  cancelPendingToolApprovals("cancelled");
   disposeCurrentAppServer();
   repositoryToolRuntimeFactory = createPermissionedToolRuntime;
 }
@@ -92,6 +103,8 @@ function openPanel(context) {
     if (panel === currentPanel) {
       panel = undefined;
       if (activeRepositoryInspection) cancelActiveRepositoryInspection();
+      cancelPanelToolApprovals(currentPanel);
+      if (activeVerification) cancelActiveVerification("panel-closed");
     }
   }, null, context.subscriptions);
 
@@ -106,6 +119,9 @@ function openPanel(context) {
         postToPanel(currentPanel, { type: "active-request", requestId: activeCodexRequestId, kind: activeRequestType });
       }
       await restoreSelectedHistory(currentPanel);
+      postCurrentTaskState(currentPanel);
+      for (const approval of pendingToolApprovals.values()) postToolApproval(approval);
+      if (activeVerification) postToPanel(currentPanel, { type: "verification-start", requestId: activeVerification.requestId, operation: activeVerification.kind });
       return;
     }
 
@@ -131,6 +147,26 @@ function openPanel(context) {
 
     if (message?.type === "new-session-with-provider") {
       await createSessionWithProvider(currentPanel);
+      return;
+    }
+
+    if (message?.type === "load-older-history") {
+      await loadOlderHistory(currentPanel);
+      return;
+    }
+
+    if (message?.type === "tool-approval-response") {
+      decideToolApproval(currentPanel, message);
+      return;
+    }
+
+    if (message?.type === "refresh-verification" && typeof message.requestId === "string") {
+      await refreshVerificationSuggestions(message.requestId, currentPanel);
+      return;
+    }
+
+    if (message?.type === "run-verification" && typeof message.requestId === "string" && Number.isSafeInteger(message.index)) {
+      await runVerification(message.requestId, message.index, currentPanel);
       return;
     }
 
@@ -161,7 +197,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
     postToPanel(targetPanel, { type: "input-error", text: `Enter a task between 1 and ${MAX_PROMPT_LENGTH.toLocaleString()} characters.` });
     return;
   }
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection) return;
+  if (hasActiveOperation()) return;
   const requestId = ++requestSequence;
   const startedAt = performance.now();
   const project = selectedProjectContext();
@@ -233,16 +269,35 @@ async function handlePrompt(prompt, targetPanel = panel) {
 
   const session = selectedSession;
   const generation = projectGeneration;
-  const client = executionProviderForSession(session, cwd, generation);
+  const lifecycle = new TaskLifecycle({ requestId: String(requestId), sessionId: session.sessionId, providerId: session.providerId, projectRoot: cwd, task: prompt });
+  lastTaskLifecycle = lifecycle;
+  lastTaskGeneration = generation;
   activeCodexRequestId = requestId;
   activeRequestType = "turn";
-  const lifecycle = new TaskLifecycle({ requestId: String(requestId), sessionId: session.sessionId, providerId: session.providerId, projectRoot: cwd, task: prompt });
+  let client;
+  try {
+    client = executionProviderForSession(session, cwd, generation);
+  } catch (error) {
+    lifecycle.complete({ error });
+    postToPanel(targetPanel, { type: "assistant-start", requestId, providerId: session.providerId });
+    postCurrentTaskState(targetPanel);
+    postToPanel(targetPanel, { type: "assistant-error", requestId, state: "failed", providerId: session.providerId,
+      text: `${providerSessionName(session.providerId)} could not start this task: ${safeMessage(error)}`, elapsedMs: 0 });
+    setProviderLiveStatus(session.sessionId, { text: `last provider task could not start (${safeErrorCode(error)})` });
+    activeCodexRequestId = undefined;
+    activeRequestType = undefined;
+    postSessionView(targetPanel);
+    return;
+  }
   const postWorkflowState = () => {
     if (!isCurrentRequest(requestId, client, session.sessionId, generation)) return;
     const { projectRoot: _projectRoot, ...state } = lifecycle.snapshot();
-    postToPanel(targetPanel, { type: "workflow-state", requestId, workflow: state });
+    const workflow = { ...state, stageLabel: taskStageLabel(state.stage), statusLabel: taskStatusLabel(state.status) };
+    postToPanel(targetPanel, { type: "workflow-state", requestId, workflow });
+    postToPanel(targetPanel, { type: "task-state", workflow });
   };
   postToPanel(targetPanel, { type: "assistant-start", requestId, providerId: session.providerId });
+  postCurrentTaskState(targetPanel);
   const providerName = providerSessionName(session.providerId);
   if (session.providerConversationId && !client.getState().conversationReady) {
     setSessionView(targetPanel, {
@@ -294,6 +349,10 @@ async function handlePrompt(prompt, targetPanel = panel) {
       });
     } else if (event?.type === "task-progress" && event.kind === "aggregate-diff" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
       postToPanel(targetPanel, { type: "turn-diff", requestId, activity: normalizeTurnDiffForPanel(event.activity) });
+    } else if (event?.type === "approval-required" && isCurrentRequest(requestId, client, session.sessionId, generation)) {
+      if (session.providerId === DEFAULT_PROVIDER_ID) postCodexApprovalRequest(targetPanel, event.request, session, requestId);
+    } else if (event?.type === "approval-decided" && isCurrentRequest(requestId, client, session.sessionId, generation) && session.providerId === DEFAULT_PROVIDER_ID) {
+      postCodexApprovalDecision(targetPanel, event);
     }
   };
   client.on("event", onExecutionEvent);
@@ -418,6 +477,9 @@ async function handlePrompt(prompt, targetPanel = panel) {
     if (!result || !["completed", "interrupted", "timeout"].includes(result.status)) {
       throw new Error("The provider did not return a confirmed task outcome.");
     }
+    setProviderLiveStatus(session.sessionId, { text: `last live task ${result.status} ${formatTimestamp(new Date().toISOString())}` });
+    if (result.status === "completed") lifecycle.setStage("review");
+    postWorkflowState();
     await captureWorkspaceDiff(lifecycle, permissionedToolRuntime, {
       isCurrent: () => isCurrentRequest(requestId, client, session.sessionId, generation),
     });
@@ -454,6 +516,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       sessionStore.update(session.sessionId, uncertainInterrupt
         ? { status: "recovery-required", recovery: { code: "submission-outcome-uncertain" } }
         : { status: "active", recovery: null });
+      selectedSession = sessionStore.touch(session.sessionId);
     } catch { /* Keep the task result visible if metadata could not be refreshed. */ }
     if (isCurrentRequest(requestId, client, session.sessionId, generation)) {
       setSessionView(targetPanel, uncertainInterrupt
@@ -461,8 +524,17 @@ async function handlePrompt(prompt, targetPanel = panel) {
         : { state: "connected", text: isTextOnlyProvider(session.providerId)
           ? `${providerSessionName(session.providerId)} · this Vesper session is saved.`
           : "Connected · this Vesper session is saved.", blocked: false });
+      postSessionView(targetPanel);
     }
   } catch (error) {
+    const outcome = lifecycle.snapshot();
+    setProviderLiveStatus(session.sessionId, {
+      text: outcome.submitted
+        ? `last live task failed (${safeErrorCode(error)})`
+        : `last task ended before provider completion (${safeErrorCode(error)})`,
+    });
+    lifecycle.setStage("review");
+    postWorkflowState();
     await captureWorkspaceDiff(lifecycle, permissionedToolRuntime, {
       isCurrent: () => isCurrentRequest(requestId, client, session.sessionId, generation),
     });
@@ -496,7 +568,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
         ? "submission-outcome-uncertain"
         : error.code === "UNSUPPORTED_OPERATION" ? "unsupported-operation"
           : error.code === "RESUME_FAILED" ? "resume-failed" : "connection-lost";
-      try { sessionStore.update(session.sessionId, { status: "recovery-required", recovery: { code: recoveryCode } }); } catch { /* Recovery UI remains available if metadata is not writable. */ }
+      try { selectedSession = sessionStore.update(session.sessionId, { status: "recovery-required", recovery: { code: recoveryCode } }); } catch { /* Recovery UI remains available if metadata is not writable. */ }
       const canRetry = Boolean(session.providerConversationId && client.capabilities.recovery);
       setSessionView(targetPanel, {
         state: "recovery-required",
@@ -510,6 +582,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
         canStartNew: true,
       });
     } else if (terminalTurnState) {
+      try { selectedSession = sessionStore.touch(session.sessionId); } catch { /* The task error remains visible if session metadata cannot be refreshed. */ }
       setSessionView(targetPanel, { state: "connected", text: "Connected · the saved conversation remains available.", blocked: false });
     }
     postToPanel(targetPanel, {
@@ -520,6 +593,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       text: interrupted ? "Turn interrupted." : `${providerName} task failed: ${safeMessage(error)}`,
       elapsedMs,
     });
+    if (selectedSession?.sessionId === session.sessionId && projectGeneration === generation) postSessionView(targetPanel);
   } finally {
     client.off("event", onExecutionEvent);
     if (activeRepositoryPreflight?.requestId === requestId) activeRepositoryPreflight = undefined;
@@ -527,7 +601,7 @@ async function handlePrompt(prompt, targetPanel = panel) {
       activeCodexRequestId = undefined;
       activeRequestType = undefined;
     }
-    if (deferredHistoryRestore && activeCodexRequestId === undefined) {
+    if (deferredHistoryRestore && !hasActiveOperation()) {
       deferredHistoryRestore = false;
       if (panel && selectedSession?.sessionId === session.sessionId) void restoreSelectedHistory(panel);
     }
@@ -553,10 +627,28 @@ async function previewPlan(task, targetPanel = panel) {
     const catalog = await provider.getCatalog({ refresh: true });
     const decision = classifyRequest(task);
     const plan = createCapabilityPlan({ task, catalog, routeDecision: decision, projectContext: { cwd: project.path } });
-    postToPanel(targetPanel, { type: "plan-preview", text: renderCapabilityPlan(plan), error: false });
+    postToPanel(targetPanel, { type: "plan-preview", text: `${renderCapabilityPlan(plan)}\n\n${renderCapabilityStatusSummary(catalog)}`, error: false });
   } catch {
     postToPanel(targetPanel, { type: "plan-preview", text: "Capability discovery did not complete; Vesper could not build a plan. No task was executed.", error: true });
   }
+}
+
+function renderCapabilityStatusSummary(catalog) {
+  const capabilities = Array.isArray(catalog?.capabilities) ? catalog.capabilities : [];
+  const lines = [`Discovered capability status · ${capabilities.length} item(s). Discovery is separate from installation, configuration, connection, runtime loading, and successful use.`];
+  for (const item of capabilities.slice(0, 16)) {
+    lines.push(`- ${safeCapabilityText(item.type)} ${safeCapabilityText(item.id)} · discovery ${safeCapabilityText(item.discoveryStatus)} · installation ${safeCapabilityText(item.installationStatus)} · configuration ${safeCapabilityText(item.configurationStatus)} · availability ${safeCapabilityText(item.availabilityStatus)} · runtime ${safeCapabilityText(item.runtimeLoadedStatus)} · operation ${safeCapabilityText(item.operationalStatus)}`);
+  }
+  if (capabilities.length > 16) lines.push(`… ${capabilities.length - 16} additional discovered capabilities omitted.`);
+  for (const diagnostic of (Array.isArray(catalog?.diagnostics) ? catalog.diagnostics : []).slice(0, 4)) {
+    lines.push(`Discovery note · ${safeCapabilityText(diagnostic.type)} · ${safeCapabilityText(diagnostic.message).slice(0, 240)}`);
+  }
+  return lines.join("\n");
+}
+
+function safeCapabilityText(value) {
+  if (typeof value !== "string") return "unknown";
+  return redactSensitiveText(value).replace(/[\u0000-\u001f\u007f-\u009f\p{Cf}\p{Cs}]/gu, " ").slice(0, 160) || "unknown";
 }
 
 async function runInspectionCommand(context, mode) {
@@ -602,7 +694,7 @@ async function runRepositoryInspection(task, mode = "inspect", targetPanel = pan
     postToPanel(targetPanel, { type: "repository-inspection-error", text: `Enter a repository question between 1 and ${MAX_PROMPT_LENGTH.toLocaleString()} characters.` });
     return;
   }
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection) {
+  if (hasActiveOperation()) {
     postToPanel(targetPanel, { type: "status", text: "Wait for the active Vesper operation to finish before starting another." });
     return;
   }
@@ -745,7 +837,7 @@ function runProviderSessionCommand(context) {
 }
 
 async function switchSavedSession(targetPanel = panel) {
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection) {
+  if (hasActiveOperation()) {
     postToPanel(targetPanel, { type: "status", text: "Wait for the active Vesper operation to finish before switching sessions." });
     return;
   }
@@ -770,8 +862,8 @@ async function switchSavedSession(targetPanel = panel) {
     return;
   }
   const items = sessions.map((session) => ({
-    label: `${providerDisplayName(session.providerId)}${session.modelId ? ` · ${session.modelId}` : ""}`,
-    description: `${session.status === "recovery-required" ? "recovery required" : session.providerConversationId ? "saved conversation" : "new conversation"} · updated ${new Date(session.updatedAt).toLocaleString()}`,
+    label: `${session.sessionId === selectedSession?.sessionId ? "● Current · " : ""}${providerDisplayName(session.providerId)}${session.modelId ? ` · ${session.modelId}` : ""}`,
+    description: `${session.status === "recovery-required" ? "recovery required" : session.providerConversationId ? "saved conversation" : "new conversation"} · updated ${formatTimestamp(session.updatedAt) || "time unavailable"}`,
     detail: session.sessionId,
     sessionId: session.sessionId,
   }));
@@ -785,7 +877,7 @@ async function switchSavedSession(targetPanel = panel) {
   if (!picked) return;
   try {
     const currentProject = selectedProjectContext();
-    if (panel !== targetPanel || !currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
+    if (panel !== targetPanel || !currentProject.available || currentProject.path !== project.path || hasActiveOperation()) {
       postToPanel(targetPanel, { type: "status", text: "The project or active task changed while the session picker was open. No session was switched." });
       return;
     }
@@ -807,7 +899,7 @@ async function switchSavedSession(targetPanel = panel) {
 }
 
 async function createSessionWithProvider(targetPanel = panel) {
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection) {
+  if (hasActiveOperation()) {
     postToPanel(targetPanel, { type: "status", text: "Wait for the active Vesper operation to finish before creating a provider session." });
     return;
   }
@@ -878,7 +970,7 @@ async function createSessionWithProvider(targetPanel = panel) {
     }
   }
   const currentProject = selectedProjectContext();
-  if (panel !== targetPanel || !currentProject.available || currentProject.path !== project.path || activeCodexRequestId !== undefined || activeRepositoryInspection) {
+  if (panel !== targetPanel || !currentProject.available || currentProject.path !== project.path || hasActiveOperation()) {
     postToPanel(targetPanel, { type: "status", text: "The project or active task changed while provider selection was open. No session was created." });
     return;
   }
@@ -897,7 +989,7 @@ function capabilityProviderFor(cwd) {
 }
 
 async function selectProject(targetPanel) {
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection) return;
+  if (hasActiveOperation()) return;
   if (typeof vscode.window.showWorkspaceFolderPick !== "function") {
     postToPanel(targetPanel, { type: "status", text: "Project selection is unavailable in this VS Code version." });
     return;
@@ -926,21 +1018,28 @@ async function selectProject(targetPanel) {
 }
 
 async function retryResume(targetPanel) {
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection || !sessionView.canRetry) return;
+  if (hasActiveOperation() || !sessionView.canRetry) return;
   const project = selectedProjectContext();
   if (!project.available || !selectedSession?.providerConversationId) return;
 
   const requestId = ++requestSequence;
   const session = selectedSession;
   const generation = projectGeneration;
-  const client = executionProviderForSession(session, project.path, generation);
+  let client;
+  try {
+    client = executionProviderForSession(session, project.path, generation);
+  } catch (error) {
+    setSessionView(targetPanel, { state: "recovery-required", text: `Could not start the saved ${providerSessionName(session.providerId)} session: ${safeMessage(error)}. Fix configuration or start a new provider session.`, blocked: true, canStartNew: true });
+    postHistoryState(targetPanel, unavailableHistory(safeMessage(error)));
+    return;
+  }
   const historyLoadId = ++historyLoadSequence;
   historyLoadingSessionId = session.sessionId;
   activeCodexRequestId = requestId;
   activeRequestType = "recovery";
   postToPanel(targetPanel, { type: "recovery-start" });
   setSessionView(targetPanel, { state: "restoring", text: "Verifying the saved Codex thread…", blocked: true });
-  postHistoryState(targetPanel, { state: "loading", text: "Restoring saved conversation history…", entries: [], truncated: false });
+  postHistoryState(targetPanel, { state: "loading", text: `Restoring saved ${providerSessionName(session.providerId)} conversation history…`, entries: [], truncated: false });
   try {
     await client.recover({ projectPath: project.path, conversationId: session.providerConversationId });
     await loadHistoryForSession(targetPanel, { client, session, projectPath: project.path, generation, historyLoadId, requestId });
@@ -955,7 +1054,7 @@ async function retryResume(targetPanel) {
     }
     if (historyLoadingSessionId === session.sessionId && historyLoadSequence === historyLoadId) historyLoadingSessionId = undefined;
     postToPanel(targetPanel, { type: "recovery-finished" });
-    if (deferredHistoryRestore && activeCodexRequestId === undefined) {
+    if (deferredHistoryRestore && !hasActiveOperation()) {
       deferredHistoryRestore = false;
       if (panel && selectedSession?.sessionId === session.sessionId) void restoreSelectedHistory(panel);
     }
@@ -963,7 +1062,7 @@ async function retryResume(targetPanel) {
 }
 
 function startNewSession(targetPanel, { providerId = null, modelId = undefined } = {}) {
-  if (activeCodexRequestId !== undefined || activeRepositoryInspection) return;
+  if (hasActiveOperation()) return;
   const project = selectedProjectContext();
   if (!project.available) {
     postToPanel(targetPanel, { type: "status", text: "The selected workspace folder is unavailable; no session was changed." });
@@ -997,6 +1096,11 @@ function startNewSession(targetPanel, { providerId = null, modelId = undefined }
 }
 
 async function interruptRequest(requestId, targetPanel) {
+  if (activeVerification?.requestId === requestId) {
+    cancelActiveVerification("user-interrupt");
+    postToPanel(targetPanel, { type: "interrupt-requested", requestId, phase: "verification" });
+    return;
+  }
   if (activeRepositoryInspection?.requestId === requestId) {
     cancelActiveRepositoryInspection();
     postToPanel(targetPanel, { type: "interrupt-requested", requestId, phase: "inspection" });
@@ -1019,6 +1123,225 @@ async function interruptRequest(requestId, targetPanel) {
       postToPanel(targetPanel, { type: "assistant-interrupt-error", requestId, text: safeMessage(error) });
     }
   }
+}
+
+async function refreshVerificationSuggestions(workflowRequestId, targetPanel = panel) {
+  if (hasActiveOperation()) {
+    postToPanel(targetPanel, { type: "verification-error", text: "Wait for the active Vesper operation to finish before refreshing verification suggestions." });
+    return;
+  }
+  const scope = currentTaskScope(workflowRequestId);
+  if (!scope) {
+    postToPanel(targetPanel, { type: "verification-error", text: "The selected task no longer matches this project and session. Start a task in the current session before refreshing verification." });
+    return;
+  }
+  const requestId = ++requestSequence;
+  const controller = new AbortController();
+  const operation = { requestId, kind: "verification-refresh", controller, systemModel: null,
+    sessionId: scope.sessionId, projectPath: scope.projectPath, generation: scope.generation };
+  activeVerification = operation;
+  scope.lifecycle.setVerificationCandidates(scope.lifecycle.snapshot().verificationCandidates, { fresh: false });
+  postCurrentTaskState(targetPanel);
+  postToPanel(targetPanel, { type: "verification-refresh-start", requestId, text: "Refreshing bounded project verification evidence. No command will run." });
+
+  let runtime;
+  try {
+    runtime = await repositoryToolRuntimeFactory({ projectRoot: scope.projectPath, sessionId: scope.sessionId,
+      commandExecutionEnabled: false, commandWorkspaceWriteEnabled: false });
+    if (!runtime || runtime.sessionId !== scope.sessionId) throw new Error("Verification inspection runtime did not match the selected session.");
+    const client = executionProviderSessionId === scope.sessionId ? executionProvider : null;
+    const repositoryIntelligence = createRepositoryIntelligence({
+      toolRuntime: runtime,
+      projectRoot: scope.projectPath,
+      sessionId: scope.sessionId,
+      providerId: scope.providerId,
+      getConversationId: () => client?.getState?.().conversationId || selectedSession?.providerConversationId || null,
+    });
+    const systemModel = createSystemModel({ repositoryIntelligence, planner: client, environment: process.env });
+    operation.systemModel = systemModel;
+    const result = await systemModel.investigate({ task: "", intent: "overview", signal: controller.signal });
+    if (!isCurrentVerification(operation)) return;
+    const candidates = selectVerificationCandidates(result?.project?.commands || []);
+    scope.lifecycle.setVerificationCandidates(candidates, { fresh: true, observedAt: new Date().toISOString() });
+    scope.lifecycle.setVerificationSuggestions(result?.verificationRequirements || []);
+    postCurrentTaskState(targetPanel);
+
+    let commandAvailability = { state: "disabled", text: "Command execution is disabled. No suggested command was run." };
+    let statusRuntime;
+    try {
+      if (process.env.VESPER_ENABLE_ISOLATED_COMMANDS === "1") {
+        statusRuntime = await repositoryToolRuntimeFactory({ projectRoot: scope.projectPath, sessionId: scope.sessionId,
+          approvalHandler: async () => "cancel", commandExecutionEnabled: true, commandWorkspaceWriteEnabled: false });
+        const status = await statusRuntime.getCommandExecutionStatus();
+        commandAvailability = status?.available && status?.enabled
+          ? { state: "available", text: "Isolated command runtime is available; each command still requires one-time approval." }
+          : { state: "unavailable", text: `Isolated command runtime unavailable${status?.reasonCode ? ` (${status.reasonCode})` : ""}. No command was run.` };
+      } else {
+        commandAvailability.text = "Host opt-in VESPER_ENABLE_ISOLATED_COMMANDS=1 is required before an isolated command can be reviewed.";
+      }
+    } catch (error) {
+      commandAvailability = { state: "unavailable", text: `Isolated command status could not be checked (${safeErrorCode(error)}). No command was run.` };
+    } finally {
+      try { await statusRuntime?.dispose?.(); } catch { /* Status probe has no execution side effect. */ }
+    }
+    postToPanel(targetPanel, { type: "verification-refresh-result", requestId,
+      state: candidates.length ? "available" : "empty",
+      suggestions: scope.lifecycle.snapshot().verificationSuggestions,
+      candidates,
+      commandAvailability,
+      text: candidates.length ? `${candidates.length} bounded project command suggestion(s) found. None have been executed.`
+        : "No supported manifest command candidates were found in the refreshed project evidence. No command was executed." });
+  } catch (error) {
+    if (activeVerification !== operation) return;
+    const cancelled = controller.signal.aborted || error?.name === "AbortError";
+    postToPanel(targetPanel, { type: "verification-refresh-result", requestId, state: cancelled ? "cancelled" : "failed",
+      text: cancelled ? "Verification evidence refresh was cancelled. No command was run." : `Verification suggestions could not be refreshed: ${safeMessage(error)}. No command was run.` });
+  } finally {
+    try { await runtime?.dispose?.(); } catch { /* Inspection cleanup does not alter verification evidence. */ }
+    if (activeVerification === operation) {
+      activeVerification = undefined;
+      postCurrentTaskState(panel);
+    }
+  }
+}
+
+async function runVerification(workflowRequestId, index, targetPanel = panel) {
+  if (hasActiveOperation()) {
+    postToPanel(targetPanel, { type: "verification-error", text: "Wait for the active Vesper operation to finish before requesting a verification command." });
+    return;
+  }
+  const scope = currentTaskScope(workflowRequestId);
+  const state = scope?.lifecycle.snapshot();
+  const candidate = Number.isSafeInteger(index) ? state?.verificationCandidates?.[index] : null;
+  if (!scope || !state?.verificationCandidatesFresh || !candidate) {
+    postToPanel(targetPanel, { type: "verification-error", text: "This command suggestion is stale or unavailable. Refresh verification evidence before requesting approval." });
+    return;
+  }
+  const argv = parseVerificationArgv(candidate.command);
+  if (!argv) {
+    postToPanel(targetPanel, { type: "verification-error", text: "This suggested command uses shell syntax outside Vesper's supported argv format. It remains a suggestion and was not run." });
+    return;
+  }
+  scope.lifecycle.setVerificationCandidates(state.verificationCandidates, { fresh: false });
+  if (process.env.VESPER_ENABLE_ISOLATED_COMMANDS !== "1") {
+    scope.lifecycle.recordVerification({ state: "unavailable", errorCode: "UNSUPPORTED_OPERATION" }, argv);
+    postCurrentTaskState(targetPanel);
+    postToPanel(targetPanel, { type: "verification-result", state: "unavailable", executed: false,
+      text: "Command execution is disabled by the host. Set VESPER_ENABLE_ISOLATED_COMMANDS=1, reload Vesper, refresh evidence, then request approval. No command was run." });
+    return;
+  }
+  const requestId = ++requestSequence;
+  const controller = new AbortController();
+  const operation = { requestId, kind: "verification-run", controller, runtime: null,
+    sessionId: scope.sessionId, projectPath: scope.projectPath, generation: scope.generation };
+  activeVerification = operation;
+  scope.lifecycle.setStage("verification");
+  postCurrentTaskState(targetPanel);
+  postToPanel(targetPanel, { type: "verification-run-start", requestId,
+    text: "Command selected. Vesper will show its exact argv for one-time approval before invoking the isolated runtime." });
+  let runtime;
+  try {
+    runtime = await repositoryToolRuntimeFactory({
+      projectRoot: scope.projectPath,
+      sessionId: scope.sessionId,
+      approvalHandler: (snapshot, approvalOptions) => requestPanelToolApproval(snapshot, approvalOptions, {
+        sessionId: scope.sessionId,
+        projectPath: scope.projectPath,
+        generation: scope.generation,
+        kind: "verification",
+        requestId,
+      }),
+      commandExecutionEnabled: true,
+      commandWorkspaceWriteEnabled: false,
+    });
+    operation.runtime = runtime;
+    if (!runtime || runtime.sessionId !== scope.sessionId) throw new Error("Verification runtime did not match the selected session.");
+    const availability = await runtime.getCommandExecutionStatus();
+    if (controller.signal.aborted) throw createVerificationCancelledError();
+    if (!availability?.available || !availability?.enabled) {
+      const result = { state: "unavailable", executed: false,
+        error: { code: availability?.reasonCode || "ISOLATION_UNAVAILABLE", message: availability?.message || "The isolated command runtime is unavailable." } };
+      scope.lifecycle.recordVerification(result, argv);
+      postCurrentTaskState(targetPanel);
+      postToPanel(targetPanel, { type: "verification-result", requestId, state: "unavailable", executed: false,
+        text: `The isolated runtime is unavailable${availability?.reasonCode ? ` (${availability.reasonCode})` : ""}. No command was run.` });
+      return;
+    }
+    if (!isCurrentVerification(operation)) return;
+    if (controller.signal.aborted) throw createVerificationCancelledError();
+    const result = await runtime.invoke({
+      toolId: "run_command",
+      input: { argv, workspaceAccess: "read-only" },
+      context: { projectRoot: scope.projectPath, sessionId: scope.sessionId },
+      requestId: randomUUID(),
+    }, { signal: controller.signal });
+    if (!isCurrentVerification(operation)) return;
+    scope.lifecycle.recordVerification(result, argv);
+    scope.lifecycle.setStage("report");
+    postCurrentTaskState(targetPanel);
+    const executed = result?.executed === true;
+    const commandResult = executed ? result.result || {} : null;
+    const outputText = executed
+      ? [commandResult.stdout ? `stdout:\n${commandResult.stdout}` : "", commandResult.stderr ? `stderr:\n${commandResult.stderr}` : ""]
+        .filter(Boolean).join("\n\n").slice(0, 32 * 1024)
+      : "";
+    postToPanel(targetPanel, { type: "verification-result", requestId, state: result?.state || "unknown", executed,
+      exitCode: Number.isInteger(commandResult?.exitCode) ? commandResult.exitCode : null,
+      signal: typeof commandResult?.signal === "string" ? commandResult.signal : null,
+      output: outputText,
+      text: executed
+        ? `Command execution completed with exit ${commandResult?.exitCode ?? "unknown"}${commandResult?.signal ? ` · signal ${commandResult.signal}` : ""}.`
+        : result?.error?.message || "Command was not executed." });
+  } catch (error) {
+    if (activeVerification !== operation) return;
+    const cancelled = controller.signal.aborted || error?.name === "AbortError";
+    const result = { state: cancelled ? "interrupted" : "unavailable", executed: false,
+      error: { code: cancelled ? "COMMAND_INTERRUPTED" : safeErrorCode(error) } };
+    scope.lifecycle.recordVerification(result, argv);
+    scope.lifecycle.setStage("report");
+    postCurrentTaskState(targetPanel);
+    postToPanel(targetPanel, { type: "verification-result", requestId, state: cancelled ? "cancelled" : "failed", executed: false,
+      text: cancelled ? "Verification command was cancelled. Its execution outcome was not confirmed." : `Verification command failed before Vesper could confirm execution: ${safeMessage(error)}` });
+  } finally {
+    try { await runtime?.dispose?.(); } catch { /* Runtime cleanup does not change the recorded outcome. */ }
+    if (activeVerification === operation) {
+      activeVerification = undefined;
+      postCurrentTaskState(panel);
+    }
+  }
+}
+
+function currentTaskScope(workflowRequestId) {
+  const lifecycle = lastTaskLifecycle;
+  if (!lifecycle) return null;
+  const state = lifecycle.snapshot();
+  const project = selectedProjectContext();
+  if (!state.finished || !state.submitted || state.providerStatus !== "completed" || state.requestId !== workflowRequestId || !project.available || project.path !== state.projectRoot ||
+      projectGeneration !== lastTaskGeneration || selectedSession?.sessionId !== state.sessionId || selectedSession?.providerId !== state.providerId) return null;
+  return { lifecycle, state, sessionId: state.sessionId, providerId: state.providerId,
+    projectPath: project.path, generation: projectGeneration };
+}
+
+function isCurrentVerification(operation) {
+  const project = selectedProjectContext();
+  return activeVerification === operation && project.available && project.path === operation.projectPath &&
+    selectedSession?.sessionId === operation.sessionId && projectGeneration === operation.generation;
+}
+
+function cancelActiveVerification(reason = "cancelled") {
+  const operation = activeVerification;
+  if (!operation) return false;
+  operation.controller?.abort(reason);
+  try { operation.runtime?.interrupt?.(); } catch { /* Cancellation remains best-effort. */ }
+  try { Promise.resolve(operation.systemModel?.interrupt?.()).catch(() => undefined); } catch { /* Cancellation remains best-effort. */ }
+  return true;
+}
+
+function createVerificationCancelledError() {
+  const error = new Error("Verification was cancelled before command execution.");
+  error.name = "AbortError";
+  error.code = "COMMAND_INTERRUPTED";
+  return error;
 }
 
 function executionProviderForSession(session, cwd, generation) {
@@ -1060,6 +1383,12 @@ function executionProviderForSession(session, cwd, generation) {
     permissionedToolRuntime = createPermissionedToolRuntime({
       projectRoot: cwd,
       sessionId,
+      approvalHandler: (snapshot, approvalOptions) => requestPanelToolApproval(snapshot, approvalOptions, {
+        sessionId,
+        projectPath: cwd,
+        generation,
+        kind: "file-change",
+      }),
       commandExecutionEnabled: false,
       commandWorkspaceWriteEnabled: false,
     });
@@ -1115,6 +1444,7 @@ function executionProviderForSession(session, cwd, generation) {
 
 function disposeCurrentAppServer() {
   cancelActiveRepositoryPreflight();
+  cancelPendingToolApprovals("session-changed");
   const previous = executionProvider;
   const previousTools = permissionedToolRuntime;
   executionProvider = undefined;
@@ -1202,6 +1532,9 @@ function selectWorkspaceFolder(folder) {
   }
   selectedSession = undefined;
   sessionLookupError = undefined;
+  lastTaskLifecycle = undefined;
+  lastTaskGeneration = undefined;
+  activeHistoryPage = undefined;
 }
 
 function selectedProjectContext() {
@@ -1286,6 +1619,7 @@ async function restoreSelectedHistory(targetPanel) {
   const session = selectedSession;
   const historyLoadId = ++historyLoadSequence;
   deferredHistoryRestore = false;
+  activeHistoryPage = undefined;
 
   if (!project.available) {
     postHistoryState(targetPanel, unavailableHistory("Conversation history cannot be checked because the selected workspace is unavailable."));
@@ -1295,13 +1629,13 @@ async function restoreSelectedHistory(targetPanel) {
     postHistoryState(targetPanel, unavailableHistory("Saved session metadata could not be checked, so conversation history was not treated as empty."));
     return;
   }
-  if (activeCodexRequestId !== undefined) {
+  if (hasActiveOperation()) {
     deferredHistoryRestore = true;
     postHistoryState(targetPanel, {
       state: "loading",
       entries: [],
       truncated: false,
-      text: "Saved history will be restored after the active Codex task finishes.",
+      text: "Saved history will be restored after the active Vesper operation finishes.",
     });
     return;
   }
@@ -1311,20 +1645,27 @@ async function restoreSelectedHistory(targetPanel) {
       entries: [],
       truncated: false,
       text: session
-        ? "This saved Vesper session has no Codex thread or saved conversation history yet."
+        ? `This saved Vesper session has no ${providerSessionName(session.providerId)} conversation or saved history yet.`
         : "No saved Vesper conversation exists for this project yet.",
     });
     return;
   }
 
   const generation = projectGeneration;
-  const client = executionProviderForSession(session, project.path, generation);
+  let client;
+  try {
+    client = executionProviderForSession(session, project.path, generation);
+  } catch (error) {
+    postHistoryState(targetPanel, unavailableHistory(`Saved ${providerSessionName(session.providerId)} history could not be loaded: ${safeMessage(error)}. The session was kept.`));
+    setSessionView(targetPanel, { state: "recovery-required", text: `Could not connect to the saved ${providerSessionName(session.providerId)} session: ${safeMessage(error)}. Start a new provider session or retry after fixing configuration.`, blocked: true, canStartNew: true });
+    return;
+  }
   historyLoadingSessionId = session.sessionId;
   postHistoryState(targetPanel, {
     state: "loading",
     entries: [],
     truncated: false,
-    text: "Checking the saved Codex conversation history…",
+    text: `Checking the saved ${providerSessionName(session.providerId)} conversation history…`,
   });
   setSessionView(targetPanel, {
     state: "restoring",
@@ -1355,15 +1696,96 @@ async function loadHistoryForSession(targetPanel, { client, session, projectPath
   if (!isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId })) return false;
   const result = await client.readConversationHistory();
   if (!isCurrentHistoryLoad({ client, session, projectPath, generation, historyLoadId, requestId })) return false;
-  postHistoryState(targetPanel, result);
+  const cursor = typeof result?.nextCursor === "string" ? result.nextCursor : null;
+  activeHistoryPage = {
+    sessionId: session.sessionId,
+    projectPath,
+    conversationId: session.providerConversationId,
+    generation,
+    cursor,
+    hasOlder: Boolean(result?.hasOlder && cursor),
+    pages: 1,
+    seenCursors: new Set(),
+    state: result?.state || "unavailable",
+    text: result?.text || "Conversation history status unavailable.",
+  };
+  const { nextCursor: _nextCursor, ...visibleResult } = result || {};
+  postHistoryState(targetPanel, visibleResult);
   setSessionView(targetPanel, {
     state: "connected",
     text: result.state === "unavailable"
       ? "Connected to the saved conversation; its history is unavailable. New tasks are available."
-      : "Connected · saved Codex conversation restored.",
+      : `Connected · saved ${providerSessionName(session.providerId)} conversation restored.`,
     blocked: false,
   });
   return true;
+}
+
+async function loadOlderHistory(targetPanel = panel) {
+  const page = activeHistoryPage;
+  const project = selectedProjectContext();
+  const session = selectedSession;
+  if (hasActiveOperation()) {
+    postToPanel(targetPanel, { type: "history-load-error", text: "Wait for the active Vesper operation to finish before loading older history." });
+    return;
+  }
+  if (!page?.hasOlder || !page.cursor || page.sessionId !== session?.sessionId || page.projectPath !== project.path ||
+      page.generation !== projectGeneration || !project.available || !session?.providerConversationId) {
+    postToPanel(targetPanel, { type: "history-load-error", text: "Older history is unavailable for the selected session." });
+    return;
+  }
+  if (page.pages >= MAX_HISTORY_PAGES) {
+    page.hasOlder = false;
+    postHistoryState(targetPanel, { pageMode: "status", state: page.state, hasOlder: false,
+      text: `History display limit reached after ${page.pages} pages. The existing transcript was kept.` });
+    return;
+  }
+  const cursor = page.cursor;
+  if (page.seenCursors.has(cursor)) {
+    page.hasOlder = false;
+    postHistoryState(targetPanel, { pageMode: "status", state: page.state, hasOlder: false,
+      text: "The provider repeated a history cursor. Vesper stopped paging and kept the transcript already shown." });
+    return;
+  }
+  page.seenCursors.add(cursor);
+  const historyLoadId = historyLoadSequence;
+  postHistoryState(targetPanel, { pageMode: "loading-older", state: page.state, hasOlder: true, text: "Loading older conversation messages…" });
+  try {
+    const client = executionProviderForSession(session, project.path, page.generation);
+    const result = await client.readConversationHistory({ cursor });
+    const current = activeHistoryPage;
+    if (current !== page || selectedSession?.sessionId !== page.sessionId || projectGeneration !== page.generation ||
+        !selectedProjectContext().available || selectedProjectContext().path !== page.projectPath || historyLoadSequence !== historyLoadId) return;
+    if (result?.state === "unavailable") {
+      page.seenCursors.delete(cursor);
+      postToPanel(targetPanel, { type: "history-load-error", text: result.text || "Older conversation history is unavailable. The existing transcript was kept; you can retry." });
+      return;
+    }
+    const entries = Array.isArray(result?.entries) ? result.entries : [];
+    const entryText = entries.reduce((total, entry) => total + String(entry?.label || "").length + String(entry?.text || "").length, 0);
+    if (entries.length > MAX_HISTORY_MESSAGES || entryText > MAX_HISTORY_TEXT_LENGTH) {
+      page.hasOlder = false;
+      postHistoryState(targetPanel, { pageMode: "status", state: page.state, hasOlder: false,
+        text: "The provider returned an oversized history page. Vesper kept the transcript already shown." });
+      return;
+    }
+    const nextCursor = typeof result?.nextCursor === "string" ? result.nextCursor : null;
+    const cursorRepeated = Boolean(nextCursor && page.seenCursors.has(nextCursor));
+    page.cursor = cursorRepeated ? null : nextCursor;
+    page.hasOlder = Boolean(result?.hasOlder && nextCursor && !cursorRepeated);
+    page.pages += 1;
+    page.state = result?.state || page.state;
+    page.text = cursorRepeated
+      ? "The provider repeated a history cursor. Vesper stopped paging and kept the transcript already shown."
+      : result?.text || page.text;
+    const { nextCursor: _nextCursor, ...visibleResult } = result || {};
+    postHistoryState(targetPanel, { ...visibleResult, pageMode: "prepend", hasOlder: page.hasOlder,
+      text: page.text || "Older conversation messages loaded." });
+  } catch (error) {
+    if (activeHistoryPage !== page || selectedSession?.sessionId !== page.sessionId || projectGeneration !== page.generation) return;
+    page.seenCursors.delete(cursor);
+    postToPanel(targetPanel, { type: "history-load-error", text: `Older conversation messages could not be loaded: ${safeMessage(error)}. The existing transcript was kept; you can retry.` });
+  }
 }
 
 function showHistoryFailure(targetPanel, { client, session, generation, historyLoadId, projectPath, requestId, error } = {}) {
@@ -1377,8 +1799,8 @@ function showHistoryFailure(targetPanel, { client, session, generation, historyL
   const threadVerified = providerState.conversationReady && providerState.conversationId === session.providerConversationId;
   const historyError = unavailableHistory(safeMessage(error)).text;
   postHistoryState(targetPanel, unavailableHistory(threadVerified
-    ? `The saved Codex thread is connected, but conversation history could not be retrieved: ${historyError}. Vesper has not treated it as empty.`
-    : `Conversation history could not be retrieved because the saved thread is not connected: ${historyError}. Vesper has not treated it as empty.`));
+    ? `The saved ${providerSessionName(session.providerId)} conversation is connected, but its history could not be retrieved: ${historyError}. Vesper has not treated it as empty.`
+    : `Conversation history could not be retrieved because the saved ${providerSessionName(session.providerId)} conversation is not connected: ${historyError}. Vesper has not treated it as empty.`));
   if (threadVerified) {
     setSessionView(targetPanel, {
       state: "connected",
@@ -1409,6 +1831,158 @@ function postHistoryState(targetPanel, state) {
   postToPanel(targetPanel, { type: "conversation-history", ...state });
 }
 
+function hasActiveOperation() {
+  return activeCodexRequestId !== undefined || Boolean(activeRepositoryInspection) || Boolean(activeVerification);
+}
+
+function postCurrentTaskState(targetPanel = panel) {
+  const lifecycle = lastTaskLifecycle;
+  if (!lifecycle) return;
+  const state = lifecycle.snapshot();
+  const project = selectedProjectContext();
+  if (!project.available || projectGeneration !== lastTaskGeneration || selectedSession?.sessionId !== state.sessionId ||
+      project.path !== state.projectRoot) return;
+  postToPanel(targetPanel, { type: "task-state", workflow: { ...state,
+    stageLabel: taskStageLabel(state.stage), statusLabel: taskStatusLabel(state.status),
+    verificationOperationActive: Boolean(activeVerification) } });
+}
+
+function postCodexApprovalRequest(targetPanel, request, session, requestId) {
+  const approval = request && typeof request === "object" ? request : {};
+  const body = typeof approval.reviewBody === "string" ? approval.reviewBody.slice(0, MAX_PANEL_APPROVAL_REVIEW_LENGTH) : "Codex did not provide a bounded approval preview.";
+  postToPanel(targetPanel, {
+    type: "codex-approval",
+    requestId,
+    providerId: session.providerId,
+    operation: typeof approval.type === "string" ? approval.type : "unknown",
+    title: typeof approval.reviewTitle === "string" ? approval.reviewTitle.slice(0, 120) : "Approval request",
+    body,
+    truncated: approval.reviewTruncated === true || body.length >= MAX_PANEL_APPROVAL_REVIEW_LENGTH,
+    text: "Vesper's VS Code panel keeps Codex approvals decline-only. No approval was granted. Continue in the Vesper terminal to use its existing Codex approval flow.",
+  });
+}
+
+function postCodexApprovalDecision(targetPanel, event) {
+  const status = typeof event?.status === "string" ? event.status : "unknown";
+  const explanation = status === "declined" || status === "rejected"
+    ? "The Codex approval request was declined by the VS Code panel."
+    : status === "approved" || status === "accepted"
+      ? "Codex reported an approval decision. Vesper did not create or modify that decision."
+      : `Codex reported approval state: ${status}.`;
+  postToPanel(targetPanel, { type: "codex-approval-decision", text: explanation });
+}
+
+function requestPanelToolApproval(snapshot, { signal } = {}, scope = {}) {
+  if (!snapshot || typeof snapshot !== "object" || typeof snapshot.approvalId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(snapshot.approvalId) ||
+      !["apply_file_change", "run_command"].includes(snapshot.toolId)) return Promise.resolve("decline");
+  if (scope.kind === "file-change" && (snapshot.toolId !== "apply_file_change" || activeCodexRequestId === undefined ||
+      lastTaskLifecycle?.snapshot().sessionId !== scope.sessionId)) return Promise.resolve("cancel");
+  if (scope.kind === "verification" && (snapshot.toolId !== "run_command" || activeVerification?.requestId !== scope.requestId)) return Promise.resolve("cancel");
+  if (!isApprovalScopeCurrent(scope, snapshot)) return Promise.resolve("cancel");
+  if (!panel?.webview || pendingToolApprovals.size >= 8) return Promise.resolve("cancel");
+  if (typeof signal?.aborted === "boolean" && signal.aborted) return Promise.resolve("cancel");
+
+  const operation = scope.kind === "verification" ? "command" : "file-change";
+  const request = { type: operation, approvalId: snapshot.approvalId, requestId: snapshot.requestId };
+  const lifecycle = lastTaskLifecycle;
+  if (lifecycle && lifecycle.snapshot().sessionId === scope.sessionId && lastTaskGeneration === scope.generation) {
+    lifecycle.observe({ type: "approval-required", request });
+    postCurrentTaskState(panel);
+  }
+  return new Promise((resolve) => {
+    const entry = {
+      snapshot,
+      panel,
+      scope,
+      operation,
+      resolve,
+      signal,
+      timer: setTimeout(() => settleToolApproval(entry, "cancel", "Approval timed out; nothing was executed."), TOOL_APPROVAL_TIMEOUT_MS),
+      onAbort: null,
+      settled: false,
+    };
+    entry.onAbort = () => settleToolApproval(entry, "cancel", "Approval was cancelled; nothing was executed.");
+    signal?.addEventListener?.("abort", entry.onAbort, { once: true });
+    pendingToolApprovals.set(snapshot.approvalId, entry);
+    postToolApproval(entry);
+  });
+}
+
+function isApprovalScopeCurrent(entryOrScope, snapshot) {
+  const scope = entryOrScope?.scope || entryOrScope || {};
+  const project = selectedProjectContext();
+  if (!project.available || project.path !== scope.projectPath || projectGeneration !== scope.generation ||
+      selectedSession?.sessionId !== scope.sessionId || selectedSession?.cwd !== scope.projectPath ||
+      snapshot.sessionId !== scope.sessionId || snapshot.projectRoot !== scope.projectPath) return false;
+  if (scope.kind === "file-change") {
+    return activeCodexRequestId !== undefined && lastTaskGeneration === scope.generation &&
+      lastTaskLifecycle?.snapshot().sessionId === scope.sessionId;
+  }
+  if (scope.kind === "verification") return activeVerification?.requestId === scope.requestId;
+  return false;
+}
+
+function postToolApproval(entry) {
+  if (!entry || entry.settled || !isApprovalScopeCurrent(entry, entry.snapshot)) return;
+  const body = renderToolApproval(entry.snapshot).slice(0, MAX_PANEL_APPROVAL_REVIEW_LENGTH);
+  postToPanel(entry.panel, {
+    type: "tool-approval",
+    approvalId: entry.snapshot.approvalId,
+    requestId: entry.scope.requestId || null,
+    operation: entry.operation,
+    title: entry.scope.kind === "verification" ? "Run this verification command?" : "Apply this proposed file change?",
+    body,
+    kind: entry.scope.kind,
+    oneTime: true,
+  });
+}
+
+function decideToolApproval(targetPanel, message) {
+  const approvalId = typeof message.approvalId === "string" ? message.approvalId : "";
+  const entry = pendingToolApprovals.get(approvalId);
+  const choice = message.choice === "approve-once" ? "approve-once" : message.choice === "decline" ? "decline" : null;
+  if (!entry || entry.panel !== targetPanel || !choice) return;
+  if (!isApprovalScopeCurrent(entry, entry.snapshot)) {
+    settleToolApproval(entry, "cancel", "The session, project, or task changed before the decision. Nothing was executed.");
+    return;
+  }
+  settleToolApproval(entry, choice, choice === "approve-once" ? "Approved once; Vesper is rechecking the reviewed operation." : "Rejected; nothing was executed.");
+}
+
+function settleToolApproval(entry, choice, message) {
+  if (!entry || entry.settled) return false;
+  entry.settled = true;
+  clearTimeout(entry.timer);
+  entry.signal?.removeEventListener?.("abort", entry.onAbort);
+  pendingToolApprovals.delete(entry.snapshot.approvalId);
+  const status = choice === "approve-once" ? "authorized" : choice === "decline" ? "rejected" : "cancelled";
+  const lifecycle = lastTaskLifecycle;
+  if (lifecycle && lifecycle.snapshot().sessionId === entry.scope.sessionId && lastTaskGeneration === entry.scope.generation) {
+    lifecycle.observe({ type: "approval-decided", operation: entry.operation, status,
+      approvalId: entry.snapshot.approvalId, requestId: entry.snapshot.requestId });
+    postCurrentTaskState(entry.panel);
+  }
+  postToPanel(entry.panel, { type: "tool-approval-settled", approvalId: entry.snapshot.approvalId,
+    status, text: message || "Approval request ended." });
+  entry.resolve(choice);
+  return true;
+}
+
+function cancelPendingToolApprovals(reason = "cancelled") {
+  for (const entry of pendingToolApprovals.values()) {
+    settleToolApproval(entry, "cancel", reason === "session-changed"
+      ? "The selected Vesper session changed. The operation was cancelled without execution."
+      : "The approval request was cancelled without execution.");
+  }
+}
+
+function cancelPanelToolApprovals(targetPanel) {
+  for (const entry of pendingToolApprovals.values()) {
+    if (entry.panel === targetPanel) settleToolApproval(entry, "cancel", "The VS Code panel closed. The operation was cancelled without execution.");
+  }
+}
+
 function invalidateHistoryLoad() {
   historyLoadSequence += 1;
   historyLoadingSessionId = undefined;
@@ -1417,23 +1991,85 @@ function invalidateHistoryLoad() {
 
 function postSessionView(targetPanel) {
   postToPanel(targetPanel, { type: "session-state", ...sessionView });
+  const project = selectedProjectContext();
+  let projectSessions = [];
+  let totalProjectSessions = 0;
+  if (project.available && sessionStore) {
+    try {
+      const sessions = sessionStore.listByCwd(project.path);
+      totalProjectSessions = sessions.length;
+      projectSessions = sessions.slice(0, 8).map((session) => ({
+        sessionId: session.sessionId,
+        providerId: session.providerId,
+        modelId: session.modelId || null,
+        status: session.status,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        current: session.sessionId === selectedSession?.sessionId,
+      }));
+    } catch {
+      projectSessions = [];
+    }
+  }
+  postToPanel(targetPanel, {
+    type: "session-details",
+    sessionId: selectedSession?.sessionId || null,
+    providerId: selectedSession?.providerId || null,
+    modelId: selectedSession?.modelId || null,
+    status: selectedSession?.status || sessionView.state,
+    createdAt: selectedSession?.createdAt || null,
+    updatedAt: selectedSession?.updatedAt || null,
+    sessions: projectSessions,
+    totalSessions: totalProjectSessions,
+  });
   const providerId = selectedSession?.providerId ||
     (typeof process.env.VESPER_PROVIDER === "string" && process.env.VESPER_PROVIDER.trim()) || DEFAULT_PROVIDER_ID;
   const providerStatus = listProviders().some((provider) => provider.id === providerId) ? getProviderStatus(providerId, process.env) : null;
   const configuredModel = providerStatus?.model || null;
   const activeState = executionProviderSessionId === selectedSession?.sessionId ? executionProvider?.getState?.() : null;
-  const readiness = providerId === DEFAULT_PROVIDER_ID
-    ? "Codex CLI sign-in is managed by Codex; run vesper doctor to check it locally"
-    : providerStatus?.configured === true ? "configured; provider reachability not checked" : "provider configuration required";
+  const supported = listProviders().some((provider) => provider.id === providerId);
+  const configured = providerId === DEFAULT_PROVIDER_ID ? null : providerStatus?.configured === true;
+  const authentication = providerId === DEFAULT_PROVIDER_ID
+    ? "managed by Codex CLI; not checked by this panel"
+    : configured ? "not verified; an API key is configuration only" : "not available until provider configuration is valid";
+  const liveAvailability = activeState?.availability || "not checked";
+  const readiness = !supported ? "unavailable: unsupported provider id"
+    : providerId === DEFAULT_PROVIDER_ID ? "Codex app-server integration supported; CLI authentication is separate"
+      : configured ? "configured; reachability depends on a live provider request" : "configuration required";
+  const liveResult = selectedSession?.sessionId ? providerLiveStatus.get(selectedSession.sessionId) : null;
   postToPanel(targetPanel, {
     type: "provider-info",
     providerId,
     displayName: providerDisplayName(providerId),
     model: selectedSession?.modelId || configuredModel,
+    supported,
+    configured,
+    authentication,
+    availability: liveAvailability,
+    liveResult: liveResult?.text || null,
     readiness,
-    modelFreshness: selectedSession?.modelId || configuredModel ? "configured; not live-verified" : "not configured or not exposed",
-    toolCallingEnabled: activeState?.toolCallingEnabled === true || providerStatus?.toolCallingEnabled === true,
+    modelFreshness: selectedSession?.modelId ? "pinned to this Vesper session; provider support is not verified"
+      : configuredModel ? "provider default configured; support is not verified" : "not configured or not exposed",
+    toolCallingEnabled: activeState?.toolCallingEnabled === true,
+    toolCallingConfigured: providerStatus?.toolCallingEnabled === true,
+    toolCallingAvailability: isTextOnlyProvider(providerId)
+      ? activeState
+        ? activeState.toolCallingEnabled === true ? "available for the active session; model compatibility is unverified" : "disabled for the active session"
+        : "not checked for this session"
+      : "Codex tools are provider-managed; VS Code approval requests remain decline-only",
   });
+}
+
+function setProviderLiveStatus(sessionId, status) {
+  if (typeof sessionId !== "string" || !sessionId || !status || typeof status.text !== "string") return;
+  providerLiveStatus.delete(sessionId);
+  providerLiveStatus.set(sessionId, status);
+  while (providerLiveStatus.size > 100) providerLiveStatus.delete(providerLiveStatus.keys().next().value);
+}
+
+function formatTimestamp(value) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString() : null;
 }
 
 function selectedProviderForNewSession() {
@@ -1529,7 +2165,11 @@ function getHtml(webview) {
     #project-name { font-weight: 600; }
     #project-path { color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
     #session-state { color: var(--vscode-descriptionForeground); font-size: 12px; margin-top: 4px; }
+    #session-details, #task-status, #verification-status { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
     #history-state { color: var(--vscode-descriptionForeground); font-size: 11px; margin-top: 4px; }
+    #history-actions { margin-top: 4px; }
+    #load-older-history[hidden] { display: none; }
+    #task-status strong { color: var(--vscode-foreground); }
     #session-actions, #workspace-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     #session-actions { margin-top: 8px; }
     #workspace-actions { margin-top: 2px; }
@@ -1540,6 +2180,16 @@ function getHtml(webview) {
     article.user { background: var(--vscode-textBlockQuote-background); }
     article.tool, article.activity { border-style: dashed; }
     article.error { border-color: var(--vscode-errorForeground); }
+    article.approval { border-color: var(--vscode-editorWarning-foreground, var(--vscode-panel-border)); }
+    .approval-preview { max-height: 320px; overflow: auto; white-space: pre-wrap; font-family: var(--vscode-editor-font-family); font-size: 11px; }
+    .approval-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .approval-actions button { min-height: 28px; }
+    #verification-panel { border-top: 1px solid var(--vscode-panel-border); padding-top: 8px; max-height: 210px; overflow: auto; }
+    #verification-panel h2 { font-size: 12px; margin: 0 0 4px; }
+    #verification-suggestions { margin: 6px 0; padding-left: 20px; }
+    #verification-suggestions li { margin: 4px 0; overflow-wrap: anywhere; }
+    .verification-command { font-family: var(--vscode-editor-font-family); }
+    .verification-command button { margin-left: 6px; min-height: 24px; padding: 0 8px; }
     article.turn { border: 0; padding: 2px 8px; color: var(--vscode-descriptionForeground); font-size: 11px; }
     .label { color: var(--vscode-descriptionForeground); font-size: 11px; margin-bottom: 5px; }
     .answer { line-height: 1.45; }
@@ -1563,7 +2213,10 @@ function getHtml(webview) {
       </div>
       <div id="status">Starting…</div>
       <div id="session-state" role="status">Checking saved Vesper sessions…</div>
+      <div id="session-details" aria-live="polite">Session details unavailable.</div>
       <div id="history-state" role="status">Conversation history has not been checked.</div>
+      <div id="history-actions"><button id="load-older-history" type="button" hidden>Load older history</button></div>
+      <div id="task-status" role="status">No task lifecycle is available for this session.</div>
       <div id="session-actions">
         <button id="switch-session" type="button">Switch session</button>
         <button id="new-provider-session" type="button">New provider session</button>
@@ -1574,6 +2227,12 @@ function getHtml(webview) {
       </div>
     </header>
     <section id="messages" aria-live="polite"></section>
+    <section id="verification-panel" aria-label="Verification">
+      <h2>Verification</h2>
+      <div id="verification-status" role="status">Suggested commands are not run automatically.</div>
+      <ul id="verification-suggestions"></ul>
+      <button id="refresh-verification" type="button">Refresh verification evidence</button>
+    </section>
     <div id="workspace-actions">
       <button id="inspect-repository" type="button">Inspect repository</button>
       <button id="assess-impact" type="button">Change impact</button>
@@ -1609,6 +2268,12 @@ function getHtml(webview) {
     const projectPath = document.getElementById('project-path');
     const sessionState = document.getElementById('session-state');
     const historyState = document.getElementById('history-state');
+    const sessionDetails = document.getElementById('session-details');
+    const loadOlderHistory = document.getElementById('load-older-history');
+    const taskStatus = document.getElementById('task-status');
+    const verificationStatus = document.getElementById('verification-status');
+    const verificationSuggestions = document.getElementById('verification-suggestions');
+    const refreshVerification = document.getElementById('refresh-verification');
     const recoveryActions = document.getElementById('recovery-actions');
     const retryResume = document.getElementById('retry-resume');
     const startNewSession = document.getElementById('start-new-session');
@@ -1620,6 +2285,12 @@ function getHtml(webview) {
     let currentProviderName = 'Codex app-server';
     let sessionBlocked = false;
     let recoveryLoading = false;
+    let activeSessionId = '';
+    let currentWorkflow;
+    let verificationAvailability = { state: 'unknown', text: 'Refresh evidence to check the isolated command runtime.' };
+    let verificationNotice = '';
+    let historyEntryCount = 0;
+    let historyTextLength = 0;
 
     function addMessage(kind, label, text) {
       const article = document.createElement('article');
@@ -1636,6 +2307,81 @@ function getHtml(webview) {
       return { article, title, body };
     }
 
+    function addHistoryEntry(entry, parent = messages) {
+      const article = document.createElement('article');
+      article.className = new Set(['user', 'assistant', 'tool', 'activity', 'error', 'availability', 'turn']).has(entry.kind) ? entry.kind : 'activity';
+      article.dataset.historyEntry = String(entry.id || 'history-entry');
+      const title = document.createElement('div');
+      title.className = 'label';
+      const timestamp = typeof entry.timestamp === 'string' && Number.isFinite(Date.parse(entry.timestamp))
+        ? ' · ' + new Date(entry.timestamp).toLocaleString() : '';
+      title.textContent = String(entry.label || 'Conversation message') + timestamp;
+      const body = document.createElement('div');
+      body.className = 'answer';
+      body.textContent = String(entry.text || '');
+      article.append(title, body);
+      parent.append(article);
+      return article;
+    }
+
+    function renderTaskState(workflow) {
+      if (!workflow || typeof workflow !== 'object') return;
+      if (currentWorkflow && currentWorkflow.requestId !== workflow.requestId) verificationNotice = '';
+      currentWorkflow = workflow;
+      const stage = workflow.stageLabel || workflow.stage || 'Task state unavailable';
+      const state = workflow.statusLabel || workflow.status || 'Status unavailable';
+      const started = typeof workflow.startedAt === 'string' && Number.isFinite(Date.parse(workflow.startedAt))
+        ? new Date(workflow.startedAt).toLocaleString() : 'time unavailable';
+      const finished = typeof workflow.completedAt === 'string' && Number.isFinite(Date.parse(workflow.completedAt))
+        ? ' · finished ' + new Date(workflow.completedAt).toLocaleString() : '';
+      const pending = Array.isArray(workflow.approvals) ? workflow.approvals.filter((item) => item && item.status === 'pending') : [];
+      const approvalText = pending.length ? ' · waiting for ' + pending.length + ' approval(s)' : '';
+      const files = Array.isArray(workflow.proposedFiles) ? workflow.proposedFiles.slice(0, 8) : [];
+      const fileText = files.length ? '\nFiles: ' + files.map((item) => item.path + ' (' + item.state + ')').join(', ') + (workflow.proposedFiles.length > files.length ? ', …' : '') : '';
+      taskStatus.textContent = 'Task ' + state + ' · ' + stage + approvalText + ' · started ' + started + finished + fileText;
+
+      const suggestions = Array.isArray(workflow.verificationSuggestions) ? workflow.verificationSuggestions : [];
+      const candidates = Array.isArray(workflow.verificationCandidates) ? workflow.verificationCandidates : [];
+      verificationSuggestions.replaceChildren();
+      if (workflow.verification && workflow.verification.state && workflow.verification.state !== 'not-run') {
+        const result = document.createElement('li');
+        result.textContent = workflow.verification.executed === true
+          ? 'Executed verification · ' + workflow.verification.state + (workflow.verification.command ? ' · ' + workflow.verification.command : '') + (Number.isInteger(workflow.verification.exitCode) ? ' · exit ' + workflow.verification.exitCode : '')
+          : 'Verification request · ' + workflow.verification.state + ' · no execution confirmed' + (workflow.verification.command ? ' · ' + workflow.verification.command : '');
+        verificationSuggestions.append(result);
+      }
+      for (const suggestion of suggestions.slice(0, 8)) {
+        const item = document.createElement('li');
+        item.textContent = 'Suggested by investigation · not run: ' + suggestion;
+        verificationSuggestions.append(item);
+      }
+      candidates.slice(0, 8).forEach((candidate, index) => {
+        const item = document.createElement('li');
+        item.className = 'verification-command';
+        const evidence = candidate.inferred ? 'inferred' : 'manifest observed';
+        item.textContent = (workflow.verificationCandidatesFresh ? 'Fresh ' : 'Unrefreshed ') + evidence + ' candidate · not run · ' + candidate.name + ' · ' + candidate.path + ' · ' + candidate.command;
+        if (workflow.verificationCandidatesFresh && verificationAvailability.state === 'available' && workflow.finished === true && workflow.verificationOperationActive !== true) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = 'Request approval';
+          button.dataset.verificationIndex = String(index);
+          button.dataset.workflowRequestId = String(workflow.requestId || '');
+          button.setAttribute('aria-label', 'Request one-time approval to run ' + candidate.command);
+          button.addEventListener('click', () => {
+            button.disabled = true;
+            vscode.postMessage({ type: 'run-verification', requestId: String(workflow.requestId || ''), index });
+          });
+          item.append(button);
+        }
+        verificationSuggestions.append(item);
+      });
+      const freshness = workflow.verificationCandidatesFresh
+        ? 'Fresh command candidates observed ' + (workflow.verificationCandidatesObservedAt ? new Date(workflow.verificationCandidatesObservedAt).toLocaleString() : 'just now') + '.'
+        : 'Command candidates must be refreshed before they can be run.';
+      verificationStatus.textContent = [freshness, verificationAvailability.text || '', verificationNotice].filter(Boolean).join(' ');
+      refreshVerification.disabled = activeRequestId !== undefined || workflow.finished !== true || workflow.submitted !== true || workflow.providerStatus !== 'completed';
+    }
+
     function setBusy(busy) {
       send.disabled = busy || sessionBlocked || recoveryLoading;
       previewPlan.disabled = busy;
@@ -1645,6 +2391,9 @@ function getHtml(webview) {
       chooseProject.disabled = busy;
       switchSession.disabled = busy;
       newProviderSession.disabled = busy;
+      loadOlderHistory.disabled = busy;
+      refreshVerification.disabled = busy || !currentWorkflow || currentWorkflow.finished !== true || currentWorkflow.submitted !== true || currentWorkflow.providerStatus !== 'completed';
+      for (const button of verificationSuggestions.querySelectorAll('button[data-verification-index]')) button.disabled = busy;
       if (!busy && !sessionBlocked) prompt.focus();
     }
 
@@ -1681,6 +2430,25 @@ function getHtml(webview) {
 
     switchSession.addEventListener('click', () => vscode.postMessage({ type: 'switch-session' }));
     newProviderSession.addEventListener('click', () => vscode.postMessage({ type: 'new-session-with-provider' }));
+    loadOlderHistory.addEventListener('click', () => {
+      if (loadOlderHistory.disabled) return;
+      loadOlderHistory.disabled = true;
+      vscode.postMessage({ type: 'load-older-history' });
+    });
+    refreshVerification.addEventListener('click', () => {
+      if (!currentWorkflow || currentWorkflow.finished !== true || currentWorkflow.submitted !== true || currentWorkflow.providerStatus !== 'completed' || refreshVerification.disabled) return;
+      vscode.postMessage({ type: 'refresh-verification', requestId: String(currentWorkflow.requestId || '') });
+    });
+
+    messages.addEventListener('click', (event) => {
+      const button = event.target && event.target.closest ? event.target.closest('button[data-approval-choice]') : null;
+      if (!button || button.disabled) return;
+      const approvalId = button.dataset.approvalId;
+      const choice = button.dataset.approvalChoice;
+      if (!approvalId || !['approve-once', 'decline'].includes(choice)) return;
+      for (const sibling of button.parentElement.querySelectorAll('button')) sibling.disabled = true;
+      vscode.postMessage({ type: 'tool-approval-response', approvalId, choice });
+    });
 
     chooseProject.addEventListener('click', () => {
       if (chooseProject.disabled) return;
@@ -1714,11 +2482,18 @@ function getHtml(webview) {
       if (message.type === 'provider-info') {
         currentProviderId = typeof message.providerId === 'string' ? message.providerId : 'codex-app-server';
         currentProviderName = typeof message.displayName === 'string' ? message.displayName : currentProviderId;
-        providerInfo.textContent = 'Execution provider: ' + currentProviderName + (message.model ? ' · model ' + message.model : (currentProviderId === 'openai-chat-completions' || currentProviderId === 'nvidia-nim') ? ' · model not configured' : '') + (message.readiness ? ' · ' + message.readiness : '') + (message.modelFreshness ? ' · ' + message.modelFreshness : '') + (message.toolCallingEnabled ? ' · project inspection/proposals enabled; file writes unavailable in panel' : '');
+        const configuredText = message.configured === null ? 'configuration: Codex CLI-managed' : 'configured: ' + (message.configured ? 'yes' : 'no');
+        providerInfo.textContent = currentProviderName + (message.model ? ' · model ' + message.model : ' · model not configured/exposed') +
+          ' · supported by Vesper: ' + (message.supported ? 'yes' : 'no') + ' · ' + configuredText +
+          ' · authentication: ' + (message.authentication || 'not checked') + ' · session availability: ' + (message.availability || 'not checked') +
+          (message.liveResult ? ' · ' + message.liveResult : '') + (message.modelFreshness ? ' · ' + message.modelFreshness : '') +
+          (message.toolCallingConfigured ? ' · structured tool opt-in configured for provider defaults' : '') +
+          (message.toolCallingAvailability ? ' · structured tools: ' + message.toolCallingAvailability : '') +
+          (message.toolCallingEnabled ? ' · Vesper file-change tools require one-time approval; commands are unavailable to provider tools' : '');
         providerPrivacy.textContent = currentProviderId === 'openai-chat-completions'
-          ? (message.toolCallingEnabled ? 'OpenAI receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'For code-oriented tasks, OpenAI receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
+          ? (message.toolCallingEnabled ? 'OpenAI receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. File writes require a one-time review here; provider tools cannot run commands.' : 'For code-oriented tasks, OpenAI receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
           : currentProviderId === 'nvidia-nim'
-            ? (message.toolCallingEnabled ? 'NVIDIA NIM receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. Model support is unverified. Proposals stay in memory; this panel cannot approve file writes. Commands are unavailable.' : 'For code-oriented tasks, NVIDIA NIM receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
+            ? (message.toolCallingEnabled ? 'NVIDIA NIM receives the task, saved conversation, bounded local repository summaries for code tasks, and bounded results from Vesper project inspection and proposal tools. Model support is unverified. File writes require a one-time review here; provider tools cannot run commands.' : 'For code-oriented tasks, NVIDIA NIM receives the task, saved conversation, and a bounded local repository summary; Vesper does not send full project files by default. Generated text is not executed, applied, or validated.')
           : 'Codex uses a read-only sandbox; Vesper declines approval requests.';
       }
       if (message.type === 'project') {
@@ -1730,32 +2505,100 @@ function getHtml(webview) {
           activeActionType = undefined;
           stop.hidden = true;
           historyState.textContent = 'Checking this project’s saved conversation history…';
+          activeSessionId = '';
+          currentWorkflow = undefined;
+          taskStatus.textContent = 'No task lifecycle is available for this project.';
+          verificationSuggestions.replaceChildren();
+          verificationStatus.textContent = 'Suggested commands are not run automatically.';
+          verificationNotice = '';
+          verificationAvailability = { state: 'unknown', text: 'Refresh evidence to check the isolated command runtime.' };
         }
         projectPath.dataset.currentPath = message.path || '';
         projectName.textContent = message.available ? (message.name || 'Workspace folder') : (message.name ? message.name + ' · unavailable' : 'No workspace folder selected');
         projectPath.textContent = message.path || 'Open a folder in VS Code to start a provider task.';
         projectPath.title = message.path || '';
       }
+      if (message.type === 'session-details') {
+        const incomingSessionId = typeof message.sessionId === 'string' ? message.sessionId : '';
+        if (activeSessionId && incomingSessionId !== activeSessionId) {
+          messages.replaceChildren();
+          historyEntryCount = 0;
+          historyTextLength = 0;
+          activeAssistant = undefined;
+          activeDiff = undefined;
+          currentWorkflow = undefined;
+          taskStatus.textContent = 'No task lifecycle is available for this session.';
+          verificationSuggestions.replaceChildren();
+          verificationAvailability = { state: 'unknown', text: 'Refresh evidence to check the isolated command runtime.' };
+          verificationNotice = '';
+        }
+        activeSessionId = incomingSessionId;
+        const created = typeof message.createdAt === 'string' && Number.isFinite(Date.parse(message.createdAt)) ? new Date(message.createdAt).toLocaleString() : 'unknown';
+        const updated = typeof message.updatedAt === 'string' && Number.isFinite(Date.parse(message.updatedAt)) ? new Date(message.updatedAt).toLocaleString() : 'unknown';
+        const sessions = Array.isArray(message.sessions) ? message.sessions.slice(0, 8) : [];
+        const summary = incomingSessionId
+          ? 'Active session ' + incomingSessionId + ' · ' + (message.status || 'unknown') + ' · created ' + created + ' · updated ' + updated
+          : 'No active session. A session will be created when a task is sent.';
+        const recent = sessions.map((item) => (item.current ? '● ' : '○ ') + item.sessionId + ' · ' + item.providerId + (item.modelId ? ' / ' + item.modelId : '') + ' · ' + item.status + ' · updated ' + (Number.isFinite(Date.parse(item.updatedAt || '')) ? new Date(item.updatedAt).toLocaleString() : 'unknown')).join('\n');
+        sessionDetails.textContent = summary + '\n' + (recent || 'No sessions saved for this project.') + (message.totalSessions > sessions.length ? '\nShowing the 8 most recent of ' + message.totalSessions + ' sessions. Use Switch session to choose.' : '');
+      }
       if (message.type === 'conversation-history') {
-        activeDiff = undefined;
+        const mode = message.pageMode || 'replace';
         historyState.textContent = typeof message.text === 'string' ? message.text : 'Conversation history status unavailable.';
+        if (mode === 'loading-older') {
+          loadOlderHistory.disabled = true;
+          return;
+        }
+        if (mode === 'status') {
+          loadOlderHistory.hidden = !message.hasOlder;
+          loadOlderHistory.disabled = false;
+          return;
+        }
+        if (mode === 'prepend') {
+          const entries = Array.isArray(message.entries) ? message.entries : [];
+          const validEntries = entries.filter((entry) => entry && typeof entry === 'object' && typeof entry.label === 'string' && typeof entry.text === 'string');
+          const addedText = validEntries.reduce((total, entry) => total + entry.label.length + entry.text.length, 0);
+          if (historyEntryCount + validEntries.length > 240 || historyTextLength + addedText > 128000) {
+            loadOlderHistory.hidden = true;
+            loadOlderHistory.disabled = true;
+            historyState.textContent = 'Vesper history display limit reached. Older messages remain in provider storage.';
+            return;
+          }
+          const fragment = document.createDocumentFragment();
+          for (const entry of validEntries) addHistoryEntry(entry, fragment);
+          const firstEntry = messages.querySelector('[data-history-entry]');
+          messages.insertBefore(fragment, firstEntry || messages.firstChild);
+          historyEntryCount += validEntries.length;
+          historyTextLength += addedText;
+          loadOlderHistory.hidden = !message.hasOlder;
+          loadOlderHistory.disabled = false;
+          return;
+        }
+        activeDiff = undefined;
+        loadOlderHistory.hidden = true;
+        loadOlderHistory.disabled = false;
         if (message.state === 'loading') {
           if (activeRequestId === undefined) messages.replaceChildren();
+          historyEntryCount = 0;
+          historyTextLength = 0;
           return;
         }
         messages.replaceChildren();
+        historyEntryCount = 0;
+        historyTextLength = 0;
         activeAssistant = undefined;
         activeRequestId = undefined;
         stop.hidden = true;
         if (message.state === 'unavailable') return;
-        const historyKinds = new Set(['user', 'assistant', 'tool', 'activity', 'error', 'availability', 'turn']);
         if (Array.isArray(message.entries)) {
           for (const entry of message.entries) {
             if (!entry || typeof entry !== 'object' || typeof entry.label !== 'string' || typeof entry.text !== 'string') continue;
-            const kind = historyKinds.has(entry.kind) ? entry.kind : 'activity';
-            addMessage(kind, entry.label, entry.text);
+            addHistoryEntry(entry);
+            historyEntryCount += 1;
+            historyTextLength += entry.label.length + entry.text.length;
           }
         }
+        loadOlderHistory.hidden = !message.hasOlder;
       }
       if (message.type === 'session-state') {
         sessionBlocked = Boolean(message.blocked);
@@ -1769,6 +2612,115 @@ function getHtml(webview) {
           send.disabled = sessionBlocked;
           prompt.disabled = sessionBlocked;
         }
+      }
+      if (message.type === 'task-state') renderTaskState(message.workflow || {});
+      if (message.type === 'tool-approval') {
+        const card = document.createElement('article');
+        card.className = 'approval';
+        card.dataset.approvalId = String(message.approvalId || '');
+        const title = document.createElement('div');
+        title.className = 'label';
+        title.textContent = (message.title || 'Vesper approval required') + ' · one operation only';
+        const preview = document.createElement('div');
+        preview.className = 'answer approval-preview';
+        preview.textContent = message.body || 'No safe review preview is available.';
+        const actions = document.createElement('div');
+        actions.className = 'approval-actions';
+        const approve = document.createElement('button');
+        approve.type = 'button';
+        approve.textContent = message.kind === 'verification' ? 'Approve this command once' : 'Approve this file change once';
+        approve.dataset.approvalId = String(message.approvalId || '');
+        approve.dataset.approvalChoice = 'approve-once';
+        const reject = document.createElement('button');
+        reject.type = 'button';
+        reject.textContent = 'Reject';
+        reject.dataset.approvalId = String(message.approvalId || '');
+        reject.dataset.approvalChoice = 'decline';
+        actions.append(approve, reject);
+        card.append(title, preview, actions);
+        messages.append(card);
+        messages.scrollTop = messages.scrollHeight;
+      }
+      if (message.type === 'tool-approval-settled') {
+        for (const card of messages.querySelectorAll('article[data-approval-id]')) {
+          if (card.dataset.approvalId !== message.approvalId) continue;
+          for (const button of card.querySelectorAll('button')) button.disabled = true;
+          const outcome = document.createElement('div');
+          outcome.className = 'label';
+          outcome.textContent = message.text || ('Approval ' + (message.status || 'ended') + '.');
+          card.append(outcome);
+        }
+      }
+      if (message.type === 'codex-approval') {
+        const card = document.createElement('article');
+        card.className = 'approval';
+        const title = document.createElement('div');
+        title.className = 'label';
+        title.textContent = 'Codex requested ' + (message.title || 'approval') + ' · VS Code decline-only';
+        const preview = document.createElement('div');
+        preview.className = 'answer approval-preview';
+        preview.textContent = message.body || 'Codex did not provide a review preview.';
+        const note = document.createElement('div');
+        note.className = 'label';
+        note.textContent = message.text || 'Vesper did not approve this request.';
+        card.append(title, preview, note);
+        messages.append(card);
+        messages.scrollTop = messages.scrollHeight;
+      }
+      if (message.type === 'codex-approval-decision') addMessage('activity', 'Codex approval outcome', message.text || 'Codex reported an approval outcome.');
+      if (message.type === 'verification-start') {
+        activeRequestId = message.requestId;
+        activeActionType = 'verification';
+        setBusy(true);
+        stop.hidden = false;
+        stop.disabled = false;
+        verificationStatus.textContent = message.operation === 'verification-run'
+          ? 'Waiting for isolated command approval or execution…'
+          : 'Refreshing project verification evidence…';
+        verificationNotice = verificationStatus.textContent;
+      }
+      if (message.type === 'verification-refresh-start' || message.type === 'verification-run-start') {
+        activeRequestId = message.requestId;
+        activeActionType = 'verification';
+        setBusy(true);
+        stop.hidden = false;
+        stop.disabled = false;
+        verificationStatus.textContent = message.text || 'Verification operation started.';
+        verificationNotice = verificationStatus.textContent;
+      }
+      if (message.type === 'verification-refresh-result' && message.requestId === activeRequestId) {
+        verificationAvailability = message.commandAvailability || verificationAvailability;
+        if (currentWorkflow) renderTaskState(currentWorkflow);
+        verificationNotice = message.text || (message.state === 'failed' || message.state === 'cancelled'
+          ? 'Verification evidence refresh did not complete.' : 'Verification evidence refreshed.');
+        verificationStatus.textContent = verificationNotice + ' ' + (verificationAvailability.text || '');
+        activeRequestId = undefined;
+        activeActionType = undefined;
+        stop.hidden = true;
+        setBusy(false);
+        if (currentWorkflow) renderTaskState(currentWorkflow);
+      }
+      if (message.type === 'verification-result' && message.requestId === activeRequestId) {
+        if (message.executed === true && typeof message.output === 'string' && message.output) {
+          addMessage(message.exitCode === 0 ? 'activity' : 'error', 'Verification output · executed · exit ' + (message.exitCode === null ? 'unknown' : message.exitCode), message.output);
+        }
+        verificationNotice = message.text || 'Verification outcome reported.';
+        verificationStatus.textContent = verificationNotice;
+        activeRequestId = undefined;
+        activeActionType = undefined;
+        stop.hidden = true;
+        setBusy(false);
+        status.textContent = 'Vesper · verification ' + (message.state || 'finished') + (message.executed ? ' · command executed' : ' · no confirmed execution');
+        if (currentWorkflow) renderTaskState(currentWorkflow);
+      }
+      if (message.type === 'verification-error') {
+        verificationNotice = message.text || 'Verification operation failed.';
+        verificationStatus.textContent = verificationNotice;
+        addMessage('error', 'Verification unavailable', message.text || 'No verification outcome is available.');
+      }
+      if (message.type === 'history-load-error') {
+        historyState.textContent = message.text || 'Older conversation messages could not be loaded.';
+        loadOlderHistory.disabled = false;
       }
       if (message.type === 'recovery-start') {
         recoveryLoading = true;
@@ -1795,7 +2747,8 @@ function getHtml(webview) {
       }
       if (message.type === 'user-message') return;
       if (message.type === 'plan-preview') {
-        addMessage(message.error ? 'error' : 'assistant', 'Vesper capability plan · advisory · not executed', message.text || 'No capability plan output is available.');
+        const capabilityNote = '\n\nCapability discovery does not prove installation, configuration, connection, runtime loading, or successful use.';
+        addMessage(message.error ? 'error' : 'assistant', 'Vesper capability plan · advisory · not executed', (message.text || 'No capability plan output is available.') + capabilityNote);
         previewPlan.disabled = false;
       }
       if (message.type === 'repository-inspection-start') {
@@ -1907,6 +2860,7 @@ function getHtml(webview) {
       }
       if (message.type === 'workflow-state' && message.requestId === activeRequestId) {
         const workflow = message.workflow || {};
+        renderTaskState(workflow);
         const verification = workflow.verification && workflow.verification.state ? ' · verification ' + workflow.verification.state : '';
         status.textContent = currentProviderName + ' · workflow ' + (workflow.status || 'running') + ' · ' + (workflow.stage || 'understanding') + verification;
         if (workflow.diff && workflow.diff.source === 'workspace') {

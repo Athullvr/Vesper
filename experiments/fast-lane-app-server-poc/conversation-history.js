@@ -70,7 +70,9 @@ function projectConversationHistory({ turns, truncated = false } = {}) {
       incomplete = true;
     }
 
+    const timestamp = safeTimestamp(turn.createdAt ?? turn.updatedAt ?? turn.created_at ?? turn.updated_at);
     const statusEntry = turnStatusEntry(turn);
+    if (statusEntry && timestamp) statusEntry.timestamp = timestamp;
     if (statusEntry) append(statusEntry);
     if (stop) break;
 
@@ -99,7 +101,7 @@ function projectConversationHistory({ turns, truncated = false } = {}) {
 
       const projected = projectItem(turn.id, item);
       if (projected.incomplete) incomplete = true;
-      if (projected.entry) append(projected.entry);
+      if (projected.entry) append(timestamp ? { ...projected.entry, timestamp } : projected.entry);
     }
 
     if (!stop && itemsView === "summary") {
@@ -296,6 +298,12 @@ function describeInputType(type) {
 
 function safeStatus(value) {
   return typeof value === "string" && ITEM_STATUSES.has(value) ? value : "";
+}
+
+function safeTimestamp(value) {
+  if (typeof value !== "string" || value.length > 80) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
 function cleanText(value, maxLength) {
